@@ -5,10 +5,58 @@ import tempfile
 import unittest
 
 from lol_support_advisor.champions import ChampionRegistry
-from lol_support_advisor.opgg import OpggClient
+from lol_support_advisor.opgg import OpggClient, OpggError
 
 
 class OpggParsingTests(unittest.TestCase):
+    def test_monkeyking_uses_opgg_canonical_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            self.assertEqual(registry.slug("MonkeyKing"), "monkeyking")
+
+    def test_insufficient_matchup_sample_is_cached_as_no_data(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            client = OpggClient(registry)
+            client._fetch = lambda _url: """
+                <div>Patch 16.16</div>
+                <div>Sample size is not large enough.</div>
+            """
+
+            snapshot = client.refresh_matchup("Heimerdinger", "SUPPORT")
+
+            self.assertEqual(snapshot.raw_status, "NO_DATA")
+            self.assertEqual(snapshot.position, "SUPPORT")
+            self.assertEqual(snapshot.patch, "16.16")
+            self.assertEqual(snapshot.counters, [])
+            self.assertEqual(snapshot.weak_picks, [])
+
+    def test_sparse_single_row_matchup_table_is_valid(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            client = OpggClient(registry)
+            client._fetch = lambda _url: """
+                <div>Win rate</div><div>Games</div>
+                <div>Janna</div><div>46.0</div><div>%</div><div>100</div>
+                <div>Patch 16.16</div>
+            """
+
+            snapshot = client.refresh_matchup("Heimerdinger", "SUPPORT")
+
+            self.assertEqual(snapshot.raw_status, "OK")
+            self.assertEqual(len(snapshot.counters), 1)
+            self.assertEqual(snapshot.counters[0].champion_id, "Janna")
+            self.assertAlmostEqual(snapshot.counters[0].versus_win_rate, 54.0)
+
+    def test_unknown_empty_matchup_markup_still_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            client = OpggClient(registry)
+            client._fetch = lambda _url: "<div>unexpected page</div>"
+
+            with self.assertRaises(OpggError):
+                client.refresh_matchup("Heimerdinger", "SUPPORT")
+
     def test_rendered_counter_table_tokens_are_inverted_for_candidate(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = ChampionRegistry(Path(temp_dir) / "champions.json")
