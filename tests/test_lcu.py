@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 import tempfile
 import unittest
 
 from lol_support_advisor.champions import ChampionRegistry
 from lol_support_advisor.lcu import (
-    LcuActionError, LcuClient, champ_select_time_left_ms,
+    LcuActionError, LcuActionStateChanged, LcuClient,
+    champ_select_time_left_ms, champ_select_timer_phase,
     champion_action_in_progress, deferred_ban_due,
     find_local_champion_action, parse_lcu_session,
 )
@@ -45,12 +47,20 @@ class LcuParsingTests(unittest.TestCase):
         session["timer"]["adjustedTimeLeftInPhase"] = 4900
         self.assertTrue(deferred_ban_due(session, 5000, 10.0, 1.0))
         session["timer"]["adjustedTimeLeftInPhase"] = 9000
-        self.assertTrue(deferred_ban_due(session, 5000, 10.0, 10.0))
+        self.assertFalse(deferred_ban_due(session, 5000, 10.0, 10.0))
 
         no_timer: dict = {}
         self.assertIsNone(champ_select_time_left_ms(no_timer))
         self.assertFalse(deferred_ban_due(no_timer, 5000, 12.0, 11.9))
         self.assertTrue(deferred_ban_due(no_timer, 5000, 12.0, 12.0))
+
+    def test_champ_select_timer_phase_is_normalized(self) -> None:
+        self.assertEqual(
+            champ_select_timer_phase({"timer": {"phase": " ban_pick "}}),
+            "BAN_PICK",
+        )
+        self.assertEqual(champ_select_timer_phase({"timer": {}}), "")
+        self.assertEqual(champ_select_timer_phase({}), "")
 
     def test_infinite_champ_select_timer_uses_fallback(self) -> None:
         session = {
@@ -170,6 +180,61 @@ class LcuParsingTests(unittest.TestCase):
             self.assertEqual(draft.enemy_ban_actions[0].state, "HOVER")
             self.assertEqual(draft.enemy_ban_actions[0].champion_id, "Thresh")
 
+    def test_accepted_pick_order_swap_moves_local_player_from_fifth_to_third(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+
+            def pick(actor: int) -> dict:
+                return {
+                    "type": "pick", "actorCellId": actor, "championId": 0,
+                    "completed": False, "isInProgress": False,
+                }
+
+            session = {
+                "localPlayerCellId": 4,
+                "myTeam": [
+                    {"cellId": 0, "assignedPosition": "top"},
+                    {"cellId": 1, "assignedPosition": "jungle"},
+                    {"cellId": 2, "assignedPosition": "middle"},
+                    {"cellId": 3, "assignedPosition": "bottom"},
+                    {"cellId": 4, "assignedPosition": "utility"},
+                ],
+                "theirTeam": [
+                    {"cellId": 5 + index, "assignedPosition": position}
+                    for index, position in enumerate(
+                        ("top", "jungle", "middle", "bottom", "utility")
+                    )
+                ],
+                # Pick slots remain fixed when Riot accepts the exchange.
+                "actions": [
+                    [pick(0)], [pick(5), pick(6)], [pick(1), pick(2)],
+                    [pick(7), pick(8)], [pick(3), pick(4)], [pick(9)],
+                ],
+                "pickOrderSwaps": [{"id": 9, "cellId": 2, "state": "SENT"}],
+                "bans": {},
+            }
+            before = parse_lcu_session(session, registry)
+            self.assertEqual(before.my_pick_order, 5)
+            self.assertEqual(before.my_role, "SUPPORT")
+            self.assertEqual(before.pick_order_swap_state, "SENT")
+            self.assertEqual(before.pick_order_swap_target_cell_id, 2)
+
+            accepted = deepcopy(session)
+            accepted["localPlayerCellId"] = 2
+            accepted["myTeam"][2]["assignedPosition"] = "utility"
+            accepted["myTeam"][4]["assignedPosition"] = "middle"
+            accepted["pickOrderSwaps"] = [
+                {"id": 20 + cell_id, "cellId": cell_id, "state": "AVAILABLE"}
+                for cell_id in (0, 1, 3, 4)
+            ]
+            after = parse_lcu_session(accepted, registry)
+
+            self.assertEqual(after.local_player_cell_id, 2)
+            self.assertEqual(after.my_pick_order, 3)
+            self.assertEqual(after.my_role, "SUPPORT")
+            self.assertEqual(after.pick_order_swap_state, "")
+            self.assertNotEqual(before.snapshot_id, after.snapshot_id)
+
     def test_local_assigned_position_drives_recommendation_role(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = ChampionRegistry(Path(temp_dir) / "champions.json")
@@ -184,6 +249,28 @@ class LcuParsingTests(unittest.TestCase):
             }, registry)
             self.assertEqual(draft.my_role, "JUNGLE")
             self.assertEqual(draft.enemy_locked[0].role, "JUNGLE")
+
+    def test_planning_champion_pick_intent_is_local_hover(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            draft = parse_lcu_session({
+                "localPlayerCellId": 4,
+                "myTeam": [{
+                    "cellId": 4,
+                    "assignedPosition": "utility",
+                    "championId": 0,
+                    "championPickIntent": 54,
+                }],
+                "theirTeam": [],
+                "actions": [],
+                "bans": {},
+                "timer": {"phase": "PLANNING"},
+            }, registry)
+
+            self.assertIsNotNone(draft.my_hover)
+            self.assertEqual(draft.my_hover.champion_id, "Malphite")
+            self.assertEqual(draft.my_hover.state, "HOVER")
+            self.assertEqual(draft.my_status, "SELECTING")
 
 
 class LcuActionTests(unittest.TestCase):
@@ -208,6 +295,10 @@ class LcuActionTests(unittest.TestCase):
                 },
             ]],
             "bans": {"myTeamBans": [], "theirTeamBans": []},
+            "timer": {
+                "phase": "BAN_PICK",
+                "adjustedTimeLeftInPhase": 10000,
+            },
         }
 
     def client(self, session: dict, **responses: object) -> FakeLcuClient:
@@ -267,6 +358,28 @@ class LcuActionTests(unittest.TestCase):
             "PATCH", "/lol-champ-select/v1/session/actions/777",
             {"championId": 99, "completed": True},
         ))
+
+    def test_ban_is_blocked_during_planning_even_if_action_is_in_progress(self) -> None:
+        session = self.session(local_type="ban")
+        session["timer"]["phase"] = "PLANNING"
+        session["timer"]["adjustedTimeLeftInPhase"] = 7500
+        client = self.client(session)
+
+        with self.assertRaisesRegex(LcuActionStateChanged, "실제 밴 단계"):
+            client.perform_champion_action(99, "ban")
+
+        self.assertEqual(client.writes, [])
+
+    def test_scheduled_ban_is_blocked_if_local_action_id_changed(self) -> None:
+        session = self.session(local_type="ban")
+        client = self.client(session)
+
+        with self.assertRaisesRegex(LcuActionStateChanged, "작업이 변경"):
+            client.perform_champion_action(
+                99, "ban", expected_action_id=123,
+            )
+
+        self.assertEqual(client.writes, [])
 
     def test_local_turn_helpers_never_fall_back_to_a_teammate(self) -> None:
         session = self.session(local_in_progress=False)

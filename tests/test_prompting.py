@@ -72,6 +72,7 @@ class PromptingTests(unittest.TestCase):
         self.assertIn("숫자를 추측하지 말 것", payload["opgg"]["notice"])
         self.assertLess(len(prompt), 2500)
         self.assertNotIn('"recommendations"', prompt)
+        self.assertIn("파일·명령·웹 도구를 사용하지 말고", prompt)
 
     def test_memory_prompt_contains_rules_and_response_contract(self) -> None:
         prompt = build_memory_prompt()

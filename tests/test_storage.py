@@ -1,14 +1,19 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timedelta
+import json
 from pathlib import Path
 import tempfile
+import threading
 import unittest
+from unittest.mock import patch
 
 from lol_support_advisor.storage import Storage
 from lol_support_advisor.models import (
-    ChampionBuildGuide, GamePrediction, OpggSnapshot,
-    OpggSynergySnapshot, OpggSynergyStat,
+    BuildAsset, ChampionBuildGuide, GamePrediction, OpggSnapshot,
+    OpggSynergySnapshot, OpggSynergyStat, RuneBuild, SummonerSpellBuild,
 )
 
 
@@ -46,6 +51,192 @@ def match_payload(
 
 
 class StorageTests(unittest.TestCase):
+    def test_settings_cache_avoids_repeated_reads_and_persists_new_instances(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "advisor.db"
+            storage = Storage(db_path)
+            storage.set_setting("cached-key", "first")
+
+            with patch.object(
+                storage, "_connect", wraps=storage._connect,
+            ) as connect:
+                for _index in range(100):
+                    self.assertEqual(storage.get_setting("cached-key"), "first")
+                    self.assertEqual(storage.get_setting("missing", "fallback"), "fallback")
+                self.assertEqual(connect.call_count, 0)
+
+                storage.set_setting("cached-key", "second")
+                self.assertEqual(connect.call_count, 1)
+                self.assertEqual(storage.get_setting("cached-key"), "second")
+                self.assertEqual(connect.call_count, 1)
+
+            reopened = Storage(db_path)
+            self.assertEqual(reopened.get_setting("cached-key"), "second")
+
+    def test_settings_cache_serializes_concurrent_readers_and_writers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "advisor.db"
+            storage = Storage(db_path)
+            storage.set_setting("race-key", "0")
+
+            def write(value: int) -> None:
+                storage.set_setting("race-key", str(value))
+
+            def read() -> list[str]:
+                return [storage.get_setting("race-key") for _index in range(100)]
+
+            with ThreadPoolExecutor(max_workers=8) as executor:
+                futures = [executor.submit(write, value) for value in range(1, 13)]
+                futures.extend(executor.submit(read) for _index in range(8))
+                results = [future.result() for future in futures]
+
+            observed = [value for result in results if isinstance(result, list) for value in result]
+            self.assertTrue(observed)
+            self.assertTrue(all(value.isdigit() for value in observed))
+            storage.set_setting("race-key", "final")
+            self.assertEqual(storage.get_setting("race-key"), "final")
+            self.assertEqual(Storage(db_path).get_setting("race-key"), "final")
+
+    def test_settings_reader_does_not_wait_for_slow_sqlite_writer(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            storage.set_setting("status", "committed")
+            writer_entered = threading.Event()
+            release_writer = threading.Event()
+
+            class FakeConnection:
+                @staticmethod
+                def execute(*_args: object) -> None:
+                    return None
+
+            @contextmanager
+            def slow_connect():
+                writer_entered.set()
+                release_writer.wait(timeout=2.0)
+                yield FakeConnection()
+
+            with patch.object(storage, "_connect", slow_connect):
+                with ThreadPoolExecutor(max_workers=2) as executor:
+                    writer = executor.submit(storage.set_setting, "status", "new")
+                    self.assertTrue(writer_entered.wait(timeout=1.0))
+                    reader = executor.submit(storage.get_setting, "status")
+                    try:
+                        self.assertEqual(
+                            reader.result(timeout=0.25), "committed"
+                        )
+                    finally:
+                        release_writer.set()
+                    writer.result(timeout=1.0)
+
+            self.assertEqual(storage.get_setting("status"), "new")
+
+    def test_match_revision_and_count_are_cached_until_match_upsert(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            storage.save_matches([
+                match_payload("KR_COUNT_1", True, "Janna", "Leona", 1000),
+                match_payload("KR_COUNT_2", False, "Janna", "Leona", 2000),
+            ])
+
+            with patch.object(
+                storage, "_connect", wraps=storage._connect,
+            ) as connect:
+                self.assertEqual(storage.count_matches(), 2)
+                self.assertEqual(storage.match_revision(), (2, 2000))
+                self.assertEqual(storage.count_matches(), 2)
+                self.assertEqual(connect.call_count, 1)
+
+            storage.save_matches([
+                match_payload("KR_COUNT_3", True, "Braum", "Leona", 3000),
+            ])
+            with patch.object(
+                storage, "_connect", wraps=storage._connect,
+            ) as connect:
+                self.assertEqual(storage.match_revision(), (3, 3000))
+                self.assertEqual(storage.count_matches(), 3)
+                self.assertEqual(connect.call_count, 1)
+
+            # Replacing a row invalidates the revision but must not increment
+            # the cached count as though it were a new match.
+            storage.save_matches([
+                match_payload("KR_COUNT_3", False, "Braum", "Leona", 4000),
+            ])
+            self.assertEqual(storage.match_revision(), (3, 4000))
+
+    def test_match_count_never_waits_for_full_payload_decode_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            storage.save_matches([
+                match_payload("KR_HEADER", True, "Nami", "Leona", 1000)
+            ])
+            storage._match_revision_cache = None
+            storage._decoded_match_cache_lock.acquire()
+            try:
+                with ThreadPoolExecutor(max_workers=1) as executor:
+                    future = executor.submit(storage.count_matches)
+                    self.assertEqual(future.result(timeout=1.0), 1)
+            finally:
+                storage._decoded_match_cache_lock.release()
+
+    def test_match_payload_decode_cache_is_shared_and_incrementally_updated(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            matches = [
+                match_payload(
+                    f"KR_CACHE_{index}", index != 1, "LeeSin", "Viego",
+                    3000 - index, my_position="JUNGLE", enemy_position="JUNGLE",
+                )
+                for index in range(3)
+            ]
+            storage.save_matches(matches)
+
+            with patch(
+                "lol_support_advisor.storage.json.loads", wraps=json.loads,
+            ) as decode:
+                # These are the independent jobs launched by the play tab.  A
+                # simultaneous cold start must build one cache, not decode the
+                # same Match-v5 payload once per worker.
+                jobs = [
+                    lambda: storage.count_player_matches("mine"),
+                    lambda: storage.player_champion_record("mine", "LeeSin"),
+                    lambda: storage.latest_player_match("mine"),
+                    lambda: storage.relationship_summary("mine", "enemy"),
+                    lambda: storage.personal_stat(
+                        "mine", "LeeSin", "Viego", position="JUNGLE"
+                    ),
+                    lambda: storage.player_behavior(
+                        "mine", "LeeSin", position="JUNGLE"
+                    ),
+                    lambda: storage.jungle_tendency("mine", "LeeSin"),
+                ]
+                with ThreadPoolExecutor(max_workers=len(jobs)) as executor:
+                    results = [future.result() for future in (
+                        executor.submit(job) for job in jobs
+                    )]
+
+                self.assertEqual(decode.call_count, len(matches))
+                self.assertEqual(results[0], 3)
+                self.assertEqual(results[1], (3, 2))
+
+                # Repeated analysis reuses the same decoded collection.
+                storage.relationship_summary("mine", "ally")
+                storage.personal_stat(
+                    "mine", "LeeSin", "Viego", position="JUNGLE"
+                )
+                self.assertEqual(decode.call_count, len(matches))
+
+                # A Match-v5 upsert is merged into an already-built cache.  The
+                # next reader sees it immediately without rebuilding all rows.
+                newest = match_payload(
+                    "KR_CACHE_NEW", True, "Nami", "Leona", 4000,
+                )
+                storage.save_matches([newest])
+                self.assertEqual(storage.count_player_matches("mine"), 4)
+                self.assertEqual(
+                    storage.latest_player_match("mine")["champion_id"], "Nami"
+                )
+                self.assertEqual(decode.call_count, len(matches))
+
     def test_integer_setting_uses_default_and_persists_valid_value(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir) / "advisor.db")
@@ -218,6 +409,54 @@ class StorageTests(unittest.TestCase):
             jungle_guides = storage.load_build_guides_for_position("JUNGLE")
             self.assertEqual(set(support_guides), {"Poppy"})
             self.assertEqual(jungle_guides["Poppy"].patch, "16.16")
+
+    def test_build_guide_statistics_round_trip_and_legacy_spell_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            flash = BuildAsset(4, "Flash", "flash.png")
+            ignite = BuildAsset(14, "Ignite", "ignite.png")
+            guide = ChampionBuildGuide(
+                champion_id="Thresh",
+                champion_name_ko="쓰레쉬",
+                position="SUPPORT",
+                rune_builds=[RuneBuild(
+                    "추천 룬 1", 8400, 8300, [BuildAsset(8439, "여진")],
+                    games=68_728, win_rate=52.09667, pick_rate=52.01,
+                )],
+                summoner_spells=[flash, ignite],
+                summoner_spell_builds=[SummonerSpellBuild(
+                    "추천 스펠 1", [flash, ignite],
+                    games=88_622, win_rate=52.07, pick_rate=68.03,
+                )],
+            )
+            storage.save_build_guide(guide)
+
+            loaded = storage.load_build_guide("Thresh", "SUPPORT")
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.rune_builds[0].games, 68_728)
+            self.assertAlmostEqual(loaded.rune_builds[0].win_rate or 0, 52.09667)
+            self.assertEqual(loaded.summoner_spell_builds[0].games, 88_622)
+            self.assertAlmostEqual(
+                loaded.summoner_spell_builds[0].pick_rate or 0, 68.03
+            )
+
+            legacy = ChampionBuildGuide.from_dict({
+                "champion_id": "Leona",
+                "champion_name_ko": "레오나",
+                "position": "SUPPORT",
+                "rune_builds": [{
+                    "name": "기존 룬", "primary_style_id": 8400,
+                    "sub_style_id": 8300, "perks": [],
+                }],
+                "summoner_spells": [flash.to_dict(), ignite.to_dict()],
+            })
+            self.assertIsNone(legacy.rune_builds[0].games)
+            self.assertEqual(len(legacy.summoner_spell_builds), 1)
+            self.assertEqual(
+                [spell.asset_id for spell in legacy.summoner_spell_builds[0].spells],
+                [4, 14],
+            )
 
     def test_opgg_cache_is_separated_by_position(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

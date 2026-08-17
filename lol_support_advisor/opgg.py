@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 from .champions import ChampionRegistry, POSSIBLE_SUPPORTS
 from .models import (
     BuildAsset, BuildItemGroup, ChampionBuildGuide, OpggCounter,
-    OpggPlayerChampionStat, OpggSnapshot, RuneBuild,
+    OpggPlayerChampionStat, OpggSnapshot, RuneBuild, SummonerSpellBuild,
 )
 
 
@@ -502,6 +502,47 @@ class OpggClient:
             r'\\"championKey\\":\\"[^"\\]+\\",\\"primaryStyleId\\":(\d+),'
             r'\\"subStyleId\\":(\d+),\\"selectedPerkIds\\":\[([\d,]+)\]\}'
         )
+        rune_stats: dict[tuple[int, ...], tuple[int, float, float]] = {}
+        rune_page_pattern = re.compile(
+            r'\{\\"id\\":\d+,\\"play\\":(?P<games>\d+),'
+            r'\\"pick_rate\\":(?P<pick>[\d.]+),\\"builds\\":\[\{'
+        )
+        rune_pages = list(rune_page_pattern.finditer(html))
+        for index, page_match in enumerate(rune_pages):
+            if index + 1 < len(rune_pages):
+                page_end = rune_pages[index + 1].start()
+            else:
+                page_end = html.find(
+                    '],\\"single_rune_builds\\"', page_match.end()
+                )
+                if page_end < 0:
+                    page_end = len(html)
+            page_html = html[page_match.start():page_end]
+            win_match = re.search(
+                r'\\"win_rate\\":([\d.]+),\\"primary_rune\\":\{',
+                page_html,
+            )
+            if not win_match:
+                continue
+            games = int(page_match.group("games"))
+            pick_rate = float(page_match.group("pick"))
+            win_rate = float(win_match.group(1))
+            if pick_rate <= 1:
+                pick_rate *= 100
+            if win_rate <= 1:
+                win_rate *= 100
+            for build_match in rune_pattern.finditer(page_html):
+                perk_ids = tuple(
+                    int(value)
+                    for value in build_match.group(3).split(",")
+                    if value
+                )
+                if len(perk_ids) != 9:
+                    continue
+                previous = rune_stats.get(perk_ids)
+                if previous is None or games > previous[0]:
+                    rune_stats[perk_ids] = (games, pick_rate, win_rate)
+
         rune_builds: list[RuneBuild] = []
         seen_perks: set[tuple[int, ...]] = set()
         for match in rune_pattern.finditer(html):
@@ -521,17 +562,23 @@ class OpggClient:
                 )
                 for perk_id in perk_ids
             ]
+            statistics = rune_stats.get(perk_ids)
             rune_builds.append(RuneBuild(
                 name=f"추천 룬 {len(rune_builds) + 1}",
                 primary_style_id=int(match.group(1)),
                 sub_style_id=int(match.group(2)),
                 perks=perks,
+                games=statistics[0] if statistics else None,
+                pick_rate=statistics[1] if statistics else None,
+                win_rate=statistics[2] if statistics else None,
             ))
             if len(rune_builds) >= 3:
                 break
 
         tables = self._html_tables(html)
         spells: list[BuildAsset] = []
+        spell_builds: list[SummonerSpellBuild] = []
+        seen_spell_builds: set[tuple[int, ...]] = set()
         skill_priority: list[str] = []
         skill_sequence: list[str] = []
         item_groups: list[BuildItemGroup] = []
@@ -540,13 +587,69 @@ class OpggClient:
             tokens = self._table_tokens(table)
             token_text = " ".join(tokens)
             images = self._table_images(table)
-            if "SummonerSpells Table" in token_text and not spells:
+            if "SummonerSpells Table" in token_text:
+                spell_pair: list[BuildAsset] = []
                 for name, icon_url in images:
                     spell_id = SPELL_IDS.get(name.casefold())
-                    if spell_id and all(spell.asset_id != spell_id for spell in spells):
-                        spells.append(BuildAsset(spell_id, name, icon_url))
-                    if len(spells) == 2:
+                    if spell_id and all(
+                        spell.asset_id != spell_id for spell in spell_pair
+                    ):
+                        spell_pair.append(BuildAsset(spell_id, name, icon_url))
+                    if len(spell_pair) == 2:
                         break
+                signature = tuple(sorted(spell.asset_id for spell in spell_pair))
+                if len(spell_pair) != 2 or signature in seen_spell_builds \
+                        or len(spell_builds) >= 3:
+                    continue
+
+                games: int | None = None
+                games_number_index: int | None = None
+                games_label_index: int | None = None
+                for token_index, token in enumerate(tokens):
+                    games_match = re.fullmatch(
+                        r"([\d,]+)\s*(?:Games?|게임)",
+                        token,
+                        flags=re.IGNORECASE,
+                    )
+                    if games_match:
+                        games = int(games_match.group(1).replace(",", ""))
+                        games_number_index = token_index
+                        games_label_index = token_index
+                        break
+                    if re.fullmatch(r"(?:Games?|게임)", token, re.IGNORECASE) \
+                            and token_index:
+                        number_match = re.fullmatch(r"[\d,]+", tokens[token_index - 1])
+                        if number_match:
+                            games = int(number_match.group(0).replace(",", ""))
+                            games_number_index = token_index - 1
+                            games_label_index = token_index
+                            break
+
+                def nearby_rate(start: int, stop: int, step: int) -> float | None:
+                    for rate_index in range(start, stop, step):
+                        rate_match = re.fullmatch(
+                            r"([\d.]+)\s*%?", tokens[rate_index]
+                        )
+                        if rate_match:
+                            return float(rate_match.group(1))
+                    return None
+
+                pick_rate = (
+                    nearby_rate(games_number_index - 1, -1, -1)
+                    if games_number_index is not None else None
+                )
+                win_rate = (
+                    nearby_rate(games_label_index + 1, len(tokens), 1)
+                    if games_label_index is not None else None
+                )
+                seen_spell_builds.add(signature)
+                spell_builds.append(SummonerSpellBuild(
+                    name=f"추천 스펠 {len(spell_builds) + 1}",
+                    spells=spell_pair,
+                    games=games,
+                    pick_rate=pick_rate,
+                    win_rate=win_rate,
+                ))
             elif "SkillOrder Table" in token_text and not skill_priority:
                 letters = [token for token in tokens if token in {"Q", "W", "E", "R"}]
                 if len(letters) >= 3:
@@ -585,6 +688,8 @@ class OpggClient:
                     ))
                 item_groups.append(BuildItemGroup(title, items))
 
+        if spell_builds:
+            spells = list(spell_builds[0].spells)
         if not rune_builds or len(spells) < 2 or not item_groups:
             raise OpggError(
                 "OP.GG 빌드 페이지에서 룬·스펠·아이템을 완전하게 읽지 못했습니다. "
@@ -600,6 +705,7 @@ class OpggClient:
             source_url=url,
             rune_builds=rune_builds,
             summoner_spells=spells,
+            summoner_spell_builds=spell_builds,
             skill_priority=skill_priority,
             skill_sequence=skill_sequence,
             item_groups=item_groups[:14],

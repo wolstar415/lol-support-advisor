@@ -323,6 +323,7 @@ def build_prompt(
         "LOL_PICK_QUERY_V4\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + "\nEND_LOL_PICK_QUERY_V4\n"
+          "파일·명령·웹 도구를 사용하지 말고 위 입력만 즉시 판단해. "
           "기억한 LOL_PICK_MEMORY_V4 규칙대로 전체 조합 흐름을 종합해 정확히 3개를 "
           "LOL_SUPPORT_V2 형식으로만 답해."
     )

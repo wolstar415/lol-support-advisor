@@ -53,6 +53,8 @@ class DraftSnapshot:
     local_player_cell_id: int | None = None
     connection_state: str = "DISCONNECTED"
     snapshot_id: str = ""
+    pick_order_swap_state: str = ""
+    pick_order_swap_target_cell_id: int | None = None
 
     def unavailable_champions(self) -> list[str]:
         values = [m.champion_id for m in self.ally_locked]
@@ -73,6 +75,7 @@ class DraftSnapshot:
             "my_role": self.my_role,
             "my_pick_order": self.my_pick_order,
             "my_status": self.my_status,
+            "local_player_cell_id": self.local_player_cell_id,
             "ally_locked": [m.to_dict() for m in self.ally_locked],
             "ally_hover": [m.to_dict() for m in self.ally_hover],
             "my_hover": self.my_hover.to_dict() if self.my_hover else None,
@@ -315,6 +318,9 @@ class RuneBuild:
     primary_style_id: int
     sub_style_id: int
     perks: list[BuildAsset] = field(default_factory=list)
+    games: int | None = None
+    win_rate: float | None = None
+    pick_rate: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {**asdict(self), "perks": [perk.to_dict() for perk in self.perks]}
@@ -323,6 +329,24 @@ class RuneBuild:
     def from_dict(cls, data: dict[str, Any]) -> "RuneBuild":
         payload = dict(data)
         payload["perks"] = [BuildAsset(**item) for item in data.get("perks", [])]
+        return cls(**payload)
+
+
+@dataclass(slots=True)
+class SummonerSpellBuild:
+    name: str
+    spells: list[BuildAsset] = field(default_factory=list)
+    games: int | None = None
+    win_rate: float | None = None
+    pick_rate: float | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "spells": [spell.to_dict() for spell in self.spells]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "SummonerSpellBuild":
+        payload = dict(data)
+        payload["spells"] = [BuildAsset(**item) for item in data.get("spells", [])]
         return cls(**payload)
 
 
@@ -352,6 +376,7 @@ class ChampionBuildGuide:
     source_url: str = ""
     rune_builds: list[RuneBuild] = field(default_factory=list)
     summoner_spells: list[BuildAsset] = field(default_factory=list)
+    summoner_spell_builds: list[SummonerSpellBuild] = field(default_factory=list)
     skill_priority: list[str] = field(default_factory=list)
     skill_sequence: list[str] = field(default_factory=list)
     item_groups: list[BuildItemGroup] = field(default_factory=list)
@@ -361,6 +386,9 @@ class ChampionBuildGuide:
             **asdict(self),
             "rune_builds": [build.to_dict() for build in self.rune_builds],
             "summoner_spells": [spell.to_dict() for spell in self.summoner_spells],
+            "summoner_spell_builds": [
+                build.to_dict() for build in self.summoner_spell_builds
+            ],
             "item_groups": [group.to_dict() for group in self.item_groups],
         }
 
@@ -373,6 +401,19 @@ class ChampionBuildGuide:
         payload["summoner_spells"] = [
             BuildAsset(**item) for item in data.get("summoner_spells", [])
         ]
+        payload["summoner_spell_builds"] = [
+            SummonerSpellBuild.from_dict(item)
+            for item in data.get("summoner_spell_builds", [])
+        ]
+        if not payload["summoner_spell_builds"] and payload["summoner_spells"]:
+            payload["summoner_spell_builds"] = [SummonerSpellBuild(
+                name="추천 스펠 1",
+                spells=list(payload["summoner_spells"]),
+            )]
+        elif payload["summoner_spell_builds"] and not payload["summoner_spells"]:
+            payload["summoner_spells"] = list(
+                payload["summoner_spell_builds"][0].spells
+            )
         payload["item_groups"] = [
             BuildItemGroup.from_dict(item) for item in data.get("item_groups", [])
         ]

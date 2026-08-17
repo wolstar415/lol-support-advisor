@@ -10,7 +10,7 @@ from typing import Any
 
 
 FAST_CODEX_MODEL = "gpt-5.6-luna"
-FAST_REASONING_EFFORT = "low"
+FAST_REASONING_EFFORT = "none"
 
 
 class CodexCliError(RuntimeError):

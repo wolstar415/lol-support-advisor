@@ -9,7 +9,8 @@ import unittest
 from unittest.mock import patch
 
 from lol_support_advisor.codex_cli import (
-    CodexCliClient, CodexCliError, FAST_CODEX_MODEL, parse_codex_jsonl,
+    CodexCliClient, CodexCliError, FAST_CODEX_MODEL, FAST_REASONING_EFFORT,
+    parse_codex_jsonl,
 )
 
 
@@ -28,7 +29,7 @@ class CodexCliTests(unittest.TestCase):
         ))
         self.assertEqual(parse_codex_jsonl(output), ("thread-123", "final"))
 
-    def test_resume_uses_fast_model_low_effort_and_chatgpt_auth_environment(self) -> None:
+    def test_resume_uses_fast_model_minimal_effort_and_chatgpt_auth_environment(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             client = CodexCliClient(
                 Path(temp_dir), command="codex.cmd", timeout_seconds=5,
@@ -51,7 +52,8 @@ class CodexCliTests(unittest.TestCase):
             self.assertEqual(turn.thread_id, "thread-123")
             self.assertIn("resume", args)
             self.assertIn(FAST_CODEX_MODEL, args)
-            self.assertIn('model_reasoning_effort="low"', args)
+            self.assertEqual(FAST_REASONING_EFFORT, "none")
+            self.assertIn('model_reasoning_effort="none"', args)
             self.assertNotIn("OPENAI_API_KEY", environment)
             self.assertEqual(run.call_args.kwargs["input"], "question")
             self.assertNotEqual(run.call_args.kwargs["creationflags"], None)

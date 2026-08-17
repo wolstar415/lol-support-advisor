@@ -5,6 +5,7 @@ from contextlib import contextmanager
 import json
 from pathlib import Path
 import sqlite3
+import threading
 from typing import Any, Iterable, Iterator
 
 from .models import (
@@ -18,8 +19,30 @@ from .models import (
 class Storage:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
+        self._settings_cache_lock = threading.RLock()
+        # SQLite commits may wait for another writer for up to 20 seconds.
+        # Never hold the tiny reader lock during that wait: the Tk thread reads
+        # settings for status labels and must be able to keep using the previous
+        # committed snapshot while a background writer finishes.
+        self._settings_write_lock = threading.Lock()
+        self._settings_cache: dict[str, str] = {}
+        # Live-game analysis asks several independent questions about the same
+        # locally cached match history.  Decoding every 80KB Match-v5 payload
+        # again for each question can consume seconds of GIL time and starve Tk
+        # even when the callers run on background threads.  Keep one immutable
+        # row collection per Storage instance and rebuild it only after matches
+        # are written.  The lock is intentionally held while the cache is built
+        # so simultaneous profile workers cannot perform duplicate full scans.
+        self._decoded_match_cache_lock = threading.Lock()
+        self._decoded_match_cache: tuple[tuple[int, dict[str, Any]], ...] | None = None
+        # Header count reads must never wait behind the expensive first decode
+        # of every Match-v5 payload.  Keep this tiny revision cache on its own
+        # lock so Tk can query it while analysis workers build their cache.
+        self._match_revision_lock = threading.Lock()
+        self._match_revision_cache: tuple[int, int] | None = None
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize()
+        self._load_settings_cache()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
@@ -105,10 +128,17 @@ class Storage:
         if backfill_payloads:
             self.save_matches(backfill_payloads)
 
-    def get_setting(self, key: str, default: str = "") -> str:
+    def _load_settings_cache(self) -> None:
         with self._connect() as connection:
-            row = connection.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
-        return str(row["value"]) if row else default
+            rows = connection.execute("SELECT key, value FROM settings").fetchall()
+        with self._settings_cache_lock:
+            self._settings_cache = {
+                str(row["key"]): str(row["value"]) for row in rows
+            }
+
+    def get_setting(self, key: str, default: str = "") -> str:
+        with self._settings_cache_lock:
+            return self._settings_cache.get(key, default)
 
     def get_int_setting(
         self,
@@ -125,12 +155,19 @@ class Storage:
         return value if minimum <= value <= maximum else default
 
     def set_setting(self, key: str, value: str) -> None:
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO settings(key, value) VALUES(?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, value),
-            )
+        stored_value = str(value)
+        # Serialize the commit and cache publication. Readers either observe the
+        # previous committed value or the new committed value, never an update
+        # that later fails to persist.
+        with self._settings_write_lock:
+            with self._connect() as connection:
+                connection.execute(
+                    "INSERT INTO settings(key, value) VALUES(?, ?) "
+                    "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    (key, stored_value),
+                )
+            with self._settings_cache_lock:
+                self._settings_cache[key] = stored_value
 
     def set_riot_api_key(self, api_key: str, when: datetime | None = None) -> None:
         """Store a development key locally without ever putting it in source files."""
@@ -688,8 +725,74 @@ class Storage:
             rows = connection.execute("SELECT match_id FROM matches").fetchall()
         return {str(row["match_id"]) for row in rows}
 
+    @staticmethod
+    def _cached_match_id(match: dict[str, Any]) -> str:
+        return str((match.get("metadata") or {}).get("matchId") or "")
+
+    @staticmethod
+    def _cached_game_creation(match: dict[str, Any]) -> int:
+        return int((match.get("info") or {}).get("gameCreation") or 0)
+
+    def _merge_decoded_match_cache(
+        self, updates: list[tuple[str, int, dict[str, Any]]],
+    ) -> None:
+        """Apply committed match upserts without forcing another 69MB decode.
+
+        If the cache has not been requested yet there is nothing to maintain.
+        If it is being built, this waits for that single build and then replaces
+        the matching rows, which keeps concurrent readers accurate without a
+        second full database scan.
+        """
+        if not updates:
+            return
+        with self._match_revision_lock:
+            # Upserts can replace an existing match, so invalidating the small
+            # revision tuple is safer than assuming every saved payload adds one.
+            self._match_revision_cache = None
+        with self._decoded_match_cache_lock:
+            if self._decoded_match_cache is None:
+                return
+            updated_ids = {match_id for match_id, _queue_id, _match in updates}
+            merged = [
+                row for row in self._decoded_match_cache
+                if self._cached_match_id(row[1]) not in updated_ids
+            ]
+            merged.extend(
+                (queue_id, match) for _match_id, queue_id, match in updates
+            )
+            merged.sort(
+                key=lambda row: self._cached_game_creation(row[1]), reverse=True
+            )
+            self._decoded_match_cache = tuple(merged)
+
+    def _decoded_match_rows(self) -> tuple[tuple[int, dict[str, Any]], ...]:
+        """Return newest-first decoded matches shared by all local analyses.
+
+        Match payloads are treated as read-only by storage analysis methods.
+        Returning the cached objects avoids both the SQLite full fetch and the
+        much more expensive repeated ``json.loads`` work.
+        """
+        with self._decoded_match_cache_lock:
+            if self._decoded_match_cache is not None:
+                return self._decoded_match_cache
+            with self._connect() as connection:
+                rows = connection.execute(
+                    "SELECT queue_id, payload_json FROM matches "
+                    "ORDER BY game_creation DESC"
+                ).fetchall()
+            decoded: list[tuple[int, dict[str, Any]]] = []
+            for row in rows:
+                try:
+                    match = dict(json.loads(row["payload_json"]))
+                except (ValueError, TypeError):
+                    continue
+                decoded.append((int(row["queue_id"]), match))
+            self._decoded_match_cache = tuple(decoded)
+            return self._decoded_match_cache
+
     def save_matches(self, matches: Iterable[dict[str, Any]]) -> int:
         saved = 0
+        cache_updates: list[tuple[str, int, dict[str, Any]]] = []
         with self._connect() as connection:
             for match in matches:
                 metadata = match.get("metadata", {})
@@ -727,35 +830,34 @@ class Storage:
                             "updated_at = excluded.updated_at",
                             (f"{game_name}#{tag_line}", participant_puuid, identity_stamp),
                         )
+                cache_updates.append((match_id, int(info.get("queueId", 0)), match))
                 saved += 1
+        self._merge_decoded_match_cache(cache_updates)
         return saved
 
     def count_matches(self) -> int:
-        with self._connect() as connection:
-            row = connection.execute("SELECT COUNT(*) AS count FROM matches").fetchone()
-        return int(row["count"])
+        return self.match_revision()[0]
 
     def match_revision(self) -> tuple[int, int]:
-        with self._connect() as connection:
-            row = connection.execute(
-                "SELECT COUNT(*) AS count, COALESCE(MAX(game_creation), 0) AS newest FROM matches"
-            ).fetchone()
-        return int(row["count"]), int(row["newest"])
+        with self._match_revision_lock:
+            if self._match_revision_cache is not None:
+                return self._match_revision_cache
+            with self._connect() as connection:
+                row = connection.execute(
+                    "SELECT COUNT(*) AS count, "
+                    "COALESCE(MAX(game_creation), 0) AS newest FROM matches"
+                ).fetchone()
+            self._match_revision_cache = (
+                int(row["count"]), int(row["newest"])
+            )
+            return self._match_revision_cache
 
     def count_player_matches(self, puuid: str, limit: int = 1000) -> int:
         count = 0
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches WHERE queue_id = 420 "
-                "ORDER BY game_creation DESC"
-            ).fetchall()
-        for row in rows:
-            try:
-                participants = json.loads(row["payload_json"]).get("info", {}).get(
-                    "participants", []
-                )
-            except (ValueError, TypeError):
+        for queue_id, match in self._decoded_match_rows():
+            if queue_id != 420:
                 continue
+            participants = match.get("info", {}).get("participants", [])
             if any(item.get("puuid") == puuid for item in participants):
                 count += 1
                 if count >= limit:
@@ -806,17 +908,9 @@ class Storage:
         """Return newest locally cached matches containing the requested player."""
         if not puuid or limit <= 0:
             return []
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches WHERE queue_id = ? "
-                "ORDER BY game_creation DESC",
-                (queue_id,),
-            ).fetchall()
         matches: list[dict[str, Any]] = []
-        for row in rows:
-            try:
-                match = dict(json.loads(row["payload_json"]))
-            except (ValueError, TypeError):
+        for stored_queue_id, match in self._decoded_match_rows():
+            if stored_queue_id != queue_id:
                 continue
             participants = (match.get("info") or {}).get("participants") or []
             if not any(participant.get("puuid") == puuid for participant in participants):
@@ -1088,15 +1182,8 @@ class Storage:
     def recent_riot_ids(self, my_puuid: str, limit: int = 9) -> list[tuple[str, str]]:
         result: list[tuple[str, str]] = []
         seen: set[str] = set()
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches ORDER BY game_creation DESC"
-            ).fetchall()
-        for row in rows:
-            try:
-                participants = json.loads(row["payload_json"]).get("info", {}).get("participants", [])
-            except (ValueError, TypeError):
-                continue
+        for _queue_id, match in self._decoded_match_rows():
+            participants = match.get("info", {}).get("participants", [])
             if not any(item.get("puuid") == my_puuid for item in participants):
                 continue
             for participant in participants:
@@ -1116,15 +1203,8 @@ class Storage:
 
     def pair_same_team_games(self, first_puuid: str, second_puuid: str, limit: int = 30) -> int:
         games = inspected = 0
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches ORDER BY game_creation DESC"
-            ).fetchall()
-        for row in rows:
-            try:
-                participants = json.loads(row["payload_json"]).get("info", {}).get("participants", [])
-            except (ValueError, TypeError):
-                continue
+        for _queue_id, match in self._decoded_match_rows():
+            participants = match.get("info", {}).get("participants", [])
             first = next((item for item in participants if item.get("puuid") == first_puuid), None)
             second = next((item for item in participants if item.get("puuid") == second_puuid), None)
             if not first or not second:
@@ -1140,16 +1220,8 @@ class Storage:
         self, puuid: str, champion_id: str, limit: int = 50
     ) -> tuple[int, int]:
         games = wins = 0
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches ORDER BY game_creation DESC"
-            ).fetchall()
         inspected = 0
-        for row in rows:
-            try:
-                match = json.loads(row["payload_json"])
-            except (ValueError, TypeError):
-                continue
+        for _queue_id, match in self._decoded_match_rows():
             participant = next(
                 (item for item in match.get("info", {}).get("participants", []) if item.get("puuid") == puuid),
                 None,
@@ -1189,15 +1261,8 @@ class Storage:
         return inspected, games, wins
 
     def latest_player_match(self, puuid: str) -> dict[str, Any] | None:
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches WHERE queue_id = 420 "
-                "ORDER BY game_creation DESC"
-            ).fetchall()
-        for row in rows:
-            try:
-                match = json.loads(row["payload_json"])
-            except (ValueError, TypeError):
+        for queue_id, match in self._decoded_match_rows():
+            if queue_id != 420:
                 continue
             participant = next(
                 (
@@ -1249,16 +1314,9 @@ class Storage:
             "last_met_my_champion_id": "",
             "last_met_other_champion_id": "",
         }
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches ORDER BY game_creation DESC"
-            ).fetchall()
         inspected_my_games = 0
-        for row in rows:
-            try:
-                participants = json.loads(row["payload_json"]).get("info", {}).get("participants", [])
-            except (ValueError, TypeError):
-                continue
+        for _queue_id, match in self._decoded_match_rows():
+            participants = match.get("info", {}).get("participants", [])
             mine = next((item for item in participants if item.get("puuid") == my_puuid), None)
             if not mine:
                 continue
@@ -1329,17 +1387,11 @@ class Storage:
         }
         if not stats or not puuid:
             return stats
-        with self._connect() as connection:
-            rows = connection.execute(
-                "SELECT payload_json FROM matches WHERE queue_id = 420 ORDER BY game_creation DESC"
-            ).fetchall()
 
         inspected = 0
         requested_position = self._normalized_position(position)
-        for row in rows:
-            try:
-                match = json.loads(row["payload_json"])
-            except (ValueError, TypeError):
+        for queue_id, match in self._decoded_match_rows():
+            if queue_id != 420:
                 continue
             participants = match.get("info", {}).get("participants", [])
             mine = next((p for p in participants if p.get("puuid") == puuid), None)

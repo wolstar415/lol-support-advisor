@@ -8,12 +8,95 @@ import queue
 import re
 import ssl
 import threading
+import time
 import tkinter as tk
 from typing import Callable
 from urllib.request import Request, urlopen
 
 from .champions import ChampionRegistry
 from .models import ChampionBuildGuide
+
+
+_READY_BATCH_SIZE = 16
+_READY_TIME_BUDGET_SECONDS = 0.008
+_READY_BACKLOG_DELAY_MS = 1
+
+
+def _drain_callback_queue(
+    root: tk.Misc,
+    ready: queue.SimpleQueue[Callable[[], None]],
+    again: Callable[[], None],
+    idle_delay_ms: int,
+) -> None:
+    """Run a bounded slice of Tk callbacks so an icon burst cannot freeze UI input."""
+    started = time.perf_counter()
+    drained = 0
+    backlog = False
+    try:
+        try:
+            while drained < _READY_BATCH_SIZE:
+                if (
+                    drained
+                    and time.perf_counter() - started >= _READY_TIME_BUDGET_SECONDS
+                ):
+                    backlog = True
+                    break
+                callback = ready.get_nowait()
+                drained += 1
+                callback()
+            if drained >= _READY_BATCH_SIZE:
+                # The queue may contain exactly one batch.  One inexpensive fast
+                # follow-up is preferable to probing SimpleQueue with qsize().
+                backlog = True
+        except queue.Empty:
+            backlog = False
+    finally:
+        try:
+            root.after(
+                _READY_BACKLOG_DELAY_MS if backlog else idle_delay_ms,
+                again,
+            )
+        except tk.TclError:
+            return
+
+
+def _captured_value_token(value: object) -> tuple[object, ...]:
+    """Make a conservative identity token for an on-ready callback capture."""
+    if value is None or isinstance(value, (bool, int, float, str, bytes)):
+        return ("value", type(value), value)
+    if isinstance(value, tuple):
+        return ("tuple", *(_captured_value_token(item) for item in value))
+    return ("object", type(value), id(value))
+
+
+def _callback_token(callback: Callable[[], None]) -> tuple[object, ...]:
+    """Identify freshly-created lambdas when their code and captures are identical."""
+    bound_self = getattr(callback, "__self__", None)
+    bound_function = getattr(callback, "__func__", None)
+    if bound_self is not None and bound_function is not None:
+        return ("bound", bound_function, id(bound_self))
+
+    code = getattr(callback, "__code__", None)
+    if code is None:
+        return ("callable", type(callback), id(callback))
+
+    closure_tokens: list[tuple[object, ...]] = []
+    for cell in getattr(callback, "__closure__", None) or ():
+        try:
+            closure_tokens.append(_captured_value_token(cell.cell_contents))
+        except ValueError:
+            closure_tokens.append(("empty-cell",))
+    defaults = tuple(
+        _captured_value_token(value)
+        for value in (getattr(callback, "__defaults__", None) or ())
+    )
+    keyword_defaults = tuple(
+        (name, _captured_value_token(value))
+        for name, value in sorted(
+            (getattr(callback, "__kwdefaults__", None) or {}).items()
+        )
+    )
+    return ("function", code, tuple(closure_tokens), defaults, keyword_defaults)
 
 
 class ChampionIconCache:
@@ -23,54 +106,86 @@ class ChampionIconCache:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._images: dict[tuple[str, int], tk.PhotoImage] = {}
+        # ``get`` runs on Tk's thread while download and bulk-prefetch workers
+        # complete in the background. Keep their shared state atomic.
+        self._state_lock = threading.RLock()
         self._pending: set[str] = set()
         self._callbacks: dict[str, list[Callable[[], None]]] = {}
+        self._callback_tokens: dict[str, set[tuple[object, ...]]] = {}
         self._prefetch_versions: set[str] = set()
         self._existing_paths: dict[str, Path] = {}
+        self._failed_until: dict[str, float] = {}
         self._ready: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
+        self._index_existing_paths()
         self.root.after(120, self._drain_ready)
 
     def _drain_ready(self) -> None:
+        _drain_callback_queue(self.root, self._ready, self._drain_ready, 120)
+
+    def _index_existing_paths(self) -> None:
+        """Index every usable patch icon once instead of globbing during get()."""
+        indexed: dict[str, tuple[bool, int, Path]] = {}
         try:
-            while True:
-                callback = self._ready.get_nowait()
-                callback()
-        except queue.Empty:
-            pass
-        try:
-            self.root.after(120, self._drain_ready)
-        except tk.TclError:
+            paths = self.cache_dir.glob("*/*.png")
+            for path in paths:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                if not path.is_file() or stat.st_size <= 0:
+                    continue
+                candidate = (
+                    path.parent.name == self.registry.version,
+                    stat.st_mtime_ns,
+                    path,
+                )
+                previous = indexed.get(path.stem)
+                if previous is None or candidate[:2] > previous[:2]:
+                    indexed[path.stem] = candidate
+        except OSError:
             return
+        with self._state_lock:
+            self._existing_paths = {
+                champion_id: candidate[2]
+                for champion_id, candidate in indexed.items()
+            }
+
+    def _remember_callback(
+        self, champion_id: str, callback: Callable[[], None]
+    ) -> None:
+        with self._state_lock:
+            token = _callback_token(callback)
+            tokens = self._callback_tokens.setdefault(champion_id, set())
+            if token in tokens:
+                return
+            tokens.add(token)
+            self._callbacks.setdefault(champion_id, []).append(callback)
+
+    def _take_callbacks(self, champion_id: str) -> list[Callable[[], None]]:
+        with self._state_lock:
+            self._callback_tokens.pop(champion_id, None)
+            return self._callbacks.pop(champion_id, [])
 
     def _path(self, champion_id: str) -> Path:
         return self.cache_dir / self.registry.version / f"{champion_id}.png"
 
     def _existing_path(self, champion_id: str) -> Path | None:
         current = self._path(champion_id)
-        try:
-            if current.is_file() and current.stat().st_size > 0:
-                self._existing_paths[champion_id] = current
-                return current
-        except OSError:
-            pass
-        remembered = self._existing_paths.get(champion_id)
-        try:
-            if remembered and remembered.is_file() and remembered.stat().st_size > 0:
-                return remembered
-        except OSError:
+        with self._state_lock:
+            remembered = self._existing_paths.get(champion_id)
+            # Prefer the active patch just as before, while the initialized
+            # index supplies an older reusable patch without another glob.
+            for candidate in (current, remembered):
+                if candidate is None:
+                    continue
+                try:
+                    if candidate.is_file() and candidate.stat().st_size > 0:
+                        self._existing_paths[champion_id] = candidate
+                        return candidate
+                except OSError:
+                    continue
             self._existing_paths.pop(champion_id, None)
-        try:
-            candidates = [
-                path for path in self.cache_dir.glob(f"*/{champion_id}.png")
-                if path.is_file() and path.stat().st_size > 0
-            ]
-        except OSError:
             return None
-        if not candidates:
-            return None
-        selected = max(candidates, key=lambda path: path.stat().st_mtime)
-        self._existing_paths[champion_id] = selected
-        return selected
 
     def is_cached(self, champion_id: str) -> bool:
         """Return whether a reusable local icon exists in any cached patch."""
@@ -106,26 +221,70 @@ class ChampionIconCache:
         if not url:
             return None
         path = self._path(champion_id)
-        if on_ready:
-            self._callbacks.setdefault(champion_id, []).append(on_ready)
-        if champion_id in self._pending:
-            return None
-        self._pending.add(champion_id)
+        late_cached = False
+        with self._state_lock:
+            # A prefetch can publish the file between the first disk check and
+            # this claim. Recheck while holding the same lock used by its
+            # completion path so a second download cannot be launched.
+            try:
+                late_cached = path.is_file() and path.stat().st_size > 0
+            except OSError:
+                late_cached = False
+            if late_cached:
+                self._existing_paths[champion_id] = path
+            else:
+                retry_at = self._failed_until.get(champion_id, 0.0)
+                if retry_at > time.monotonic():
+                    return None
+                self._failed_until.pop(champion_id, None)
+                if on_ready:
+                    self._remember_callback(champion_id, on_ready)
+                if champion_id in self._pending:
+                    return None
+                self._pending.add(champion_id)
+        if late_cached:
+            try:
+                original = tk.PhotoImage(file=str(path))
+                divisor = max(1, round(original.width() / max(size, 1)))
+                image = original.subsample(divisor, divisor) if divisor > 1 else original
+                self._images[key] = image
+                return image
+            except tk.TclError:
+                return None
 
         def download() -> None:
+            downloaded = False
+            temporary = path.with_suffix(".part")
             try:
                 request = Request(url, headers={"User-Agent": "LOL-Support-Advisor/0.2"})
                 with urlopen(request, timeout=12, context=ssl.create_default_context()) as response:
                     payload = response.read()
+                if not payload:
+                    raise OSError("empty champion icon response")
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(payload)
-                self._existing_paths[champion_id] = path
+                temporary.write_bytes(payload)
+                temporary.replace(path)
+                downloaded = True
             except OSError:
-                pass
+                # A failed icon used to invoke on_ready, which rebuilt the
+                # player card and immediately retried the same failed download
+                # forever.  Back off silently; any later render may retry.
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
             finally:
-                self._pending.discard(champion_id)
-                for callback in self._callbacks.pop(champion_id, []):
-                    self._ready.put(callback)
+                with self._state_lock:
+                    if downloaded:
+                        self._existing_paths[champion_id] = path
+                        self._failed_until.pop(champion_id, None)
+                    else:
+                        self._failed_until[champion_id] = time.monotonic() + 300.0
+                    self._pending.discard(champion_id)
+                    callbacks = self._take_callbacks(champion_id)
+                if downloaded:
+                    for callback in callbacks:
+                        self._ready.put(callback)
 
         threading.Thread(target=download, daemon=True).start()
         return None
@@ -133,38 +292,67 @@ class ChampionIconCache:
     def prefetch_all(self, on_ready: Callable[[], None] | None = None) -> bool:
         """Download the current patch's icons sequentially without blocking Tk."""
         version = self.registry.version
-        if version == "fallback" or version in self._prefetch_versions:
+        with self._state_lock:
+            already_prefetched = version in self._prefetch_versions
+            if version != "fallback" and not already_prefetched:
+                self._prefetch_versions.add(version)
+        if version == "fallback" or already_prefetched:
             if on_ready:
                 self._ready.put(on_ready)
             return False
-        self._prefetch_versions.add(version)
         champion_ids = sorted(self.registry.by_id)
 
         def download_all() -> None:
             context = ssl.create_default_context()
             for champion_id in champion_ids:
                 path = self._path(champion_id)
-                if self.is_cached(champion_id) or champion_id in self._pending:
+                if self.is_cached(champion_id):
                     continue
                 url = self.registry.icon_url(champion_id)
                 if not url:
                     continue
-                self._pending.add(champion_id)
+                with self._state_lock:
+                    if champion_id in self._pending:
+                        continue
+                    retry_at = self._failed_until.get(champion_id, 0.0)
+                    if retry_at > time.monotonic():
+                        continue
+                    self._failed_until.pop(champion_id, None)
+                    self._pending.add(champion_id)
+                downloaded = False
+                temporary = path.with_suffix(".part")
                 try:
                     request = Request(url, headers={"User-Agent": "LOL-Support-Advisor/0.2"})
                     with urlopen(
                         request, timeout=12, context=context
                     ) as response:
                         payload = response.read()
+                    if not payload:
+                        raise OSError("empty champion icon response")
                     path.parent.mkdir(parents=True, exist_ok=True)
-                    path.write_bytes(payload)
-                    self._existing_paths[champion_id] = path
+                    temporary.write_bytes(payload)
+                    temporary.replace(path)
+                    downloaded = True
                 except OSError:
+                    try:
+                        temporary.unlink(missing_ok=True)
+                    except OSError:
+                        pass
                     continue
                 finally:
-                    self._pending.discard(champion_id)
-                    for callback in self._callbacks.pop(champion_id, []):
-                        self._ready.put(callback)
+                    with self._state_lock:
+                        if downloaded:
+                            self._existing_paths[champion_id] = path
+                            self._failed_until.pop(champion_id, None)
+                        else:
+                            self._failed_until[champion_id] = (
+                                time.monotonic() + 300.0
+                            )
+                        self._pending.discard(champion_id)
+                        callbacks = self._take_callbacks(champion_id)
+                    if downloaded:
+                        for callback in callbacks:
+                            self._ready.put(callback)
             if on_ready:
                 self._ready.put(on_ready)
 
@@ -183,6 +371,7 @@ class ItemIconCache:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._images: dict[tuple[str, int], tk.PhotoImage] = {}
+        self._state_lock = threading.RLock()
         self._pending: set[str] = set()
         self._failed: set[str] = set()
         self._callbacks: dict[str, list[Callable[[], None]]] = {}
@@ -301,12 +490,13 @@ class ItemIconCache:
         self._ensure_metadata()
         normalized = str(item_id or "")
         if not normalized or normalized == "0":
-            if on_ready:
-                self._ready.put(on_ready)
             return None
         key = (normalized, size)
         if key in self._images:
             return self._images[key]
+        with self._state_lock:
+            if normalized in self._failed:
+                return None
         path = self._path(normalized)
         if path.exists():
             try:
@@ -316,19 +506,19 @@ class ItemIconCache:
                 self._images[key] = image
                 return image
             except tk.TclError:
-                self._failed.add(normalized)
+                with self._state_lock:
+                    self._failed.add(normalized)
                 return None
-        if normalized in self._pending:
+        if self.registry.version == "fallback":
+            return None
+        with self._state_lock:
+            if normalized in self._failed:
+                return None
             if on_ready:
                 self._callbacks.setdefault(normalized, []).append(on_ready)
-            return None
-        if self.registry.version == "fallback" or normalized in self._failed:
-            if on_ready:
-                self._ready.put(on_ready)
-            return None
-        self._pending.add(normalized)
-        if on_ready:
-            self._callbacks.setdefault(normalized, []).append(on_ready)
+            if normalized in self._pending:
+                return None
+            self._pending.add(normalized)
         url = (
             f"https://ddragon.leagueoflegends.com/cdn/{self.registry.version}/"
             f"img/item/{normalized}.png"
@@ -340,32 +530,40 @@ class ItemIconCache:
         context = ssl.create_default_context()
         while True:
             item_id, path, url, on_ready = self._downloads.get()
+            downloaded = False
+            temporary = path.with_suffix(".part")
             try:
                 request = Request(url, headers={"User-Agent": "LOL-Support-Advisor/0.2"})
                 with urlopen(request, timeout=12, context=context) as response:
                     payload = response.read()
+                if not payload:
+                    raise OSError("empty item icon response")
                 path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_bytes(payload)
+                temporary.write_bytes(payload)
+                temporary.replace(path)
+                downloaded = True
             except OSError:
-                self._failed.add(item_id)
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
             finally:
-                self._pending.discard(item_id)
-                if on_ready:
-                    self._ready.put(on_ready)
-                for callback in self._callbacks.pop(item_id, []):
-                    self._ready.put(callback)
+                with self._state_lock:
+                    if downloaded:
+                        self._failed.discard(item_id)
+                    else:
+                        self._failed.add(item_id)
+                    self._pending.discard(item_id)
+                    callbacks = self._callbacks.pop(item_id, [])
+                if downloaded:
+                    if on_ready:
+                        self._ready.put(on_ready)
+                    for callback in callbacks:
+                        self._ready.put(callback)
                 self._downloads.task_done()
 
     def _drain_ready(self) -> None:
-        try:
-            while True:
-                self._ready.get_nowait()()
-        except queue.Empty:
-            pass
-        try:
-            self.root.after(140, self._drain_ready)
-        except tk.TclError:
-            return
+        _drain_callback_queue(self.root, self._ready, self._drain_ready, 140)
 
 
 class RemoteIconCache:
@@ -376,6 +574,7 @@ class RemoteIconCache:
         self.cache_dir = cache_dir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self._images: dict[tuple[str, int], tk.PhotoImage] = {}
+        self._state_lock = threading.RLock()
         self._pending: set[str] = set()
         self._failed: set[str] = set()
         self._callbacks: dict[str, list[Callable[[], None]]] = {}
@@ -393,13 +592,15 @@ class RemoteIconCache:
         on_ready: Callable[[], None] | None = None,
     ) -> tk.PhotoImage | None:
         if not key or not url:
-            if on_ready:
-                self._ready.put(on_ready)
             return None
         image_key = (f"{key}|{url}", size)
         if image_key in self._images:
             return self._images[image_key]
         path = self._path(key, url)
+        pending_key = str(path)
+        with self._state_lock:
+            if pending_key in self._failed:
+                return None
         if path.exists():
             try:
                 original = tk.PhotoImage(file=str(path))
@@ -408,20 +609,17 @@ class RemoteIconCache:
                 self._images[image_key] = image
                 return image
             except tk.TclError:
-                self._failed.add(pending_key := str(path))
-                if on_ready:
-                    self._ready.put(on_ready)
+                with self._state_lock:
+                    self._failed.add(pending_key)
                 return None
-        pending_key = str(path)
-        if on_ready:
-            self._callbacks.setdefault(pending_key, []).append(on_ready)
-        if pending_key in self._failed:
-            for callback in self._callbacks.pop(pending_key, []):
-                self._ready.put(callback)
-            return None
-        if pending_key in self._pending:
-            return None
-        self._pending.add(pending_key)
+        with self._state_lock:
+            if pending_key in self._failed:
+                return None
+            if on_ready:
+                self._callbacks.setdefault(pending_key, []).append(on_ready)
+            if pending_key in self._pending:
+                return None
+            self._pending.add(pending_key)
 
         self._downloads.put((pending_key, path, url))
         return None
@@ -430,30 +628,40 @@ class RemoteIconCache:
         context = ssl.create_default_context()
         while True:
             pending_key, path, url = self._downloads.get()
+            downloaded = False
+            temporary = path.with_suffix(".part")
             try:
                 request = Request(url, headers={"User-Agent": "LOL-Support-Advisor/0.3"})
                 with urlopen(
                     request, timeout=12, context=context
                 ) as response:
-                    path.write_bytes(response.read())
+                    payload = response.read()
+                if not payload:
+                    raise OSError("empty remote icon response")
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary.write_bytes(payload)
+                temporary.replace(path)
+                downloaded = True
             except OSError:
-                self._failed.add(pending_key)
+                try:
+                    temporary.unlink(missing_ok=True)
+                except OSError:
+                    pass
             finally:
-                self._pending.discard(pending_key)
-                for callback in self._callbacks.pop(pending_key, []):
-                    self._ready.put(callback)
+                with self._state_lock:
+                    if downloaded:
+                        self._failed.discard(pending_key)
+                    else:
+                        self._failed.add(pending_key)
+                    self._pending.discard(pending_key)
+                    callbacks = self._callbacks.pop(pending_key, [])
+                if downloaded:
+                    for callback in callbacks:
+                        self._ready.put(callback)
                 self._downloads.task_done()
 
     def _drain_ready(self) -> None:
-        try:
-            while True:
-                self._ready.get_nowait()()
-        except queue.Empty:
-            pass
-        try:
-            self.root.after(140, self._drain_ready)
-        except tk.TclError:
-            return
+        _drain_callback_queue(self.root, self._ready, self._drain_ready, 140)
 
 
 class BuildAssetPreloader:
@@ -513,8 +721,20 @@ class BuildAssetPreloader:
                     self._remote_path(f"rune:{perk.asset_id}", perk.icon_url),
                 )
                 totals[status] += 1
-        for spell in guide.summoner_spells:
-            key = ("spell", spell.asset_id, spell.icon_url)
+        spell_builds = getattr(guide, "summoner_spell_builds", None) or []
+        if spell_builds:
+            spells = (
+                spell
+                for spell_build in spell_builds
+                for spell in spell_build.spells
+            )
+        else:
+            # Older cached guides only have the legacy flat pair.
+            spells = iter(guide.summoner_spells)
+        for spell in spells:
+            # A spell can occur in every recommended combination.  Its asset id
+            # identifies the same cached icon even when source URLs differ.
+            key = ("spell", spell.asset_id, "")
             if key in seen:
                 continue
             seen.add(key)

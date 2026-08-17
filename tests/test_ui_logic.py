@@ -1,33 +1,233 @@
 from __future__ import annotations
 
+import json
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from lol_support_advisor.ui import (
     AdvisorApp, adc_flow_hint, allied_adc_member, candidate_score,
     behavior_strength_signals, behavior_weakness_signals,
+    build_guide_has_statistics, build_loadout_stat_text,
     cache_manager_champion_ids,
+    choose_lux_auto_ban_target_ms,
     final_item_builds, matchup_build_reason,
+    game_prediction_display_signature, local_draft_selection,
+    live_active_context_signature, live_roster_signature,
     estimate_live_game_prediction,
     matchup_final_item_builds, matchup_item_groups, matchup_rune_index,
     lane_matchup_from_snapshot, lane_matchup_label, lane_matchup_snapshot_fresh,
     matchup_counter_for_candidate,
     opgg_recent_form, participant_performance_ranks, representative_build_item,
     recent_match_ids_from_payload, streak_badge_text, support_archetype,
+    recommendation_draft_context_signature,
     team_objective_counts,
 )
 from lol_support_advisor.icons import ItemIconCache
 from lol_support_advisor.models import (
-    BuildAsset, BuildItemGroup, DraftMember, DraftSnapshot, LaneMatchupStat,
+    BuildAsset, BuildItemGroup, ChampionBuildGuide, DraftBan, DraftMember,
+    DraftSnapshot, GamePrediction,
+    LaneMatchupStat,
     LiveGameSnapshot, LivePlayer,
     OpggCounter, OpggMcpChampionStat, OpggMcpRecentMatch,
     OpggMcpSummonerProfile, OpggSnapshot, OpggSynergyStat,
     PersonalStat, PlayerBehaviorStat, PlayerProfileStat, RuneBuild,
+    SummonerSpellBuild,
 )
 
 
 class DuoEvidenceTests(unittest.TestCase):
+    def test_enemy_ban_hover_rerenders_only_enemy_ban_strip(self) -> None:
+        class FakeWidget:
+            def configure(self, **_values: object) -> None:
+                pass
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.draft = DraftSnapshot(my_role="SUPPORT")
+        app.draft.refresh_snapshot_id()
+        app.recommendations = []
+        app.recommendation_snapshot_id = ""
+        app.recommendation_context_signature = ""
+        app._pick_order_change_notice = ""
+        app._selection_panel_revisions = {}
+        app._selection_panel_signatures = {}
+        for name in (
+            "pick_order_label", "enemy_instruction_label",
+            "enemy_unknown_button", "enemy_support_label", "stale_label",
+            "ally_bans_frame", "enemy_bans_frame",
+            "ally_picks_frame", "enemy_picks_frame",
+        ):
+            setattr(app, name, FakeWidget())
+        rendered: list[tuple[str, bool]] = []
+        app._render_draft_bans = (
+            lambda _frame, ally: rendered.append(("bans", ally))
+        )
+        app._render_draft_team_slots = (
+            lambda _frame, ally: rendered.append(("picks", ally))
+        )
+
+        app._render_draft()
+        self.assertCountEqual(rendered, [
+            ("bans", True), ("bans", False),
+            ("picks", True), ("picks", False),
+        ])
+
+        rendered.clear()
+        app.draft.enemy_ban_actions = [
+            DraftBan("Lux", "럭스", "HOVER", actor_cell_id=5, order=1)
+        ]
+        app.draft.refresh_snapshot_id()
+        app._render_draft()
+        self.assertEqual(rendered, [("bans", False)])
+
+    def test_lux_auto_ban_target_has_safe_early_window(self) -> None:
+        observed: list[tuple[int, int]] = []
+
+        def picker(minimum: int, maximum: int) -> int:
+            observed.append((minimum, maximum))
+            return 9_000
+
+        self.assertEqual(choose_lux_auto_ban_target_ms(picker), 9_000)
+        self.assertEqual(observed, [(8_000, 10_000)])
+
+    def test_recommendation_context_ignores_ban_hover_but_not_locked_ban(self) -> None:
+        member = DraftMember(
+            "Malphite", "말파이트", "SUPPORT", "HOVER",
+            cell_id=4, pick_order=5,
+        )
+        draft = DraftSnapshot(
+            my_role="SUPPORT", my_pick_order=5, local_player_cell_id=4,
+            ally_team_order=[member],
+        )
+        baseline = recommendation_draft_context_signature(draft)
+
+        draft.enemy_ban_actions = [
+            DraftBan("Lux", "럭스", "HOVER", actor_cell_id=5, order=1)
+        ]
+        self.assertEqual(
+            recommendation_draft_context_signature(draft), baseline,
+        )
+
+        draft.enemy_bans = ["Lux"]
+        self.assertNotEqual(
+            recommendation_draft_context_signature(draft), baseline,
+        )
+
+    def test_local_draft_selection_keeps_completed_local_pick_visible(self) -> None:
+        locked = DraftMember(
+            "Malphite", "말파이트", "SUPPORT", "LOCKED", cell_id=4,
+        )
+        draft = DraftSnapshot(
+            local_player_cell_id=4,
+            ally_locked=[locked],
+            ally_team_order=[locked],
+        )
+        self.assertIs(local_draft_selection(draft), locked)
+
+        hover = DraftMember(
+            "Braum", "브라움", "SUPPORT", "HOVER", cell_id=4,
+        )
+        draft.my_hover = hover
+        self.assertIs(local_draft_selection(draft), hover)
+
+    def test_prediction_display_signature_ignores_capture_time_only(self) -> None:
+        first = GamePrediction(
+            prediction_key="game-key",
+            captured_at="2026-08-18T12:00:00",
+            active_riot_id="Me#KR1",
+            active_champion_id="Malphite",
+            ally_champion_ids=("Malphite",),
+            enemy_champion_ids=("Yuumi",),
+            ally_riot_ids=("Me#KR1",),
+            enemy_riot_ids=("Enemy#KR1",),
+            win_probability=52.4,
+            predicted_win=True,
+            confidence="보통",
+            evidence=("라인 상성 +2.4",),
+            evidence_score=0.6,
+        )
+        second = GamePrediction.from_dict({
+            **first.to_dict(), "captured_at": "2026-08-18T12:00:03",
+        })
+        changed = GamePrediction.from_dict({
+            **first.to_dict(), "win_probability": 49.9,
+            "predicted_win": False,
+        })
+
+        self.assertEqual(
+            game_prediction_display_signature(first),
+            game_prediction_display_signature(second),
+        )
+        self.assertNotEqual(
+            game_prediction_display_signature(first),
+            game_prediction_display_signature(changed),
+        )
+
+    def test_codex_answer_can_be_parsed_against_requested_draft_after_change(self) -> None:
+        class FakeLabel:
+            def __init__(self) -> None:
+                self.values: dict[str, object] = {}
+
+            def configure(self, **values: object) -> None:
+                self.values.update(values)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.registry = SimpleNamespace(
+            contains=lambda champion_id: champion_id in {"Braum", "Janna", "Nami"},
+        )
+        requested = DraftSnapshot(my_role="SUPPORT")
+        requested.refresh_snapshot_id()
+        current = DraftSnapshot(my_role="SUPPORT", ally_bans=["Lux"])
+        current.refresh_snapshot_id()
+        app.draft = current
+        app.exchange_status = FakeLabel()
+        app.recommendations = []
+        app.recommendation_snapshot_id = ""
+        app._recommendation_apply_error = ""
+        app._selection_panel_signatures = {}
+        app._render_recommendations = lambda: None
+        app._render_prompt_summary = lambda: None
+        payload = {
+            "schema_version": 2,
+            "snapshot_id": requested.snapshot_id,
+            "recommendations": [
+                {
+                    "rank": rank,
+                    "champion_id": champion_id,
+                    "champion_name_ko": champion_id,
+                    "style": "테스트",
+                    "blind_safety": "보통",
+                    "reason": "이유",
+                    "team_synergy": "조합",
+                    "lane_plan": "라인",
+                    "watch_for": "주의",
+                }
+                for rank, champion_id in enumerate(("Braum", "Janna", "Nami"), 1)
+            ],
+        }
+        response = (
+            "LOL_SUPPORT_V2\n"
+            + json.dumps(payload, ensure_ascii=False)
+            + "\nEND_LOL_SUPPORT_V2"
+        )
+
+        applied = app._apply_recommendation_text(
+            response,
+            show_dialog=False,
+            draft_context=requested,
+            render_summary=False,
+        )
+
+        self.assertTrue(applied)
+        self.assertEqual(len(app.recommendations), 3)
+        self.assertEqual(app.recommendation_snapshot_id, requested.snapshot_id)
+        self.assertEqual(
+            app.recommendation_context_signature,
+            recommendation_draft_context_signature(requested),
+        )
+        self.assertNotEqual(app.recommendation_snapshot_id, current.snapshot_id)
+
     def test_cache_manager_catalog_prevents_stale_wrong_role_cards(self) -> None:
         self.assertEqual(
             cache_manager_champion_ids(
@@ -451,6 +651,497 @@ class DuoEvidenceTests(unittest.TestCase):
         ]
         self.assertNotEqual(first, app._single_play_card_signature(player))
 
+    def test_play_insight_render_uses_trailing_debounce(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.pending: dict[str, tuple[int, object]] = {}
+                self.cancelled: list[str] = []
+                self.serial = 0
+
+            def after(self, delay: int, callback: object) -> str:
+                self.serial += 1
+                callback_id = f"after-{self.serial}"
+                self.pending[callback_id] = (delay, callback)
+                return callback_id
+
+            def after_cancel(self, callback_id: str) -> None:
+                self.cancelled.append(callback_id)
+                self.pending.pop(callback_id, None)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app._play_insight_after_id = None
+        rendered: list[bool] = []
+        app._current_main_tab_index = lambda: 1
+        app._render_play_insights = lambda: rendered.append(True)
+
+        app._schedule_play_insight_render()
+        first_id = app._play_insight_after_id
+        app._schedule_play_insight_render()
+
+        self.assertIn(first_id, app.root.cancelled)
+        self.assertEqual(len(app.root.pending), 1)
+        callback_id, (delay, callback) = next(iter(app.root.pending.items()))
+        self.assertEqual(delay, 380)
+        callback()
+        self.assertEqual(rendered, [True])
+        self.assertIsNone(app._play_insight_after_id)
+        self.assertEqual(callback_id, "after-2")
+
+    def test_play_summary_skips_identical_inputs(self) -> None:
+        class FakeLabel:
+            def configure(self, **_kwargs: object) -> None:
+                pass
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        player = LivePlayer(
+            "Janna", "잔나", "Player", "KR1", "ORDER", "UTILITY", 1, True,
+        )
+        app.live_game = LiveGameSnapshot(
+            players=[player], active_team="ORDER", active_riot_id=player.riot_id,
+        )
+        app.player_profiles = {
+            player.riot_id: PlayerProfileStat(
+                season_wins=10, season_losses=8, recent_games=5,
+                recent_wins=3, champion_games=4, champion_wins=2,
+                status="OK", updated_at="2026-08-18T01:00:00",
+            )
+        }
+        app.duo_pairs = {}
+        app.lane_matchups = {}
+        app._lane_matchup_refreshing = set()
+        app._live_signature = "LIVE-1"
+        app._play_summary_signature = ""
+        app.play_metrics = {
+            key: (FakeLabel(), FakeLabel())
+            for key in ("ally", "enemy", "cache", "duo", "matchup", "prediction")
+        }
+        updates: list[bool] = []
+        app._update_live_prediction = lambda: updates.append(True)
+
+        app._render_play_summary()
+        first_signature = app._play_summary_state_signature()
+        app.player_profiles[player.riot_id].updated_at = "2026-08-18T01:01:00"
+        self.assertEqual(first_signature, app._play_summary_state_signature())
+        app._render_play_summary()
+        self.assertEqual(updates, [True])
+
+        app.player_profiles[player.riot_id].recent_wins = 4
+        app._render_play_summary()
+        self.assertEqual(updates, [True, True])
+
+    def test_live_active_context_changes_without_reloading_roster(self) -> None:
+        waiting = LivePlayer(
+            "Janna", "잔나", "Player", "KR1", "ORDER", "UTILITY",
+            is_active_player=False,
+        )
+        ready = replace(waiting, is_active_player=True)
+        first = LiveGameSnapshot(players=[waiting], active_team="ORDER")
+        second = LiveGameSnapshot(
+            players=[ready], active_team="ORDER", active_riot_id=ready.riot_id,
+        )
+
+        self.assertEqual(
+            live_roster_signature(first), live_roster_signature(second),
+        )
+        self.assertNotEqual(
+            live_active_context_signature(first),
+            live_active_context_signature(second),
+        )
+
+    def test_live_poll_patches_active_player_without_profile_reload(self) -> None:
+        waiting = LivePlayer(
+            "Janna", "잔나", "Player", "KR1", "ORDER", "UTILITY",
+            is_active_player=False,
+        )
+        ready = replace(waiting, is_active_player=True)
+        previous = LiveGameSnapshot(players=[waiting], active_team="ORDER")
+        current = LiveGameSnapshot(
+            players=[ready], active_team="ORDER", active_riot_id=ready.riot_id,
+        )
+        scheduled: list[tuple[int, object]] = []
+        rendered: list[bool] = []
+        reloads: list[str] = []
+        profile = PlayerProfileStat(status="OK")
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app.game_phase = "InProgress"
+        app._live_polling = False
+        app.live_client = SimpleNamespace(snapshot=lambda: current)
+        app.root = SimpleNamespace(
+            after=lambda delay, callback: scheduled.append((delay, callback))
+        )
+        app._background = lambda work, success, _error: success(work())
+        app._attach_draft_pick_context = lambda _snapshot: None
+        app.live_game = previous
+        app._live_signature = live_roster_signature(previous)
+        app._live_active_signature = live_active_context_signature(previous)
+        app.player_profiles = {waiting.riot_id: profile}
+        app._lane_opponent_analysis_context = object()
+        app._lane_opponent_personal_stat = PersonalStat(games=1)
+        app._lane_opponent_behavior = PlayerBehaviorStat(games=1)
+        app._my_account_analysis_context = object()
+        app._my_personal_stat = PersonalStat(games=1)
+        app._my_behavior = PlayerBehaviorStat(games=1)
+        app._play_insight_signature = "old"
+        app._render_play = lambda: rendered.append(True)
+        app._load_live_profiles = lambda: reloads.append("riot")
+        app._load_opgg_live_profiles = lambda: reloads.append("opgg")
+        app._check_live_duos = lambda: reloads.append("duo")
+
+        app._poll_live()
+
+        self.assertEqual(reloads, [])
+        self.assertEqual(rendered, [True])
+        self.assertIs(app.player_profiles[ready.riot_id], profile)
+        self.assertEqual(
+            app._live_active_signature,
+            live_active_context_signature(current),
+        )
+        self.assertIsNone(app._lane_opponent_personal_stat)
+        self.assertIsNone(app._my_personal_stat)
+        self.assertIn(3000, [delay for delay, _callback in scheduled])
+
+    def test_prediction_bar_updates_without_clearing_insights(self) -> None:
+        class FakeWidget:
+            def __init__(self) -> None:
+                self.manager = ""
+                self.values: dict[str, object] = {}
+                self.pack_values: dict[str, object] = {}
+
+            def configure(self, **kwargs: object) -> None:
+                self.values.update(kwargs)
+
+            def winfo_manager(self) -> str:
+                return self.manager
+
+            def pack(self, **kwargs: object) -> None:
+                self.manager = "pack"
+                self.pack_values.update(kwargs)
+
+            def pack_forget(self) -> None:
+                self.manager = ""
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.play_prediction_frame = FakeWidget()
+        app.play_prediction_value = FakeWidget()
+        app.play_prediction_detail = FakeWidget()
+        app.play_insight_body = FakeWidget()
+        app._play_prediction_signature = ()
+        app._live_prediction = GamePrediction(
+            prediction_key="game-1", captured_at="2026-08-18T01:00:00",
+            active_riot_id="Player#KR1", active_champion_id="Janna",
+            ally_champion_ids=("Janna",), enemy_champion_ids=("Leona",),
+            ally_riot_ids=("Player#KR1",), enemy_riot_ids=("Enemy#KR1",),
+            win_probability=53.2, predicted_win=True, confidence="보통",
+            evidence=("시즌 아군 52% · 적군 49%",), evidence_score=0.5,
+        )
+        app._clear = lambda _frame: self.fail("prediction must not clear insights")
+
+        app._render_play_prediction()
+
+        self.assertEqual(app.play_prediction_frame.manager, "pack")
+        self.assertIn("53.2%", str(app.play_prediction_value.values.get("text")))
+        self.assertIs(
+            app.play_prediction_frame.pack_values.get("before"),
+            app.play_insight_body,
+        )
+
+    def test_draft_pick_context_is_read_from_storage_only_once(self) -> None:
+        reads: list[str] = []
+        cached = {
+            "ally": {"Janna": [5, 5]},
+            "enemy": {"Leona": [5, 6]},
+        }
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.draft = DraftSnapshot()
+        app.storage = SimpleNamespace(
+            get_setting=lambda key: (
+                reads.append(key) or json.dumps(cached, ensure_ascii=False)
+            )
+        )
+        app._cached_draft_pick_context = None
+        app._draft_pick_context_cache_loaded = False
+
+        first = app._draft_pick_context_candidates()
+        second = app._draft_pick_context_candidates()
+
+        self.assertEqual(reads, ["last_draft_pick_context"])
+        self.assertEqual(first, second)
+        self.assertEqual(first[0]["ally"]["Janna"], [5, 5])
+
+    def test_identical_live_profile_does_not_schedule_any_ui_work(self) -> None:
+        player = LivePlayer(
+            "Janna", "잔나", "Player", "KR1", "ORDER", "UTILITY",
+        )
+        profile = PlayerProfileStat(
+            tier="GOLD", rank="I", season_wins=20, season_losses=18,
+            status="OK", updated_at="2026-08-18T01:00:00",
+        )
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._live_signature = "LIVE-1"
+        app.live_game = LiveGameSnapshot(players=[player], active_team="ORDER")
+        app.player_profiles = {player.riot_id: profile}
+        app.opgg_player_profiles = {}
+        scheduled: list[object] = []
+        app.root = SimpleNamespace(after=lambda *_args: scheduled.append(_args))
+        app._schedule_play_render = lambda: scheduled.append("render")
+
+        app._apply_live_profile(
+            player.riot_id,
+            replace(profile, updated_at="2026-08-18T01:01:00"),
+            "LIVE-1",
+        )
+
+        self.assertEqual(scheduled, [])
+
+    def test_player_icon_ready_patches_label_without_card_render(self) -> None:
+        image = object()
+
+        class FakeLabel:
+            def __init__(self) -> None:
+                self.values: dict[str, object] = {}
+
+            @staticmethod
+            def winfo_exists() -> bool:
+                return True
+
+            def configure(self, **values: object) -> None:
+                self.values.update(values)
+
+        label = FakeLabel()
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.icon_cache = SimpleNamespace(get=lambda _champion, _size: image)
+
+        app._update_player_card_icon(label, "Janna", 68)
+
+        self.assertIs(label.values["image"], image)
+        self.assertEqual(label.values["text"], "")
+
+    def test_prediction_save_is_debounced_and_runs_in_background(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.pending: dict[str, object] = {}
+                self.serial = 0
+
+            def after(self, _delay: int, callback: object) -> str:
+                self.serial += 1
+                callback_id = f"save-{self.serial}"
+                self.pending[callback_id] = callback
+                return callback_id
+
+            def after_cancel(self, callback_id: str) -> None:
+                self.pending.pop(callback_id, None)
+
+        prediction = GamePrediction(
+            prediction_key="game-1", captured_at="2026-08-18T01:00:00",
+            active_riot_id="Player#KR1", active_champion_id="Janna",
+            ally_champion_ids=("Janna",), enemy_champion_ids=("Leona",),
+            ally_riot_ids=("Player#KR1",), enemy_riot_ids=("Enemy#KR1",),
+            win_probability=53.2, predicted_win=True, confidence="보통",
+            evidence=("시즌 표본",), evidence_score=0.5,
+        )
+        saved: list[GamePrediction] = []
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app.storage = SimpleNamespace(
+            save_game_prediction=lambda value: saved.append(value)
+        )
+        app._prediction_saved_signature = ""
+        app._prediction_save_pending_signature = ""
+        app._prediction_save_after_id = None
+        app._prediction_save_running = False
+        app._prediction_save_queued = None
+        app._background = lambda work, success, _error: success(work())
+
+        app._schedule_game_prediction_save(prediction, "settled")
+        self.assertEqual(saved, [])
+        callback = next(iter(app.root.pending.values()))
+        callback()
+
+        self.assertEqual(saved, [prediction])
+        self.assertEqual(app._prediction_saved_signature, "settled")
+
+    def test_prediction_writes_are_single_flight_and_finish_with_latest(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.pending: dict[str, object] = {}
+                self.serial = 0
+
+            def after(self, _delay: int, callback: object) -> str:
+                self.serial += 1
+                callback_id = f"save-{self.serial}"
+                self.pending[callback_id] = callback
+                return callback_id
+
+            def after_cancel(self, callback_id: str) -> None:
+                self.pending.pop(callback_id, None)
+
+        first = GamePrediction(
+            prediction_key="game-1", captured_at="2026-08-18T01:00:00",
+            active_riot_id="Player#KR1", active_champion_id="Janna",
+            ally_champion_ids=("Janna",), enemy_champion_ids=("Leona",),
+            ally_riot_ids=("Player#KR1",), enemy_riot_ids=("Enemy#KR1",),
+            win_probability=51.0, predicted_win=True, confidence="낮음",
+            evidence=("첫 표본",), evidence_score=0.2,
+        )
+        latest = replace(
+            first, captured_at="2026-08-18T01:00:01",
+            win_probability=55.0, evidence=("완료 표본",), evidence_score=0.7,
+        )
+        saved: list[GamePrediction] = []
+        workers: list[tuple[object, object, object]] = []
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app.storage = SimpleNamespace(
+            save_game_prediction=lambda value: saved.append(value)
+        )
+        app._prediction_saved_signature = ""
+        app._prediction_save_pending_signature = ""
+        app._prediction_save_after_id = None
+        app._prediction_save_running = False
+        app._prediction_save_queued = None
+        app._background = (
+            lambda work, success, error: workers.append((work, success, error))
+        )
+
+        app._schedule_game_prediction_save(first, "first")
+        next(iter(app.root.pending.values()))()
+        self.assertEqual(len(workers), 1)
+
+        app._schedule_game_prediction_save(latest, "latest")
+        list(app.root.pending.values())[-1]()
+        self.assertEqual(len(workers), 1)
+
+        work, success, _error = workers[0]
+        success(work())
+        self.assertEqual(len(workers), 2)
+        work, success, _error = workers[1]
+        success(work())
+
+        self.assertEqual(saved, [first, latest])
+        self.assertEqual(app._prediction_saved_signature, "latest")
+        self.assertFalse(app._prediction_save_running)
+
+    def test_play_insight_sections_only_clear_changed_section(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        lane = object()
+        jungle = object()
+        app.play_insight_sections = {"lane": lane, "jungle_plan": jungle}
+        app._play_insight_section_signatures = {}
+        cleared: list[object] = []
+        rendered: list[object] = []
+        app._clear = lambda section: cleared.append(section)
+
+        app._render_play_insight_section(
+            "lane", "lane-v1", lambda section: rendered.append(section),
+        )
+        app._render_play_insight_section(
+            "lane", "lane-v1", lambda section: rendered.append(section),
+        )
+        app._render_play_insight_section(
+            "jungle_plan", "jungle-v1", lambda section: rendered.append(section),
+        )
+
+        self.assertEqual(cleared, [lane, jungle])
+        self.assertEqual(rendered, [lane, jungle])
+
+    def test_scrollregion_update_debounces_and_skips_same_bbox(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.pending: dict[str, object] = {}
+                self.cancelled: list[str] = []
+                self.serial = 0
+
+            def after(self, _delay: int, callback: object) -> str:
+                self.serial += 1
+                callback_id = f"scroll-{self.serial}"
+                self.pending[callback_id] = callback
+                return callback_id
+
+            def after_cancel(self, callback_id: str) -> None:
+                self.cancelled.append(callback_id)
+                self.pending.pop(callback_id, None)
+
+        class FakeCanvas:
+            def __init__(self) -> None:
+                self.configured: list[tuple[int, int, int, int]] = []
+
+            def bbox(self, _target: str) -> tuple[int, int, int, int]:
+                return (0, 0, 100, 200)
+
+            def configure(self, *, scrollregion: tuple[int, int, int, int]) -> None:
+                self.configured.append(scrollregion)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app._scrollregion_after_ids = {}
+        app._scrollregion_bounds = {}
+        canvas = FakeCanvas()
+
+        app._schedule_scrollregion_update(canvas)
+        first_id = app._scrollregion_after_ids[canvas]
+        app._schedule_scrollregion_update(canvas)
+        self.assertIn(first_id, app.root.cancelled)
+        callback = next(iter(app.root.pending.values()))
+        callback()
+        self.assertEqual(canvas.configured, [(0, 0, 100, 200)])
+
+        app._schedule_scrollregion_update(canvas)
+        callback = next(iter(app.root.pending.values()))
+        callback()
+        self.assertEqual(canvas.configured, [(0, 0, 100, 200)])
+
+    def test_ui_queue_drain_yields_after_sixteen_callbacks(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.scheduled: list[tuple[int, object]] = []
+
+            def after(self, delay: int, callback: object) -> str:
+                self.scheduled.append((delay, callback))
+                return f"queue-{len(self.scheduled)}"
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app._ui_queue = __import__("queue").SimpleQueue()
+        completed: list[int] = []
+        for index in range(20):
+            app._ui_queue.put(lambda value=index: completed.append(value))
+
+        app._drain_ui_queue()
+        self.assertEqual(completed, list(range(16)))
+        delay, callback = app.root.scheduled[-1]
+        self.assertEqual(delay, 1)
+
+        callback()
+        self.assertEqual(completed, list(range(20)))
+        self.assertEqual(app.root.scheduled[-1][0], 80)
+
+    def test_ui_queue_callback_failure_does_not_stop_later_results(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.scheduled: list[tuple[int, object]] = []
+
+            def after(self, delay: int, callback: object) -> str:
+                self.scheduled.append((delay, callback))
+                return "queue-next"
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app._ui_queue = __import__("queue").SimpleQueue()
+        completed: list[str] = []
+
+        def fail() -> None:
+            raise RuntimeError("stale Tk widget")
+
+        app._ui_queue.put(fail)
+        app._ui_queue.put(lambda: completed.append("next"))
+
+        app._drain_ui_queue()
+
+        self.assertEqual(completed, ["next"])
+        self.assertEqual(app.root.scheduled[-1][0], 80)
+
     def test_selection_panel_signature_skips_unchanged_panel(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)
         app._selection_panel_signatures = {}
@@ -668,6 +1359,106 @@ class DuoEvidenceTests(unittest.TestCase):
         adjusted = matchup_item_groups(groups, "Leona")
         self.assertEqual(adjusted[0].items[0].asset_id, 3190)
         self.assertEqual(matchup_build_reason("Leona")[0], "이니시 대응")
+
+    def test_build_statistics_format_without_inventing_missing_sample(self) -> None:
+        self.assertEqual(
+            build_loadout_stat_text(68_728, 52.09667),
+            "승률 52.1% · 68,728게임",
+        )
+        self.assertEqual(build_loadout_stat_text(None, None), "표본 정보 없음")
+        guide = ChampionBuildGuide(
+            "Thresh", "쓰레쉬", "SUPPORT",
+            rune_builds=[RuneBuild(
+                "추천 룬", 8400, 8300, [], games=68_728, win_rate=52.1,
+            )],
+            summoner_spell_builds=[SummonerSpellBuild(
+                "추천 스펠", [BuildAsset(4, "점멸"), BuildAsset(14, "점화")],
+                games=88_622, win_rate=52.0,
+            )],
+        )
+        self.assertTrue(build_guide_has_statistics(guide))
+        self.assertFalse(build_guide_has_statistics(ChampionBuildGuide(
+            "Thresh", "쓰레쉬", "SUPPORT", rune_builds=guide.rune_builds,
+        )))
+        self.assertFalse(build_guide_has_statistics(ChampionBuildGuide(
+            "Thresh", "쓰레쉬", "SUPPORT",
+        )))
+
+    def test_spell_choice_changes_only_selected_spell_row(self) -> None:
+        flash = BuildAsset(4, "점멸")
+        ignite = BuildAsset(14, "점화")
+        exhaust = BuildAsset(3, "탈진")
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.build_guide = ChampionBuildGuide(
+            "Thresh", "쓰레쉬", "SUPPORT",
+            summoner_spells=[flash, ignite],
+            summoner_spell_builds=[
+                SummonerSpellBuild("조합 1", [flash, ignite], 80_000, 52.0),
+                SummonerSpellBuild("조합 2", [exhaust, flash], 20_000, 51.0),
+            ],
+        )
+        app._build_spell_index = 0
+        app._flash_slot = "F"
+        app._build_spell_choice_widgets = []
+
+        class Row:
+            @staticmethod
+            def winfo_exists() -> bool:
+                return True
+
+        app._build_spell_row = Row()
+        rendered: list[tuple[int, bool]] = []
+        app._render_spell_assets_row = (
+            lambda _row, guide, clear=False:
+            rendered.append((app._ordered_spell_assets(guide)[0].asset_id, clear))
+        )
+        marked: list[bool] = []
+        app._mark_build_render_current = lambda: marked.append(True)
+        full_render: list[bool] = []
+        app._render_build = lambda: full_render.append(True)
+
+        app._set_build_spell_index(1)
+
+        self.assertEqual(app._build_spell_index, 1)
+        self.assertEqual(
+            [spell.asset_id for spell in app._ordered_spell_assets(app.build_guide)],
+            [3, 4],
+        )
+        self.assertEqual(rendered, [(3, True)])
+        self.assertEqual(marked, [True])
+        self.assertEqual(full_render, [])
+
+    def test_failed_legacy_build_upgrade_attempt_persists_its_cooldown(self) -> None:
+        class Settings:
+            values: dict[str, str] = {}
+
+            def get_setting(self, key: str, default: str = "") -> str:
+                return self.values.get(key, default)
+
+            def set_setting(self, key: str, value: str) -> None:
+                self.values[key] = value
+
+        settings = Settings()
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.storage = settings
+        app._data_preferences = {"opgg_build_cooldown_hours": 24}
+        self.assertEqual(
+            app._build_statistics_upgrade_remaining(
+                "Thresh", "SUPPORT"
+            ).total_seconds(),
+            0,
+        )
+
+        app._mark_build_statistics_upgrade_attempt("Thresh", "SUPPORT")
+
+        restarted = AdvisorApp.__new__(AdvisorApp)
+        restarted.storage = settings
+        restarted._data_preferences = {"opgg_build_cooldown_hours": 24}
+        remaining = restarted._build_statistics_upgrade_remaining(
+            "Thresh", "SUPPORT"
+        )
+        self.assertGreater(remaining, timedelta(hours=23))
+        self.assertLessEqual(remaining, timedelta(hours=24))
 
     def test_preset_representative_item_rotates_core_choices(self) -> None:
         groups = [

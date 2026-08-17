@@ -124,12 +124,27 @@ class OpggParsingTests(unittest.TestCase):
             registry = ChampionRegistry(Path(temp_dir) / "champions.json")
             client = OpggClient(registry)
             rune_ids = "8465,8463,8473,8242,8345,8347,5005,5001,5001"
+            alternate_rune_ids = "8439,8463,8473,8242,8345,8347,5005,5001,5001"
             html = rf'''
-                <script>\"importClientData\":{{\"type\":\"CHAMPION_DETAIL_BUILD\",\"championKey\":\"thresh\",\"primaryStyleId\":8400,\"subStyleId\":8300,\"selectedPerkIds\":[{rune_ids}]}}</script>
-                <table><caption>SummonerSpells Table</caption><tr><td>
+                <script>{{\"rune_pages\":[
+                {{\"id\":8439,\"play\":68728,\"pick_rate\":0.5201,\"builds\":[{{\"win_rate\":0.5209667,\"primary_rune\":{{}},\"importClientData\":{{\"type\":\"CHAMPION_DETAIL_BUILD\",\"championKey\":\"thresh\",\"primaryStyleId\":8400,\"subStyleId\":8300,\"selectedPerkIds\":[{rune_ids}]}}}}]}},
+                {{\"id\":8465,\"play\":28847,\"pick_rate\":0.2183,\"builds\":[{{\"win_rate\":0.5142,\"primary_rune\":{{}},\"importClientData\":{{\"type\":\"CHAMPION_DETAIL_BUILD\",\"championKey\":\"thresh\",\"primaryStyleId\":8400,\"subStyleId\":8300,\"selectedPerkIds\":[{alternate_rune_ids}]}}}}]}}],\"single_rune_builds\":[]}}</script>
+                <table><caption>SummonerSpells Table</caption><tr><th>Summoner spells</th><th>Pick rate</th><th>Win rate</th></tr><tr><td>
                 <img alt="Flash" src="https://x/lol/16.16.1/spell/SummonerFlash.png" />
                 <img alt="Ignite" src="https://x/lol/16.16.1/spell/SummonerDot.png" />
-                </td></tr></table>
+                </td><td>68.03</td><td>88,622 Games</td><td>52.07</td><td>%</td></tr></table>
+                <table><caption>SummonerSpells Table</caption><tr><td>
+                <img alt="Exhaust" src="https://x/lol/16.16.1/spell/SummonerExhaust.png" />
+                <img alt="Flash" src="https://x/lol/16.16.1/spell/SummonerFlash.png" />
+                </td><td>17.44</td><td>22,725 Games</td><td>51.42</td><td>%</td></tr></table>
+                <table><caption>SummonerSpells Table</caption><tr><td>
+                <img alt="Heal" src="https://x/lol/16.16.1/spell/SummonerHeal.png" />
+                <img alt="Flash" src="https://x/lol/16.16.1/spell/SummonerFlash.png" />
+                </td><td>8.02</td><td>10,440 Games</td><td>50.91</td><td>%</td></tr></table>
+                <table><caption>SummonerSpells Table</caption><tr><td>
+                <img alt="Barrier" src="https://x/lol/16.16.1/spell/SummonerBarrier.png" />
+                <img alt="Flash" src="https://x/lol/16.16.1/spell/SummonerFlash.png" />
+                </td><td>2.00</td><td>2,600 Games</td><td>50.00</td><td>%</td></tr></table>
                 <table><caption>SkillOrder Table</caption><tr><td>
                 <span>Q</span><span>E</span><span>W</span><span>Q</span>
                 <span>E</span><span>W</span><span>Q</span><span>Q</span>
@@ -144,8 +159,24 @@ class OpggParsingTests(unittest.TestCase):
             client._fetch = lambda _url: html
             guide = client.refresh_build("Thresh", "SUPPORT")
             self.assertEqual(len(guide.rune_builds[0].perks), 9)
+            self.assertEqual(len(guide.rune_builds), 2)
+            self.assertEqual(guide.rune_builds[0].games, 68_728)
+            self.assertAlmostEqual(guide.rune_builds[0].pick_rate or 0, 52.01)
+            self.assertAlmostEqual(guide.rune_builds[0].win_rate or 0, 52.09667)
             self.assertEqual(
                 [spell.asset_id for spell in guide.summoner_spells], [4, 14]
+            )
+            self.assertEqual(len(guide.summoner_spell_builds), 3)
+            self.assertEqual(
+                [spell.asset_id for spell in guide.summoner_spell_builds[1].spells],
+                [3, 4],
+            )
+            self.assertEqual(guide.summoner_spell_builds[0].games, 88_622)
+            self.assertAlmostEqual(
+                guide.summoner_spell_builds[0].pick_rate or 0, 68.03
+            )
+            self.assertAlmostEqual(
+                guide.summoner_spell_builds[0].win_rate or 0, 52.07
             )
             self.assertEqual(guide.skill_priority, ["Q", "E", "W"])
             self.assertEqual(

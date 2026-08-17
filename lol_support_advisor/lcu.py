@@ -25,6 +25,10 @@ class LcuActionError(LcuUnavailable):
     """A safe, user-actionable failure returned before an LCU write."""
 
 
+class LcuActionStateChanged(LcuActionError):
+    """The champ-select phase or the local player's action changed mid-check."""
+
+
 @dataclass(frozen=True, slots=True)
 class LcuChampionActionResult:
     action_type: str
@@ -61,16 +65,18 @@ def find_local_champion_action(
     ]
     if not candidates:
         label = "픽" if wanted == "pick" else "밴"
-        raise LcuActionError(f"현재 내 {label} 작업을 찾지 못했습니다.")
+        raise LcuActionStateChanged(f"현재 내 {label} 작업을 찾지 못했습니다.")
     in_progress = next(
         (action for action in candidates if bool(action.get("isInProgress"))), None
     )
     if require_in_progress and in_progress is None:
         label = "픽" if wanted == "pick" else "밴"
-        raise LcuActionError(f"아직 내 {label} 차례가 아닙니다.")
+        raise LcuActionStateChanged(f"아직 내 {label} 차례가 아닙니다.")
     action = in_progress or candidates[0]
     if int(action.get("id") or 0) <= 0:
-        raise LcuActionError("롤 클라이언트의 선택 작업 ID를 확인하지 못했습니다.")
+        raise LcuActionStateChanged(
+            "롤 클라이언트의 선택 작업 ID를 확인하지 못했습니다."
+        )
     return action
 
 
@@ -98,17 +104,22 @@ def champ_select_time_left_ms(data: dict[str, Any]) -> int | None:
     return None
 
 
+def champ_select_timer_phase(data: dict[str, Any]) -> str:
+    """Return the normalized inner champ-select phase (for example BAN_PICK)."""
+    timer = data.get("timer") or {}
+    if not isinstance(timer, dict):
+        return ""
+    return str(timer.get("phase") or "").strip().upper()
+
+
 def deferred_ban_due(
     data: dict[str, Any], target_remaining_ms: int,
     fallback_deadline: float, now_monotonic: float,
 ) -> bool:
-    """Prefer Riot's countdown and fall back to a non-blocking local deadline."""
+    """Use Riot's countdown, falling back only when that timer is unavailable."""
     remaining_ms = champ_select_time_left_ms(data)
     if remaining_ms is not None:
-        return (
-            remaining_ms <= max(0, int(target_remaining_ms))
-            or (fallback_deadline > 0 and now_monotonic >= fallback_deadline)
-        )
+        return remaining_ms <= max(0, int(target_remaining_ms))
     return now_monotonic >= fallback_deadline
 
 
@@ -290,13 +301,17 @@ class LcuClient:
         return owned
 
     def perform_champion_action(
-        self, champion_key: int, action: str,
+        self, champion_key: int, action: str, *,
+        expected_action_id: int | None = None,
     ) -> LcuChampionActionResult:
         with self._write_lock:
-            return self._perform_champion_action(champion_key, action)
+            return self._perform_champion_action(
+                champion_key, action, expected_action_id=expected_action_id,
+            )
 
     def _perform_champion_action(
-        self, champion_key: int, action: str,
+        self, champion_key: int, action: str, *,
+        expected_action_id: int | None = None,
     ) -> LcuChampionActionResult:
         """Preflight and perform an explicit local HOVER, pick, or ban action."""
         try:
@@ -314,9 +329,21 @@ class LcuClient:
             raise LcuActionError("현재 챔피언 선택 화면이 아닙니다.")
         session = self.champ_select_session()
         action_type = "ban" if normalized == "ban" else "pick"
+        if action_type == "ban" and champ_select_timer_phase(session) != "BAN_PICK":
+            raise LcuActionStateChanged(
+                "아직 실제 밴 단계가 아닙니다. 밴 단계 진입을 기다립니다."
+            )
         local_action = find_local_champion_action(
             session, action_type, require_in_progress=True
         )
+        action_id = int(local_action["id"])
+        if (
+            expected_action_id is not None
+            and action_id != int(expected_action_id)
+        ):
+            raise LcuActionStateChanged(
+                "내 밴 작업이 변경되어 새 작업을 다시 확인합니다."
+            )
 
         banned_ids = session_banned_champion_ids(session)
         selected_ids = _locked_champion_ids(session, "pick")
@@ -343,7 +370,6 @@ class LcuClient:
                 raise LcuActionError("현재 이 챔피언을 밴할 수 없습니다.")
 
         completed = normalized in {"pick", "ban"}
-        action_id = int(local_action["id"])
         self.patch(
             f"/lol-champ-select/v1/session/actions/{action_id}",
             {"championId": champion_key, "completed": completed},
@@ -454,6 +480,15 @@ def parse_lcu_session(data: dict[str, Any], registry: ChampionRegistry) -> Draft
                 fallback_key = int(raw.get("championId") or 0)
                 if fallback_key:
                     champion_key, state = fallback_key, "LOCKED"
+                else:
+                    # During the short PLANNING/DECLARE step the client keeps
+                    # a player's declared champion here instead of in the pick
+                    # action.  Ignoring it made the local HOVER card stay in
+                    # its waiting state even though the intent was visible in
+                    # the League client.
+                    intent_key = int(raw.get("championPickIntent") or 0)
+                    if intent_key:
+                        champion_key, state = intent_key, "HOVER"
             champion_id, name = registry.from_key(champion_key) if champion_key else ("", "")
             member = DraftMember(
                 champion_id, name, role, state, cell,
@@ -481,6 +516,25 @@ def parse_lcu_session(data: dict[str, Any], registry: ChampionRegistry) -> Draft
             else:
                 ally_hover.append(member)
     enemy_locked = [member for member in enemy_team_order if member.state == "LOCKED"]
+    if my_hover and local_action_state == "WAITING":
+        local_action_state = "SELECTING"
+
+    active_pick_order_swap = next(
+        (
+            item for item in (data.get("pickOrderSwaps", []) or [])
+            if str(item.get("state") or "").strip().upper()
+            in {"SENT", "RECEIVED", "ACCEPTED"}
+        ),
+        None,
+    )
+    pick_order_swap_state = (
+        str(active_pick_order_swap.get("state") or "").strip().upper()
+        if active_pick_order_swap else ""
+    )
+    pick_order_swap_target_cell_id = (
+        int(active_pick_order_swap.get("cellId", -1))
+        if active_pick_order_swap else None
+    )
 
     bans = data.get("bans", {}) or {}
 
@@ -537,6 +591,8 @@ def parse_lcu_session(data: dict[str, Any], registry: ChampionRegistry) -> Draft
         enemy_ban_actions=enemy_ban_actions,
         local_player_cell_id=local_cell,
         connection_state="CHAMP_SELECT",
+        pick_order_swap_state=pick_order_swap_state,
+        pick_order_swap_target_cell_id=pick_order_swap_target_cell_id,
     )
     snapshot.refresh_snapshot_id()
     return snapshot
