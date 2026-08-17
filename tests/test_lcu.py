@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from io import BytesIO
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import MagicMock, patch
+from urllib.error import HTTPError, URLError
 
 from lol_support_advisor.champions import ChampionRegistry
 from lol_support_advisor.lcu import (
-    LcuActionError, LcuActionStateChanged, LcuClient,
+    LcuActionError, LcuActionStateChanged, LcuClient, LcuUnavailable,
     champ_select_time_left_ms, champ_select_timer_phase,
     champion_action_in_progress, deferred_ban_due,
     find_local_champion_action, parse_lcu_session,
@@ -381,6 +384,28 @@ class LcuActionTests(unittest.TestCase):
 
         self.assertEqual(client.writes, [])
 
+    def test_scheduled_ban_rechecks_cancellation_before_patch(self) -> None:
+        client = self.client(self.session(local_type="ban"))
+        checks = 0
+
+        def still_current() -> bool:
+            nonlocal checks
+            checks += 1
+            # The monitor is current while it waits for the write lock, then
+            # is cancelled while the read-only LCU preflight is in flight.
+            return checks == 1
+
+        with self.assertRaisesRegex(LcuActionStateChanged, "취소"):
+            client.perform_champion_action(
+                99,
+                "ban",
+                expected_action_id=777,
+                pre_commit_check=still_current,
+            )
+
+        self.assertEqual(checks, 2)
+        self.assertEqual(client.writes, [])
+
     def test_local_turn_helpers_never_fall_back_to_a_teammate(self) -> None:
         session = self.session(local_in_progress=False)
         self.assertFalse(champion_action_in_progress(session, "pick"))
@@ -401,6 +426,120 @@ class LcuActionTests(unittest.TestCase):
         })
         self.assertFalse(accepted.accept_ready_check_if_pending())
         self.assertEqual(accepted.writes, [])
+
+
+class LcuCredentialCacheTests(unittest.TestCase):
+    def test_malformed_lockfile_falls_back_without_value_error(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            lockfile = Path(temp_dir) / "lockfile"
+            lockfile.write_text(
+                "LeagueClientUx:123:not-a-port:token:https",
+                encoding="utf-8",
+            )
+            client = LcuClient(str(lockfile))
+            with (
+                patch(
+                    "lol_support_advisor.lcu.Path.read_text",
+                    side_effect=[
+                        "LeagueClientUx:123:not-a-port:token:https",
+                        *[OSError("missing") for _index in range(15)],
+                    ],
+                ),
+                patch.object(
+                    client, "_credentials_from_process",
+                    return_value=(3210, "process-token"),
+                ) as process_lookup,
+            ):
+                self.assertEqual(
+                    client._credentials(), (3210, "process-token")
+                )
+            process_lookup.assert_called_once_with()
+
+    def test_failed_discovery_has_short_negative_cache(self) -> None:
+        client = LcuClient()
+        with (
+            patch.object(
+                client, "_credentials_from_lockfile", return_value=None,
+            ) as lockfile_lookup,
+            patch.object(
+                client, "_credentials_from_process", return_value=None,
+            ) as process_lookup,
+        ):
+            with self.assertRaises(LcuUnavailable):
+                client._credentials()
+            with self.assertRaises(LcuUnavailable):
+                client._credentials()
+
+        lockfile_lookup.assert_called_once_with()
+        process_lookup.assert_called_once_with()
+
+    def test_process_discovered_credentials_are_reused(self) -> None:
+        client = LcuClient()
+        with (
+            patch.object(
+                client, "_credentials_from_lockfile", return_value=None,
+            ) as lockfile_lookup,
+            patch.object(
+                client, "_credentials_from_process",
+                return_value=(3210, "cached-token"),
+            ) as process_lookup,
+        ):
+            self.assertEqual(client._credentials(), (3210, "cached-token"))
+            self.assertEqual(client._credentials(), (3210, "cached-token"))
+
+        lockfile_lookup.assert_called_once_with()
+        process_lookup.assert_called_once_with()
+
+    def test_connection_failure_invalidates_cache_for_next_request(self) -> None:
+        client = LcuClient()
+        discovered = [(3210, "old-token"), (6543, "new-token")]
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{}'
+
+        with (
+            patch.object(
+                client, "_credentials_from_lockfile",
+                side_effect=discovered,
+            ) as lookup,
+            patch(
+                "lol_support_advisor.lcu.urlopen",
+                side_effect=[URLError("connection lost"), response],
+            ) as open_url,
+        ):
+            with self.assertRaisesRegex(LcuUnavailable, "연결 실패"):
+                client.get("/first")
+            self.assertEqual(client.get("/second"), {})
+
+        self.assertEqual(lookup.call_count, 2)
+        self.assertIn("127.0.0.1:3210", open_url.call_args_list[0].args[0].full_url)
+        self.assertIn("127.0.0.1:6543", open_url.call_args_list[1].args[0].full_url)
+
+    def test_authentication_failure_invalidates_cache_for_next_request(self) -> None:
+        client = LcuClient()
+        response = MagicMock()
+        response.__enter__.return_value = response
+        response.read.return_value = b'{}'
+        unauthorized = HTTPError(
+            "https://127.0.0.1:3210/first", 401, "Unauthorized",
+            hdrs=None, fp=BytesIO(b'{}'),
+        )
+
+        with (
+            patch.object(
+                client, "_credentials_from_lockfile",
+                side_effect=[(3210, "expired-token"), (6543, "fresh-token")],
+            ) as lookup,
+            patch(
+                "lol_support_advisor.lcu.urlopen",
+                side_effect=[unauthorized, response],
+            ),
+        ):
+            with self.assertRaisesRegex(LcuUnavailable, "HTTP 401"):
+                client.get("/first")
+            self.assertEqual(client.get("/second"), {})
+
+        self.assertEqual(lookup.call_count, 2)
 
 
 if __name__ == "__main__":

@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import json
+import threading
+import time
 import unittest
+from unittest.mock import patch
 from dataclasses import replace
 from datetime import datetime, timedelta
 from types import SimpleNamespace
@@ -15,6 +18,8 @@ from lol_support_advisor.ui import (
     final_item_builds, matchup_build_reason,
     game_prediction_display_signature, local_draft_selection,
     live_active_context_signature, live_roster_signature,
+    lux_auto_ban_deadline_after_timer_sample,
+    lux_auto_ban_monitor_due,
     estimate_live_game_prediction,
     matchup_final_item_builds, matchup_item_groups, matchup_rune_index,
     lane_matchup_from_snapshot, lane_matchup_label, lane_matchup_snapshot_fresh,
@@ -86,10 +91,234 @@ class DuoEvidenceTests(unittest.TestCase):
 
         def picker(minimum: int, maximum: int) -> int:
             observed.append((minimum, maximum))
-            return 9_000
+            return 11_000
 
-        self.assertEqual(choose_lux_auto_ban_target_ms(picker), 9_000)
-        self.assertEqual(observed, [(8_000, 10_000)])
+        self.assertEqual(choose_lux_auto_ban_target_ms(picker), 11_000)
+        self.assertEqual(observed, [(10_000, 12_000)])
+
+    def test_lux_monitor_stale_timer_uses_guarded_local_deadline(self) -> None:
+        self.assertFalse(lux_auto_ban_monitor_due(12_000, 11_000, 10.0, 10.34))
+        self.assertTrue(lux_auto_ban_monitor_due(12_000, 11_000, 10.0, 10.36))
+        self.assertFalse(lux_auto_ban_monitor_due(None, 11_000, 10.0, 9.99))
+        self.assertTrue(lux_auto_ban_monitor_due(None, 11_000, 10.0, 10.0))
+
+    def test_lux_monitor_reanchors_when_riot_timer_appears(self) -> None:
+        deadline = lux_auto_ban_deadline_after_timer_sample(
+            None, 28_000, 11_000, 100.0, 102.0,
+        )
+        self.assertEqual(deadline, 117.0)
+        self.assertFalse(lux_auto_ban_monitor_due(28_000, 11_000, deadline, 102.5))
+        self.assertTrue(lux_auto_ban_monitor_due(11_000, 11_000, deadline, 117.0))
+
+    def test_lux_monitor_executes_when_ui_queue_is_not_drained(self) -> None:
+        performed = threading.Event()
+        calls: list[tuple[int, str, int | None]] = []
+
+        class FakeLcu:
+            @staticmethod
+            def perform_champion_action(
+                champion_key: int, action: str, *,
+                expected_action_id: int | None = None,
+                pre_commit_check: object | None = None,
+            ) -> None:
+                if callable(pre_commit_check) and not pre_commit_check():
+                    raise LcuActionStateChanged("cancelled")
+                calls.append((champion_key, action, expected_action_id))
+                performed.set()
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.lux_auto_ban_enabled = True
+        # This UI-only flag can remain stale while Tk is blocked.  The LCU
+        # write lock and fresh preflight, not Tk, serialize the real action.
+        app._champion_action_running = True
+        app._lux_auto_ban_lock = threading.RLock()
+        app._lux_auto_ban_generation = 0
+        app._lux_auto_ban_monitoring = False
+        app._lux_auto_ban_completed_action_id = None
+        app._lux_auto_ban_action_id = None
+        app._lux_auto_ban_target_remaining_ms = 0
+        app._lux_auto_ban_fallback_deadline = 0.0
+        app._lux_auto_ban_last_remaining_ms = None
+        app._lux_auto_ban_last_sampled_at = 0.0
+        app.lcu = FakeLcu()
+        blocked_ui_callbacks: list[object] = []
+        app._post_ui = lambda callback: blocked_ui_callbacks.append(callback)
+        session = {
+            "timer": {
+                "phase": "BAN_PICK",
+                "adjustedTimeLeftInPhase": 9_000,
+            },
+            "localPlayerCellId": 4,
+            "actions": [[{
+                "id": 77, "actorCellId": 4, "type": "ban",
+                "isInProgress": True, "completed": False,
+            }]],
+            "bans": {"myTeamBans": [], "theirTeamBans": []},
+        }
+
+        self.assertTrue(app._ensure_lux_auto_ban_monitor(77, session))
+        self.assertTrue(performed.wait(timeout=1.0))
+        deadline = time.monotonic() + 1.0
+        while app._lux_auto_ban_monitoring and time.monotonic() < deadline:
+            time.sleep(0.005)
+
+        self.assertEqual(calls, [(99, "ban", 77)])
+        self.assertFalse(app._lux_auto_ban_monitoring)
+        self.assertEqual(app._lux_auto_ban_completed_action_id, 77)
+        self.assertGreaterEqual(len(blocked_ui_callbacks), 2)
+
+    def test_lux_watcher_discovers_turn_while_ui_queue_is_blocked(self) -> None:
+        performed = threading.Event()
+        calls: list[tuple[int, str, int | None]] = []
+        session = {
+            "timer": {
+                "phase": "BAN_PICK",
+                "adjustedTimeLeftInPhase": 9_000,
+            },
+            "localPlayerCellId": 4,
+            "actions": [[{
+                "id": 91, "actorCellId": 4, "type": "ban",
+                "isInProgress": True, "completed": False,
+            }]],
+            "bans": {"myTeamBans": [], "theirTeamBans": []},
+        }
+
+        class FakeLcu:
+            @staticmethod
+            def champ_select_session() -> dict[str, object]:
+                return session
+
+            @staticmethod
+            def perform_champion_action(
+                champion_key: int, action: str, *,
+                expected_action_id: int | None = None,
+                pre_commit_check: object | None = None,
+            ) -> None:
+                if callable(pre_commit_check) and not pre_commit_check():
+                    raise LcuActionStateChanged("cancelled")
+                calls.append((champion_key, action, expected_action_id))
+                performed.set()
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.lux_auto_ban_enabled = True
+        app._champion_action_running = False
+        app._lux_auto_ban_lock = threading.RLock()
+        app._lux_auto_ban_generation = 0
+        app._lux_auto_ban_monitoring = False
+        app._lux_auto_ban_completed_action_id = None
+        app._lux_auto_ban_action_id = None
+        app._lux_auto_ban_target_remaining_ms = 0
+        app._lux_auto_ban_fallback_deadline = 0.0
+        app._lux_auto_ban_last_remaining_ms = None
+        app._lux_auto_ban_last_sampled_at = 0.0
+        app._lux_auto_ban_watcher_running = False
+        app._lux_auto_ban_watcher_wake = threading.Event()
+        app.lcu = FakeLcu()
+        blocked_ui_callbacks: list[object] = []
+        app._post_ui = lambda callback: blocked_ui_callbacks.append(callback)
+
+        app._start_lux_auto_ban_watcher()
+        self.assertTrue(performed.wait(timeout=1.0))
+        time.sleep(0.2)
+        app.lux_auto_ban_enabled = False
+        app._lux_auto_ban_watcher_wake.set()
+
+        self.assertEqual(calls, [(99, "ban", 91)])
+        self.assertGreaterEqual(len(blocked_ui_callbacks), 2)
+
+    def test_lux_monitor_releases_owner_after_unexpected_failure(self) -> None:
+        class BrokenLcu:
+            @staticmethod
+            def perform_champion_action(*_args: object, **_kwargs: object) -> None:
+                raise ValueError("malformed transient payload")
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.lux_auto_ban_enabled = True
+        app._champion_action_running = False
+        app._lux_auto_ban_lock = threading.RLock()
+        app._lux_auto_ban_generation = 3
+        app._lux_auto_ban_monitoring = True
+        app._lux_auto_ban_completed_action_id = None
+        app._lux_auto_ban_action_id = 92
+        app._lux_auto_ban_target_remaining_ms = 11_000
+        app._lux_auto_ban_fallback_deadline = 0.0
+        app._lux_auto_ban_last_remaining_ms = 9_000
+        app._lux_auto_ban_last_sampled_at = 0.0
+        app.lcu = BrokenLcu()
+        statuses: list[object] = []
+        app._post_ui = lambda callback: statuses.append(callback)
+
+        app._run_lux_auto_ban_monitor(
+            3, 92, 11_000, 0.0, 9_000,
+        )
+
+        self.assertFalse(app._lux_auto_ban_monitoring)
+        self.assertIsNone(app._lux_auto_ban_action_id)
+        self.assertIsNone(app._lux_auto_ban_completed_action_id)
+        self.assertGreaterEqual(len(statuses), 2)
+
+    def test_lux_monitor_ignores_out_of_order_ui_status_callbacks(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._lux_auto_ban_lock = threading.RLock()
+        app._lux_auto_ban_generation = 4
+        app._lux_auto_ban_last_sampled_at = 0.0
+        app._lux_auto_ban_status = "대기"
+        callbacks: list[object] = []
+        app._post_ui = lambda callback: callbacks.append(callback)
+        app._render_automation_toggles = lambda: None
+
+        with patch(
+            "lol_support_advisor.ui.time.monotonic", side_effect=[10.0, 11.0],
+        ):
+            app._post_lux_auto_ban_status(4, "이전 상태")
+            app._post_lux_auto_ban_status(4, "최신 상태")
+
+        callbacks[1]()
+        callbacks[0]()
+        self.assertEqual(app._lux_auto_ban_status, "최신 상태")
+        self.assertEqual(app._lux_auto_ban_last_sampled_at, 11.0)
+
+    def test_lux_monitor_cancels_before_write_when_toggle_turns_off(self) -> None:
+        calls: list[object] = []
+
+        class FakeLcu:
+            @staticmethod
+            def champ_select_session() -> dict[str, object]:
+                calls.append("session")
+                return {}
+
+            @staticmethod
+            def perform_champion_action(*_args: object, **_kwargs: object) -> None:
+                calls.append("write")
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.lux_auto_ban_enabled = True
+        app._champion_action_running = False
+        app._lux_auto_ban_lock = threading.RLock()
+        app._lux_auto_ban_generation = 0
+        app._lux_auto_ban_monitoring = False
+        app._lux_auto_ban_completed_action_id = None
+        app._lux_auto_ban_action_id = None
+        app._lux_auto_ban_target_remaining_ms = 0
+        app._lux_auto_ban_fallback_deadline = 0.0
+        app._lux_auto_ban_last_remaining_ms = None
+        app._lux_auto_ban_last_sampled_at = 0.0
+        app.lcu = FakeLcu()
+        app._post_ui = lambda _callback: None
+        session = {
+            "timer": {
+                "phase": "BAN_PICK",
+                "adjustedTimeLeftInPhase": 30_000,
+            },
+        }
+
+        self.assertTrue(app._ensure_lux_auto_ban_monitor(88, session))
+        app.lux_auto_ban_enabled = False
+        app._reset_lux_auto_ban_schedule()
+        time.sleep(0.2)
+
+        self.assertNotIn("write", calls)
+        self.assertFalse(app._lux_auto_ban_monitoring)
 
     def test_recommendation_context_ignores_ban_hover_but_not_locked_ban(self) -> None:
         member = DraftMember(

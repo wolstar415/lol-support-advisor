@@ -23,7 +23,7 @@ from .history import HistoryOverview, MatchHistoryEntry, analyze_history
 from .icons import BuildAssetPreloader, ChampionIconCache, ItemIconCache, RemoteIconCache
 from .lcu import (
     LcuActionStateChanged, LcuClient, LcuUnavailable,
-    champ_select_time_left_ms, champ_select_timer_phase, deferred_ban_due,
+    champ_select_time_left_ms, champ_select_timer_phase,
     find_local_champion_action, parse_lcu_session, session_banned_champion_ids,
 )
 from .live_client import LiveClient, LiveClientUnavailable
@@ -89,10 +89,15 @@ DATA_PREFERENCE_LIMITS = {
     for key, _label, _unit, default, minimum, maximum in DATA_PREFERENCE_SPECS
 }
 
-LUX_AUTO_BAN_TARGET_MIN_MS = 8_000
-LUX_AUTO_BAN_TARGET_MAX_MS = 10_000
+LUX_AUTO_BAN_TARGET_MIN_MS = 10_000
+LUX_AUTO_BAN_TARGET_MAX_MS = 12_000
 LUX_AUTO_BAN_FALLBACK_MIN_SECONDS = 1.4
 LUX_AUTO_BAN_FALLBACK_MAX_SECONDS = 2.4
+LUX_AUTO_BAN_MONITOR_INTERVAL_SECONDS = 0.12
+LUX_AUTO_BAN_STATUS_INTERVAL_SECONDS = 0.25
+LUX_AUTO_BAN_STALE_TIMER_GRACE_SECONDS = 0.35
+LUX_AUTO_BAN_DISCOVERY_INTERVAL_SECONDS = 0.15
+LUX_AUTO_BAN_IDLE_INTERVAL_SECONDS = 0.60
 BUILD_STATISTICS_SCHEMA_VERSION = 1
 
 
@@ -102,6 +107,42 @@ def choose_lux_auto_ban_target_ms(
     """Choose a safe, non-identical point before the ban timer expires."""
     picker = randint or random.randint
     return int(picker(LUX_AUTO_BAN_TARGET_MIN_MS, LUX_AUTO_BAN_TARGET_MAX_MS))
+
+
+def lux_auto_ban_monitor_due(
+    remaining_ms: int | None,
+    target_ms: int,
+    deadline: float,
+    now_monotonic: float,
+) -> bool:
+    """Combine Riot's timer with a guarded monotonic stale-timer watchdog."""
+    if remaining_ms is None:
+        return now_monotonic >= deadline
+    return (
+        remaining_ms <= max(0, int(target_ms))
+        or now_monotonic
+        >= deadline + LUX_AUTO_BAN_STALE_TIMER_GRACE_SECONDS
+    )
+
+
+def lux_auto_ban_deadline_after_timer_sample(
+    previous_remaining_ms: int | None,
+    fresh_remaining_ms: int | None,
+    target_ms: int,
+    now_monotonic: float,
+    current_deadline: float,
+) -> float:
+    """Anchor the watchdog when Riot's real timer appears or is extended."""
+    if fresh_remaining_ms is None:
+        return current_deadline
+    if (
+        previous_remaining_ms is not None
+        and fresh_remaining_ms <= previous_remaining_ms + 750
+    ):
+        return current_deadline
+    return now_monotonic + max(
+        0.0, (fresh_remaining_ms - max(0, int(target_ms))) / 1000.0,
+    )
 
 
 def cache_manager_champion_ids(
@@ -1348,6 +1389,17 @@ class AdvisorApp:
         self._lux_auto_ban_action_id: int | None = None
         self._lux_auto_ban_target_remaining_ms = 0
         self._lux_auto_ban_fallback_deadline = 0.0
+        # Auto-ban timing must keep running even when Tk is busy rendering a
+        # large draft.  This lock protects the small controller state shared by
+        # the LCU poller, the dedicated monitor, and UI toggle callbacks.
+        self._lux_auto_ban_lock = threading.RLock()
+        self._lux_auto_ban_generation = 0
+        self._lux_auto_ban_monitoring = False
+        self._lux_auto_ban_completed_action_id: int | None = None
+        self._lux_auto_ban_last_remaining_ms: int | None = None
+        self._lux_auto_ban_last_sampled_at = 0.0
+        self._lux_auto_ban_watcher_running = False
+        self._lux_auto_ban_watcher_wake = threading.Event()
         self._pick_order_change_notice = ""
         self._pick_order_notice_after_id: str | None = None
         self._champion_action_running = False
@@ -1535,6 +1587,7 @@ class AdvisorApp:
         )
         self.root.after(420, self._ensure_history_loaded)
         if not self.demo:
+            self._start_lux_auto_ban_watcher()
             self.root.after(250, self._poll_lcu)
 
     def _configure_root(self) -> None:
@@ -2018,12 +2071,402 @@ class AdvisorApp:
         self._lux_auto_ban_status = (
             "내 밴 차례 대기" if self.lux_auto_ban_enabled else "사용 안 함"
         )
+        self._lux_auto_ban_watcher_wake.set()
         self._render_automation_toggles()
 
     def _reset_lux_auto_ban_schedule(self) -> None:
-        self._lux_auto_ban_action_id = None
-        self._lux_auto_ban_target_remaining_ms = 0
-        self._lux_auto_ban_fallback_deadline = 0.0
+        lock = getattr(self, "_lux_auto_ban_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._lux_auto_ban_lock = lock
+        with lock:
+            self._lux_auto_ban_generation = (
+                int(getattr(self, "_lux_auto_ban_generation", 0)) + 1
+            )
+            self._lux_auto_ban_monitoring = False
+            self._lux_auto_ban_completed_action_id = None
+            self._lux_auto_ban_action_id = None
+            self._lux_auto_ban_target_remaining_ms = 0
+            self._lux_auto_ban_fallback_deadline = 0.0
+            self._lux_auto_ban_last_remaining_ms = None
+            self._lux_auto_ban_last_sampled_at = 0.0
+
+    def _lux_auto_ban_monitor_is_current(
+        self, generation: int, action_id: int,
+    ) -> bool:
+        with self._lux_auto_ban_lock:
+            return bool(
+                self.lux_auto_ban_enabled
+                and self._lux_auto_ban_monitoring
+                and self._lux_auto_ban_generation == generation
+                and self._lux_auto_ban_action_id == action_id
+            )
+
+    def _start_lux_auto_ban_watcher(self) -> None:
+        """Keep ban-action discovery alive even if Tk cannot schedule polls."""
+        with self._lux_auto_ban_lock:
+            if self._lux_auto_ban_watcher_running:
+                return
+            self._lux_auto_ban_watcher_running = True
+        threading.Thread(
+            target=self._run_lux_auto_ban_watcher,
+            name="lux-auto-ban-discovery",
+            daemon=True,
+        ).start()
+
+    def _run_lux_auto_ban_watcher(self) -> None:
+        """Discover my BAN_PICK action without depending on Tk's event queue."""
+        wake = self._lux_auto_ban_watcher_wake
+        last_waiting_key = ""
+        missing_session_count = 0
+
+        def publish_waiting(key: str, status: str) -> None:
+            nonlocal last_waiting_key
+            if key == last_waiting_key:
+                return
+            last_waiting_key = key
+            with self._lux_auto_ban_lock:
+                if self._lux_auto_ban_monitoring:
+                    return
+                generation = self._lux_auto_ban_generation
+            self._post_lux_auto_ban_status(generation, status)
+
+        while True:
+            if not self.lux_auto_ban_enabled:
+                last_waiting_key = ""
+                wake.wait()
+                wake.clear()
+                continue
+            interval = LUX_AUTO_BAN_IDLE_INTERVAL_SECONDS
+            try:
+                session = self.lcu.champ_select_session()
+                missing_session_count = 0
+                interval = LUX_AUTO_BAN_DISCOVERY_INTERVAL_SECONDS
+                inner_phase = champ_select_timer_phase(session)
+                if 99 in session_banned_champion_ids(session):
+                    publish_waiting("BANNED", "럭스 이미 밴됨")
+                elif inner_phase != "BAN_PICK":
+                    publish_waiting(
+                        f"WAIT:{inner_phase}",
+                        (
+                            "픽 의사 표시 중 · 실제 밴 단계 대기"
+                            if inner_phase in {"PLANNING", "DECLARE"}
+                            else "실제 밴 단계 진입 대기"
+                        ),
+                    )
+                else:
+                    try:
+                        action = find_local_champion_action(
+                            session, "ban", require_in_progress=True,
+                        )
+                    except LcuUnavailable:
+                        publish_waiting("BAN_WAIT", "내 밴 차례 대기")
+                    else:
+                        last_waiting_key = "ACTION"
+                        self._ensure_lux_auto_ban_monitor(
+                            int(action.get("id") or 0), session,
+                        )
+            except Exception:
+                # Client startup/phase transitions and malformed transient
+                # snapshots are retried; the watcher itself must never die.
+                missing_session_count += 1
+                if missing_session_count >= 3:
+                    with self._lux_auto_ban_lock:
+                        if not self._lux_auto_ban_monitoring:
+                            self._lux_auto_ban_completed_action_id = None
+                    publish_waiting("NO_SESSION", "롤 픽·밴 화면 진입 대기")
+                interval = LUX_AUTO_BAN_IDLE_INTERVAL_SECONDS
+            wake.wait(interval)
+            wake.clear()
+
+    def _post_lux_auto_ban_status(
+        self,
+        generation: int,
+        status: str,
+        *,
+        remaining_ms: int | None = None,
+        completed: bool = False,
+    ) -> None:
+        """Send monitor state to Tk without making execution depend on Tk."""
+        sampled_at = time.monotonic()
+
+        def apply() -> None:
+            with self._lux_auto_ban_lock:
+                if (
+                    generation != self._lux_auto_ban_generation
+                    or sampled_at < self._lux_auto_ban_last_sampled_at
+                ):
+                    return
+                self._lux_auto_ban_status = status
+                self._lux_auto_ban_last_remaining_ms = remaining_ms
+                self._lux_auto_ban_last_sampled_at = sampled_at
+            self._render_automation_toggles()
+            if completed:
+                self.champion_action_status.configure(
+                    text=(
+                        "럭스 자동 밴 완료 · 백그라운드에서 밴 단계·"
+                        "내 순서·밴 가능 여부를 재확인했습니다."
+                    ),
+                    fg=COLORS["green"],
+                )
+
+        self._post_ui(apply)
+
+    def _finish_lux_auto_ban_monitor(
+        self, generation: int, action_id: int, *, completed: bool = False,
+    ) -> bool:
+        """Release only the monitor that still owns this action."""
+        with self._lux_auto_ban_lock:
+            if (
+                generation != self._lux_auto_ban_generation
+                or action_id != self._lux_auto_ban_action_id
+            ):
+                return False
+            self._lux_auto_ban_monitoring = False
+            self._lux_auto_ban_completed_action_id = (
+                action_id if completed else None
+            )
+            self._lux_auto_ban_action_id = None
+            self._lux_auto_ban_target_remaining_ms = 0
+            self._lux_auto_ban_fallback_deadline = 0.0
+            return True
+
+    def _ensure_lux_auto_ban_monitor(
+        self, action_id: int, session: dict[str, object],
+    ) -> bool:
+        """Start one UI-independent monitor for the current local ban action."""
+        if action_id <= 0 or not self.lux_auto_ban_enabled:
+            return False
+        remaining_ms = champ_select_time_left_ms(session)
+        now = time.monotonic()
+        target_ms = choose_lux_auto_ban_target_ms()
+        fallback_seconds = random.uniform(
+            LUX_AUTO_BAN_FALLBACK_MIN_SECONDS,
+            LUX_AUTO_BAN_FALLBACK_MAX_SECONDS,
+        )
+        deadline = (
+            now + max(0.0, (remaining_ms - target_ms) / 1000.0)
+            if remaining_ms is not None
+            else now + fallback_seconds
+        )
+        with self._lux_auto_ban_lock:
+            if self._lux_auto_ban_completed_action_id == action_id:
+                return False
+            if (
+                self._lux_auto_ban_monitoring
+                and self._lux_auto_ban_action_id == action_id
+            ):
+                return False
+            self._lux_auto_ban_generation += 1
+            generation = self._lux_auto_ban_generation
+            self._lux_auto_ban_monitoring = True
+            self._lux_auto_ban_action_id = action_id
+            self._lux_auto_ban_target_remaining_ms = target_ms
+            self._lux_auto_ban_fallback_deadline = deadline
+            self._lux_auto_ban_last_remaining_ms = remaining_ms
+            self._lux_auto_ban_last_sampled_at = now
+
+        if remaining_ms is None:
+            initial_status = (
+                f"LCU 타이머 없음 · 감지 후 {fallback_seconds:.1f}초에 안전 검사"
+            )
+        elif remaining_ms <= target_ms:
+            initial_status = (
+                f"현재 {remaining_ms / 1000:.1f}초 · 실행 시점 도달 · 안전 검사 중"
+            )
+        else:
+            initial_status = (
+                f"현재 {remaining_ms / 1000:.1f}초 · "
+                f"{target_ms / 1000:.1f}초 전 백그라운드 예약"
+            )
+        self._post_lux_auto_ban_status(
+            generation, initial_status, remaining_ms=remaining_ms,
+        )
+        threading.Thread(
+            target=self._run_lux_auto_ban_monitor,
+            args=(
+                generation, action_id, target_ms, deadline, remaining_ms,
+            ),
+            name="lux-auto-ban-monitor",
+            daemon=True,
+        ).start()
+        return True
+
+    def _run_lux_auto_ban_monitor(
+        self,
+        generation: int,
+        action_id: int,
+        target_ms: int,
+        deadline: float,
+        initial_remaining_ms: int | None,
+    ) -> None:
+        """Guard monitor ownership against every unexpected worker failure."""
+        try:
+            self._run_lux_auto_ban_monitor_loop(
+                generation, action_id, target_ms, deadline,
+                initial_remaining_ms,
+            )
+        except Exception:
+            if self._finish_lux_auto_ban_monitor(generation, action_id):
+                self._post_lux_auto_ban_status(
+                    generation,
+                    "자동 밴 감시 오류 · 내 밴 차례 다시 감지 중",
+                    remaining_ms=initial_remaining_ms,
+                )
+
+    def _run_lux_auto_ban_monitor_loop(
+        self,
+        generation: int,
+        action_id: int,
+        target_ms: int,
+        deadline: float,
+        initial_remaining_ms: int | None,
+    ) -> None:
+        """Watch Riot's ban timer at 120ms independently of Tk rendering."""
+        remaining_ms = initial_remaining_ms
+        previous_remaining_ms = initial_remaining_ms
+        next_status_at = 0.0
+        write_errors = 0
+        session_errors = 0
+        while self._lux_auto_ban_monitor_is_current(generation, action_id):
+            now = time.monotonic()
+            due = lux_auto_ban_monitor_due(
+                remaining_ms, target_ms, deadline, now,
+            )
+            if due:
+                self._post_lux_auto_ban_status(
+                    generation,
+                    "럭스 밴 실행 검사 중 · 단계·순서·가능 여부 재확인",
+                    remaining_ms=remaining_ms,
+                )
+                try:
+                    if not self._lux_auto_ban_monitor_is_current(
+                        generation, action_id,
+                    ):
+                        return
+                    self.lcu.perform_champion_action(
+                        99,
+                        "ban",
+                        expected_action_id=action_id,
+                        pre_commit_check=lambda: (
+                            self._lux_auto_ban_monitor_is_current(
+                                generation, action_id,
+                            )
+                        ),
+                    )
+                except LcuActionStateChanged:
+                    if self._finish_lux_auto_ban_monitor(
+                        generation, action_id,
+                    ):
+                        self._post_lux_auto_ban_status(
+                            generation,
+                            "단계 전환 감지 · 내 밴 차례 다시 대기",
+                            remaining_ms=remaining_ms,
+                        )
+                    return
+                except LcuUnavailable:
+                    write_errors += 1
+                    if write_errors >= 3:
+                        if self._finish_lux_auto_ban_monitor(
+                            generation, action_id,
+                        ):
+                            self._post_lux_auto_ban_status(
+                                generation,
+                                "LCU 응답 지연 · 자동 밴 재감지 대기",
+                                remaining_ms=remaining_ms,
+                            )
+                        return
+                else:
+                    if self._finish_lux_auto_ban_monitor(
+                        generation, action_id, completed=True,
+                    ):
+                        self._post_lux_auto_ban_status(
+                            generation,
+                            "럭스 자동 밴 완료",
+                            remaining_ms=remaining_ms,
+                            completed=True,
+                        )
+                    return
+
+            if now >= next_status_at and not due:
+                status = (
+                    f"현재 {remaining_ms / 1000:.1f}초 · "
+                    f"{target_ms / 1000:.1f}초 전 백그라운드 예약"
+                    if remaining_ms is not None else
+                    "LCU 타이머 없음 · 로컬 예약 시각 감시 중"
+                )
+                self._post_lux_auto_ban_status(
+                    generation, status, remaining_ms=remaining_ms,
+                )
+                next_status_at = now + LUX_AUTO_BAN_STATUS_INTERVAL_SECONDS
+
+            time.sleep(LUX_AUTO_BAN_MONITOR_INTERVAL_SECONDS)
+            if not self._lux_auto_ban_monitor_is_current(
+                generation, action_id,
+            ):
+                return
+            try:
+                session = self.lcu.champ_select_session()
+                if champ_select_timer_phase(session) != "BAN_PICK":
+                    raise LcuActionStateChanged("실제 밴 단계가 종료되었습니다.")
+                if 99 in session_banned_champion_ids(session):
+                    if self._finish_lux_auto_ban_monitor(
+                        generation, action_id, completed=True,
+                    ):
+                        self._post_lux_auto_ban_status(
+                            generation, "럭스 이미 밴됨",
+                        )
+                    return
+                fresh_action = find_local_champion_action(
+                    session, "ban", require_in_progress=True,
+                )
+                if int(fresh_action.get("id") or 0) != action_id:
+                    raise LcuActionStateChanged(
+                        "내 밴 작업이 변경되었습니다."
+                    )
+                fresh_remaining_ms = champ_select_time_left_ms(session)
+                now = time.monotonic()
+                adjusted_deadline = lux_auto_ban_deadline_after_timer_sample(
+                    previous_remaining_ms,
+                    fresh_remaining_ms,
+                    target_ms,
+                    now,
+                    deadline,
+                )
+                if adjusted_deadline != deadline:
+                    # Riot explicitly extended/reset the same action timer.
+                    # The same rule also replaces the short fallback once a
+                    # previously absent Riot timer becomes available.
+                    deadline = adjusted_deadline
+                    with self._lux_auto_ban_lock:
+                        if generation == self._lux_auto_ban_generation:
+                            self._lux_auto_ban_fallback_deadline = deadline
+                remaining_ms = fresh_remaining_ms
+                if fresh_remaining_ms is not None:
+                    previous_remaining_ms = fresh_remaining_ms
+                session_errors = 0
+            except LcuActionStateChanged:
+                if self._finish_lux_auto_ban_monitor(
+                    generation, action_id,
+                ):
+                    self._post_lux_auto_ban_status(
+                        generation,
+                        "단계 전환 감지 · 내 밴 차례 다시 대기",
+                        remaining_ms=remaining_ms,
+                    )
+                return
+            except LcuUnavailable:
+                session_errors += 1
+                if session_errors >= 3:
+                    if self._finish_lux_auto_ban_monitor(
+                        generation, action_id,
+                    ):
+                        self._post_lux_auto_ban_status(
+                            generation,
+                            "LCU 연결 재시도 중 · 자동 밴 재감지 대기",
+                            remaining_ms=remaining_ms,
+                        )
+                    return
 
     def _show_pick_order_change_notice(
         self, previous_order: int, current_order: int,
@@ -12135,11 +12578,6 @@ class AdvisorApp:
 
         need_identity = not self._identity_checked
         auto_accept_enabled = self.auto_accept_enabled
-        lux_auto_ban_enabled = self.lux_auto_ban_enabled
-        champion_action_running = self._champion_action_running
-        scheduled_lux_action_id = self._lux_auto_ban_action_id
-        scheduled_lux_target_ms = self._lux_auto_ban_target_remaining_ms
-        scheduled_lux_deadline = self._lux_auto_ban_fallback_deadline
 
         def work() -> tuple[str, DraftSnapshot | None, dict, dict[str, object]]:
             phase = str(self.lcu.get("/lol-gameflow/v1/gameflow-phase"))
@@ -12154,87 +12592,6 @@ class AdvisorApp:
             if phase == "ChampSelect":
                 session = self.lcu.champ_select_session()
                 draft = parse_lcu_session(session, self.registry)
-                if lux_auto_ban_enabled and not champion_action_running:
-                    inner_phase = champ_select_timer_phase(session)
-                    if 99 in session_banned_champion_ids(session):
-                        automation["lux_auto_ban"] = "럭스 이미 밴됨"
-                        automation["lux_auto_ban_reset"] = True
-                    elif inner_phase != "BAN_PICK":
-                        automation["lux_auto_ban"] = (
-                            "픽 의사 표시 중 · 실제 밴 단계 대기"
-                            if inner_phase in {"PLANNING", "DECLARE"} else
-                            "실제 밴 단계 진입 대기"
-                        )
-                        automation["lux_auto_ban_reset"] = True
-                    else:
-                        try:
-                            ban_action = find_local_champion_action(
-                                session, "ban", require_in_progress=True,
-                            )
-                        except LcuUnavailable as exc:
-                            automation["lux_auto_ban"] = "내 밴 차례 대기"
-                            automation["lux_auto_ban_reset"] = True
-                        else:
-                            action_id = int(ban_action.get("id") or 0)
-                            remaining_ms = champ_select_time_left_ms(session)
-                            now_monotonic = time.monotonic()
-                            if (
-                                action_id != scheduled_lux_action_id
-                                or scheduled_lux_target_ms <= 0
-                            ):
-                                # A different random point is chosen for every ban
-                                # action so the click does not happen immediately or
-                                # at an identical timestamp each game.
-                                target_ms = choose_lux_auto_ban_target_ms()
-                                if remaining_ms is None:
-                                    deadline = now_monotonic + random.uniform(
-                                        LUX_AUTO_BAN_FALLBACK_MIN_SECONDS,
-                                        LUX_AUTO_BAN_FALLBACK_MAX_SECONDS,
-                                    )
-                                else:
-                                    deadline = now_monotonic + max(
-                                        0.0, (remaining_ms - target_ms) / 1000.0,
-                                    )
-                                automation["lux_auto_ban_schedule"] = (
-                                    action_id, target_ms, deadline,
-                                )
-                                automation["lux_auto_ban"] = (
-                                    f"예약됨 · 종료 약 {target_ms / 1000:.1f}초 전 밴"
-                                )
-                            elif deferred_ban_due(
-                                session, scheduled_lux_target_ms,
-                                scheduled_lux_deadline, now_monotonic,
-                            ):
-                                try:
-                                    # Recheck the toggle immediately before the LCU
-                                    # write in case it was switched off during polling.
-                                    if self.lux_auto_ban_enabled:
-                                        self.lcu.perform_champion_action(
-                                            99, "ban",
-                                            expected_action_id=(
-                                                scheduled_lux_action_id
-                                            ),
-                                        )
-                                        automation["lux_auto_ban"] = "럭스 자동 밴 완료"
-                                        automation["lux_auto_ban_reset"] = True
-                                except LcuActionStateChanged:
-                                    # A phase/action transition between the poll and
-                                    # write is normal. Keep the toggle enabled and
-                                    # rebuild the schedule from the next fresh session.
-                                    automation["lux_auto_ban"] = (
-                                        "단계 전환 감지 · 내 밴 차례 다시 대기"
-                                    )
-                                    automation["lux_auto_ban_reset"] = True
-                                except LcuUnavailable as exc:
-                                    automation["lux_auto_ban_error"] = str(exc)
-                            else:
-                                detail = (
-                                    f"현재 {remaining_ms / 1000:.1f}초 남음 · "
-                                    if remaining_ms is not None else "타이머 확인 불가 · "
-                                )
-                                automation["lux_auto_ban"] = (
-                                    f"{detail}{scheduled_lux_target_ms / 1000:.1f}초 전 예약"
-                                )
             identity: dict = {}
             if need_identity:
                 try:
@@ -12253,24 +12610,8 @@ class AdvisorApp:
             draft_changed = False
             swap_state_changed = False
             self.game_phase = phase
-            if phase != "ChampSelect":
-                self._reset_lux_auto_ban_schedule()
-            schedule = automation.get("lux_auto_ban_schedule")
-            if isinstance(schedule, tuple) and len(schedule) == 3:
-                self._lux_auto_ban_action_id = int(schedule[0])
-                self._lux_auto_ban_target_remaining_ms = int(schedule[1])
-                self._lux_auto_ban_fallback_deadline = float(schedule[2])
-            if automation.get("lux_auto_ban_reset"):
-                self._reset_lux_auto_ban_schedule()
             if automation.get("auto_accept"):
                 self._auto_accept_status = str(automation["auto_accept"])
-            if automation.get("lux_auto_ban"):
-                self._lux_auto_ban_status = str(automation["lux_auto_ban"])
-                if automation["lux_auto_ban"] == "럭스 자동 밴 완료":
-                    self.champion_action_status.configure(
-                        text="럭스 자동 밴 완료 · 밴 가능 여부와 내 밴 순서를 확인했습니다.",
-                        fg=COLORS["green"],
-                    )
             auto_accept_error = automation.get("auto_accept_error")
             if auto_accept_error:
                 self.auto_accept_enabled = False
@@ -12281,18 +12622,6 @@ class AdvisorApp:
                     f"{auto_accept_error} 롤 클라이언트에서 직접 수락해 주세요. 자동 수락을 OFF로 바꿨습니다.",
                     parent=self.root,
                 )
-            lux_auto_ban_error = automation.get("lux_auto_ban_error")
-            if lux_auto_ban_error:
-                self._reset_lux_auto_ban_schedule()
-                self.lux_auto_ban_enabled = False
-                self.storage.set_setting("lux_auto_ban_enabled", "0")
-                self._lux_auto_ban_status = "실패 후 자동 OFF"
-                guidance = (
-                    f"{lux_auto_ban_error} 롤 클라이언트에서 직접 밴해 주세요. "
-                    "럭스 자동 밴을 OFF로 바꿨습니다."
-                )
-                self.champion_action_status.configure(text=guidance, fg=COLORS["red"])
-                messagebox.showwarning("럭스 자동 밴 실패", guidance, parent=self.root)
             if identity:
                 game_name = str(identity.get("gameName") or "").strip()
                 tag_line = str(identity.get("tagLine") or "").strip()

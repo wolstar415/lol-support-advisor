@@ -9,7 +9,8 @@ import re
 import ssl
 import subprocess
 import threading
-from typing import Any
+import time
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -151,6 +152,9 @@ class LcuClient:
         self.configured_lockfile = configured_lockfile
         self.timeout = timeout
         self._write_lock = threading.Lock()
+        self._credentials_lock = threading.Lock()
+        self._cached_credentials: tuple[int, str] | None = None
+        self._credentials_failure_until = 0.0
 
     def _credentials_from_lockfile(self) -> tuple[int, str] | None:
         candidates: list[Path] = []
@@ -171,7 +175,13 @@ class LcuClient:
                 continue
             parts = raw.split(":")
             if len(parts) >= 5:
-                return int(parts[2]), parts[3]
+                try:
+                    port = int(parts[2])
+                except (TypeError, ValueError):
+                    continue
+                token = str(parts[3]).strip()
+                if port > 0 and token:
+                    return port, token
         return None
 
     def _credentials_from_process(self) -> tuple[int, str] | None:
@@ -199,13 +209,44 @@ class LcuClient:
         return int(port_match.group(1)), token_match.group(1)
 
     def _credentials(self) -> tuple[int, str]:
-        credentials = self._credentials_from_lockfile() or self._credentials_from_process()
-        if not credentials:
-            raise LcuUnavailable("롤 클라이언트를 찾을 수 없습니다.")
-        return credentials
+        # Credential discovery can fall back to starting PowerShell and querying
+        # LeagueClientUx.exe.  Cache the result so every fast champ-select poll
+        # does not pay that process-discovery cost.  Holding the lock through
+        # discovery also prevents concurrent background jobs from doing the same
+        # expensive lookup in parallel.
+        with self._credentials_lock:
+            if self._cached_credentials is not None:
+                return self._cached_credentials
+            if time.monotonic() < self._credentials_failure_until:
+                raise LcuUnavailable("롤 클라이언트를 찾을 수 없습니다.")
+            credentials = (
+                self._credentials_from_lockfile()
+                or self._credentials_from_process()
+            )
+            if not credentials:
+                # Waiting callers reuse this short negative result instead of
+                # each launching their own three-second PowerShell discovery.
+                self._credentials_failure_until = time.monotonic() + 0.75
+                raise LcuUnavailable("롤 클라이언트를 찾을 수 없습니다.")
+            self._cached_credentials = credentials
+            self._credentials_failure_until = 0.0
+            return credentials
+
+    def _invalidate_credentials(
+        self, credentials: tuple[int, str] | None = None,
+    ) -> None:
+        """Forget failed credentials without clearing a newer concurrent value."""
+        with self._credentials_lock:
+            if (
+                credentials is None
+                or self._cached_credentials == credentials
+            ):
+                self._cached_credentials = None
+                self._credentials_failure_until = 0.0
 
     def request(self, method: str, path: str, payload: Any | None = None) -> Any:
-        port, token = self._credentials()
+        credentials = self._credentials()
+        port, token = credentials
         authorization = base64.b64encode(f"riot:{token}".encode("utf-8")).decode("ascii")
         body = None if payload is None else json.dumps(payload).encode("utf-8")
         request = Request(
@@ -224,6 +265,8 @@ class LcuClient:
                 raw = response.read()
                 return json.loads(raw.decode("utf-8")) if raw else None
         except HTTPError as exc:
+            if exc.code in {401, 403}:
+                self._invalidate_credentials(credentials)
             if exc.code == 404 and path == "/lol-champ-select/v1/session":
                 raise LcuUnavailable("현재 챔피언 선택 화면이 아닙니다.") from exc
             detail = ""
@@ -236,7 +279,10 @@ class LcuClient:
             raise LcuUnavailable(
                 f"롤 클라이언트 응답 오류: HTTP {exc.code}{suffix}"
             ) from exc
-        except (URLError, OSError, ValueError) as exc:
+        except (URLError, OSError) as exc:
+            self._invalidate_credentials(credentials)
+            raise LcuUnavailable(f"롤 클라이언트 연결 실패: {exc}") from exc
+        except ValueError as exc:
             raise LcuUnavailable(f"롤 클라이언트 연결 실패: {exc}") from exc
 
     def get(self, path: str) -> Any:
@@ -303,15 +349,24 @@ class LcuClient:
     def perform_champion_action(
         self, champion_key: int, action: str, *,
         expected_action_id: int | None = None,
+        pre_commit_check: Callable[[], bool] | None = None,
     ) -> LcuChampionActionResult:
         with self._write_lock:
+            if pre_commit_check is not None and not pre_commit_check():
+                raise LcuActionStateChanged(
+                    "예약된 챔피언 작업이 취소되었습니다."
+                )
             return self._perform_champion_action(
-                champion_key, action, expected_action_id=expected_action_id,
+                champion_key,
+                action,
+                expected_action_id=expected_action_id,
+                pre_commit_check=pre_commit_check,
             )
 
     def _perform_champion_action(
         self, champion_key: int, action: str, *,
         expected_action_id: int | None = None,
+        pre_commit_check: Callable[[], bool] | None = None,
     ) -> LcuChampionActionResult:
         """Preflight and perform an explicit local HOVER, pick, or ban action."""
         try:
@@ -369,6 +424,14 @@ class LcuClient:
             if champion_key not in bannable:
                 raise LcuActionError("현재 이 챔피언을 밴할 수 없습니다.")
 
+        # The automatic-ban toggle can be turned off while the LCU preflight
+        # requests above are in flight.  Recheck immediately before the only
+        # state-changing request so an already-cancelled monitor can never
+        # commit a late PATCH.
+        if pre_commit_check is not None and not pre_commit_check():
+            raise LcuActionStateChanged(
+                "예약된 챔피언 작업이 취소되었습니다."
+            )
         completed = normalized in {"pick", "ban"}
         self.patch(
             f"/lol-champ-select/v1/session/actions/{action_id}",
