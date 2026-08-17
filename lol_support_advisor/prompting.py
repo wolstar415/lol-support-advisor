@@ -5,7 +5,10 @@ import re
 from typing import Any
 
 from .champions import ChampionRegistry
-from .models import DraftSnapshot, OpggSnapshot, Recommendation
+from .models import (
+    DraftSnapshot, OpggSnapshot, OpggSynergySnapshot, PersonalStat,
+    Recommendation,
+)
 
 
 ROLE_NAMES = {
@@ -13,38 +16,70 @@ ROLE_NAMES = {
     "BOTTOM": "원딜", "SUPPORT": "서포터", "UTILITY": "서포터",
 }
 
-REQUEST_RULES_TEMPLATE = """너는 리그 오브 레전드 {role_ko} 픽 추천 분석기다.
+MEMORY_PROMPT_VERSION = "4"
 
-아래 DRAFT_SNAPSHOT_V2 데이터와 OP.GG 데이터를 사용하여
-현재 시점에서 선택하기 좋은 {role_ko} 챔피언을 정확히 3개 추천하라.
-
-[판단 규칙]
-1. LOCKED는 확정된 챔피언이다.
-2. HOVER는 픽 의사일 뿐 확정된 챔피언이 아니다.
-3. UNKNOWN 정보는 임의로 추측하지 않는다.
-4. 상대 동일 포지션 챔피언 source가 MANUAL_UNKNOWN이거나 UNKNOWN이면 블라인드 픽 안정성을 우선한다.
-5. source가 MANUAL_ENEMY_SUPPORT이면 사용자가 확정한 정보이므로 해당 상성을 가장 중요하게 판단한다.
-6. source가 AUTO_ENEMY_SUPPORT이면 공개 픽을 보고 프로그램이 추정한 것일 뿐 확정 정보가 아니다. 해당 상성과 블라인드 안정성을 함께 보고, 추천 이유에서 추정임을 분명히 한다.
-7. 아군 HOVER는 조합에 참고하되 확정된 것으로 가정하지 않는다.
-8. 밴, 확정 픽, 다른 아군의 HOVER 챔피언은 절대 추천하지 않는다.
-9. 사용자는 모든 챔피언을 보유하고 있으므로 보유 여부는 고려하지 않는다.
-10. 숫자 통계는 입력의 OP.GG 데이터만 사용하고 새로운 숫자를 만들지 않는다.
-11. 정확히 3개의 서로 다른 챔피언을 추천한다.
-12. 반드시 {role_ko} 포지션에서 실제로 사용할 가치가 있는 챔피언만 추천한다.
-13. 아래 JSON 이외의 문장, 인사말, 해설, 마크다운 코드 블록을 출력하지 않는다.
-"""
-
-# Kept as a public compatibility constant for callers that imported the old name.
-REQUEST_RULES = REQUEST_RULES_TEMPLATE.format(role_ko="서포터")
+REQUEST_RULES = """LOCKED는 확정, HOVER는 픽 의사, EMPTY/UNKNOWN은 미확정이다.
+밴·확정 픽·다른 아군 HOVER는 추천하지 않는다. 사용자는 모든 챔피언을 보유한다.
+MANUAL은 사용자 확정, AUTO는 프로그램 추정이므로 확정처럼 단정하지 않는다.
+상대 동일 포지션이 UNKNOWN이면 블라인드 안정성을 우선한다.
+내 포지션이 SUPPORT이고 ally_adc_synergy가 있으면 원딜 조합 승률·표본을 반드시 비교한다.
+추천 순위는 맞상대 상성 하나만 보지 말고 아군 원딜 궁합, 양 팀 전체 조합의 이니시·보호·딜 균형,
+AD/AP 비중, 앞라인 유무, 픽 순서와 블라인드 안정성까지 종합한다.
+HOVER 조합은 바뀔 수 있으므로 확정 픽보다 낮은 확신으로 다룬다.
+입력에 없는 통계 숫자는 만들지 않고, 현재 포지션에서 쓸 수 있는 서로 다른 챔피언 3개만 추천한다."""
 
 
-def _opgg_payload(snapshot: OpggSnapshot | None, draft: DraftSnapshot) -> dict[str, Any]:
-    if not snapshot:
+def build_memory_prompt() -> str:
+    """Build the rules message that the user sends to a ChatGPT chat once."""
+    response_example = {
+        "schema_version": 2,
+        "snapshot_id": "질문의 snapshot_id를 그대로 복사",
+        "draft_mode": "MATCHUP/MATCHUP_TENTATIVE/BLIND",
+        "recommendations": [
+            {
+                "rank": rank,
+                "champion_id": "DataDragon 영문 ID",
+                "champion_name_ko": "한국어 이름",
+                "style": "플레이 유형",
+                "blind_safety": "높음/보통/낮음",
+                "reason": "추천 이유 한 문장",
+                "team_synergy": "아군 조합 관계 한 문장",
+                "lane_plan": "초반 운영 한 문장",
+                "watch_for": "주의할 상대 픽 한 문장",
+            }
+            for rank in range(1, 4)
+        ],
+    }
+    return (
+        "LOL_PICK_MEMORY_V4\n"
+        "앞으로 이 채팅에서 LOL_PICK_QUERY_V4가 오면 리그 오브 레전드 픽 추천기로 동작해.\n"
+        + REQUEST_RULES
+        + "\nrole은 추천할 내 포지션이고 opponent는 같은 포지션의 상대 챔피언이다. "
+          "ally/enemy 항목 형식은 [챔피언ID, 포지션, 상태, 팀내픽순서, 전체픽턴]이다. "
+          "ally_adc_synergy는 [서포터ID,조합승률,표본,시너지순위,티어]이고 "
+          "my_local_combos는 [서포터ID,내조합승률,내표본]이다. 두 출처를 섞어 하나의 "
+          "가짜 승률을 만들지 말고 각각 구분해 판단해. "
+          "OP.GG 배열의 숫자는 질문에 있는 값만 인용해.\n"
+          "답변은 인사말·설명·마크다운 없이 반드시 아래 패턴의 JSON만 출력해.\n"
+          "LOL_SUPPORT_V2\n"
+        + json.dumps(response_example, ensure_ascii=False, indent=2)
+        + "\nEND_LOL_SUPPORT_V2\nEND_LOL_PICK_MEMORY_V4"
+    )
+
+
+def _opgg_payload(
+    snapshot: OpggSnapshot | None,
+    draft: DraftSnapshot,
+    meta_snapshot: OpggSnapshot | None = None,
+) -> dict[str, Any]:
+    if not snapshot and not meta_snapshot:
         return {
             "status": "NO_CACHE",
             "enemy_support_known": bool(draft.selected_enemy_support_id),
             "notice": "OP.GG 캐시가 없으므로 숫자를 추측하지 말 것",
         }
+    snapshot = snapshot or meta_snapshot
+    assert snapshot is not None
     unavailable = set(draft.unavailable_champions())
     counters = []
     for entry in snapshot.counters:
@@ -79,13 +114,143 @@ def _opgg_payload(snapshot: OpggSnapshot | None, draft: DraftSnapshot) -> dict[s
         result["counter_picks"] = counters
     else:
         result["blind_pick_candidates"] = counters
+    if meta_snapshot:
+        meta_rankings = []
+        for index, entry in enumerate(meta_snapshot.counters[:15], start=1):
+            meta_rankings.append({
+                "rank": entry.position_rank or index,
+                "champion_id": entry.champion_id,
+                "champion_name_ko": entry.champion_name_ko,
+                "win_rate": entry.overall_win_rate,
+                "pick_rate": entry.pick_rate,
+                "ban_rate": entry.ban_rate,
+                "availability": (
+                    "UNAVAILABLE" if entry.champion_id in unavailable else "AVAILABLE"
+                ),
+            })
+        result["position_meta"] = {
+            "position": meta_snapshot.position,
+            "patch": meta_snapshot.patch,
+            "tier": meta_snapshot.tier,
+            "updated_at": meta_snapshot.updated_at,
+            "rankings": meta_rankings,
+        }
     return result
 
 
-def build_prompt(draft: DraftSnapshot, opgg: OpggSnapshot | None) -> str:
+def _compact_opgg_payload(
+    snapshot: OpggSnapshot | None,
+    draft: DraftSnapshot,
+    meta_snapshot: OpggSnapshot | None = None,
+    meta_limit: int = 10,
+) -> dict[str, Any]:
+    """Keep only the numbers useful for the next pick decision."""
+    unavailable = set(draft.unavailable_champions())
+    result: dict[str, Any] = {
+        "status": "NO_CACHE",
+        "notice": "OP.GG 캐시가 없으므로 숫자를 추측하지 말 것",
+    }
+    if snapshot:
+        result = {
+            "status": snapshot.raw_status,
+            "patch": snapshot.patch,
+            "matchup": [
+                [
+                    entry.champion_id,
+                    entry.versus_win_rate,
+                    entry.games,
+                    "X" if entry.champion_id in unavailable else "O",
+                ]
+                for entry in snapshot.counters[:8]
+            ],
+            "weak": [
+                [entry.champion_id, entry.versus_win_rate, entry.games]
+                for entry in snapshot.weak_picks[:4]
+            ],
+        }
+    if meta_snapshot:
+        result["position_meta"] = [
+            [
+                entry.position_rank or index,
+                entry.champion_id,
+                entry.overall_win_rate,
+                entry.pick_rate,
+                entry.ban_rate,
+                "X" if entry.champion_id in unavailable else "O",
+            ]
+            for index, entry in enumerate(
+                meta_snapshot.counters[:max(1, int(meta_limit))], start=1
+            )
+        ]
+        result["meta_patch"] = meta_snapshot.patch
+    return result
+
+
+def _compact_synergy_payload(
+    snapshot: OpggSynergySnapshot | None,
+    draft: DraftSnapshot,
+    local_stats: dict[str, PersonalStat | None] | None = None,
+) -> dict[str, Any]:
+    ally_members = draft.ally_team_order or [
+        *draft.ally_locked, *draft.ally_hover,
+        *([draft.my_hover] if draft.my_hover else []),
+    ]
+    adc = next(
+        (
+            member for member in ally_members
+            if member.role == "BOTTOM" and member.champion_id
+            and member.state in {"LOCKED", "HOVER"}
+        ),
+        None,
+    )
+    if draft.my_role != "SUPPORT":
+        return {"status": "NOT_APPLICABLE"}
+    if not adc:
+        return {
+            "status": "ALLY_ADC_UNKNOWN",
+            "instruction": "아군 원딜 미확정이므로 조합 승률 없이 전체 조합을 판단할 것",
+        }
+    result: dict[str, Any] = {
+        "status": "NO_CACHE",
+        "ally_adc": adc.champion_id,
+        "ally_adc_state": adc.state,
+        "notice": "조합 통계 캐시가 없으므로 숫자를 추측하지 말 것",
+    }
+    if not snapshot or snapshot.ally_champion_id != adc.champion_id:
+        return result
+    result.update({
+        "status": snapshot.status,
+        "fetched_at": snapshot.fetched_at,
+        "candidates": [
+            [
+                item.champion_id,
+                item.win_rate,
+                item.games,
+                item.synergy_rank,
+                item.synergy_tier,
+            ]
+            for item in snapshot.synergies[:10]
+            if item.champion_id not in set(draft.unavailable_champions())
+        ],
+        "my_local_combos": [
+            [champion_id, stat.ally_adc_win_rate, stat.ally_adc_games]
+            for champion_id, stat in (local_stats or {}).items()
+            if stat is not None and stat.ally_adc_games
+        ],
+    })
+    return result
+
+
+def build_prompt(
+    draft: DraftSnapshot,
+    opgg: OpggSnapshot | None,
+    meta_snapshot: OpggSnapshot | None = None,
+    synergy_snapshot: OpggSynergySnapshot | None = None,
+    local_synergy_stats: dict[str, PersonalStat | None] | None = None,
+    meta_limit: int = 10,
+) -> str:
+    """Build the short per-draft query used after the memory prompt is registered."""
     draft.refresh_snapshot_id()
-    payload = draft.payload()
-    payload["snapshot_id"] = draft.snapshot_id
     source = draft.selected_enemy_support_source
     role_ko = ROLE_NAMES.get(draft.my_role, "서포터")
     unknown_opponent_instruction = (
@@ -93,50 +258,73 @@ def build_prompt(draft: DraftSnapshot, opgg: OpggSnapshot | None) -> str:
         if role_ko == "서포터" else
         f"적 {role_ko} 챔피언을 모르므로 임의 확정하지 말고 블라인드 안정성을 우선할 것"
     )
-    payload["enemy_support_certainty"] = (
+    certainty = (
         "CONFIRMED" if source == "MANUAL_ENEMY_SUPPORT" else
         "TENTATIVE" if source == "AUTO_ENEMY_SUPPORT" else "UNKNOWN"
     )
-    payload["enemy_support_instruction"] = (
+    opponent_instruction = (
         "사용자가 직접 확정함" if source == "MANUAL_ENEMY_SUPPORT" else
         "공개된 적 픽을 기반으로 프로그램이 추정했으며 확정 정보가 아님"
         if source == "AUTO_ENEMY_SUPPORT" else
         unknown_opponent_instruction
     )
-    payload["lane_opponent_certainty"] = payload["enemy_support_certainty"]
-    payload["lane_opponent_instruction"] = payload["enemy_support_instruction"]
-    payload["opgg"] = _opgg_payload(opgg, draft)
     draft_mode = (
         "MATCHUP" if source == "MANUAL_ENEMY_SUPPORT" and draft.selected_enemy_support_id else
         "MATCHUP_TENTATIVE" if source == "AUTO_ENEMY_SUPPORT" and draft.selected_enemy_support_id else
         "BLIND"
     )
-    response_template = {
-        "schema_version": 2,
+    ally_members = draft.ally_team_order or [
+        *draft.ally_locked, *draft.ally_hover,
+        *([draft.my_hover] if draft.my_hover else []),
+    ]
+    enemy_members = draft.enemy_team_order or draft.enemy_locked
+
+    def compact_member(member: Any) -> list[Any]:
+        return [
+            member.champion_id or None,
+            member.role,
+            member.state,
+            member.pick_order,
+            member.pick_turn,
+        ]
+
+    payload = {
         "snapshot_id": draft.snapshot_id,
         "draft_mode": draft_mode,
-        "recommendations": [
-            {
-                "rank": rank,
-                "champion_id": "DataDragon 영문 ID",
-                "champion_name_ko": "한국어 이름",
-                "style": "해당 포지션에 맞는 플레이 유형 한 가지",
-                "blind_safety": "높음/보통/낮음 중 하나",
-                "reason": "추천 이유 한 문장",
-                "team_synergy": "현재 아군 조합과의 관계 한 문장",
-                "lane_plan": "초반 운영 한 문장",
-                "watch_for": "주의하거나 추가로 확인할 상대 픽 한 문장",
-            }
-            for rank in range(1, 4)
+        "role": draft.my_role,
+        "role_ko": role_ko,
+        "my_pick_order": draft.my_pick_order,
+        "my_status": draft.my_status,
+        "ally": [compact_member(member) for member in ally_members],
+        "enemy": [compact_member(member) for member in enemy_members],
+        "bans": {"ally": draft.ally_bans, "enemy": draft.enemy_bans},
+        "opponent": {
+            "champion": draft.selected_enemy_support_id,
+            "name_ko": draft.selected_enemy_support_name_ko,
+            "source": source,
+            "certainty": certainty,
+            "instruction": opponent_instruction,
+        },
+        # Compatibility keys also make certainty immediately visible to the model.
+        "enemy_support_certainty": certainty,
+        "selected_lane_opponent": draft.payload()["selected_lane_opponent"],
+        "opgg": _compact_opgg_payload(
+            opgg, draft, meta_snapshot, meta_limit=meta_limit,
+        ),
+        "ally_adc_synergy": _compact_synergy_payload(
+            synergy_snapshot, draft, local_synergy_stats,
+        ),
+        "decision_focus": [
+            "lane_matchup", "ally_adc_synergy", "team_engage_and_peel",
+            "damage_balance", "frontline", "pick_timing_and_blind_safety",
         ],
     }
     return (
-        REQUEST_RULES_TEMPLATE.format(role_ko=role_ko)
-        + "\nDRAFT_SNAPSHOT_V2\n"
-        + json.dumps(payload, ensure_ascii=False, indent=2)
-        + "\nEND_DRAFT_SNAPSHOT_V2\n\n다음 형식으로만 답변하라.\n\nLOL_SUPPORT_V2\n"
-        + json.dumps(response_template, ensure_ascii=False, indent=2)
-        + "\nEND_LOL_SUPPORT_V2"
+        "LOL_PICK_QUERY_V4\n"
+        + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+        + "\nEND_LOL_PICK_QUERY_V4\n"
+          "기억한 LOL_PICK_MEMORY_V4 규칙대로 전체 조합 흐름을 종합해 정확히 3개를 "
+          "LOL_SUPPORT_V2 형식으로만 답해."
     )
 
 

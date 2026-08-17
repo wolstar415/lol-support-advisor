@@ -13,6 +13,20 @@ class DraftMember:
     role: str = "UNKNOWN"
     state: str = "LOCKED"
     cell_id: int | None = None
+    pick_order: int | None = None
+    pick_turn: int | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class DraftBan:
+    champion_id: str = ""
+    champion_name_ko: str = ""
+    state: str = "EMPTY"
+    actor_cell_id: int | None = None
+    order: int | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -27,8 +41,12 @@ class DraftSnapshot:
     ally_hover: list[DraftMember] = field(default_factory=list)
     enemy_locked: list[DraftMember] = field(default_factory=list)
     my_hover: DraftMember | None = None
+    ally_team_order: list[DraftMember] = field(default_factory=list)
+    enemy_team_order: list[DraftMember] = field(default_factory=list)
     ally_bans: list[str] = field(default_factory=list)
     enemy_bans: list[str] = field(default_factory=list)
+    ally_ban_actions: list[DraftBan] = field(default_factory=list)
+    enemy_ban_actions: list[DraftBan] = field(default_factory=list)
     selected_enemy_support_id: str | None = None
     selected_enemy_support_name_ko: str | None = None
     selected_enemy_support_source: str = "UNKNOWN"
@@ -59,6 +77,8 @@ class DraftSnapshot:
             "ally_hover": [m.to_dict() for m in self.ally_hover],
             "my_hover": self.my_hover.to_dict() if self.my_hover else None,
             "enemy_locked": [m.to_dict() for m in self.enemy_locked],
+            "ally_team_order": [m.to_dict() for m in self.ally_team_order],
+            "enemy_team_order": [m.to_dict() for m in self.enemy_team_order],
             "selected_enemy_support": {
                 "champion_id": self.selected_enemy_support_id,
                 "champion_name_ko": self.selected_enemy_support_name_ko,
@@ -67,6 +87,8 @@ class DraftSnapshot:
             "selected_lane_opponent": lane_opponent,
             "ally_bans": self.ally_bans,
             "enemy_bans": self.enemy_bans,
+            "ally_ban_actions": [item.to_dict() for item in self.ally_ban_actions],
+            "enemy_ban_actions": [item.to_dict() for item in self.enemy_ban_actions],
             "unavailable_champions": self.unavailable_champions(),
         }
 
@@ -86,6 +108,13 @@ class OpggCounter:
     overall_win_rate: float | None = None
     ally_adc_win_rate: float | None = None
     status: str = "AVAILABLE"
+    position_rank: int | None = None
+    pick_rate: float | None = None
+    ban_rate: float | None = None
+    # Some matchup providers expose a separate laning metric. OP.GG's current
+    # table parser does not always receive it, so this must remain optional and
+    # must never be substituted with the normal game win rate.
+    laning_win_rate: float | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -124,6 +153,233 @@ class OpggSnapshot:
 
 
 @dataclass(slots=True)
+class OpggSynergyStat:
+    champion_key: int
+    champion_id: str
+    champion_name_ko: str
+    games: int = 0
+    wins: int = 0
+    win_rate: float | None = None
+    synergy_rank: int = 0
+    synergy_tier: int = 4
+    tier_rank: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class OpggSynergySnapshot:
+    ally_champion_key: int
+    ally_champion_id: str
+    ally_champion_name_ko: str
+    ally_position: str = "BOTTOM"
+    candidate_position: str = "SUPPORT"
+    fetched_at: str = ""
+    synergies: list[OpggSynergyStat] = field(default_factory=list)
+    status: str = "NO_DATA"
+
+    def synergy_for(self, champion_id: str) -> OpggSynergyStat | None:
+        return next(
+            (item for item in self.synergies if item.champion_id == champion_id),
+            None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "synergies": [item.to_dict() for item in self.synergies],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "OpggSynergySnapshot":
+        payload = dict(data)
+        payload["synergies"] = [
+            OpggSynergyStat(**item) for item in data.get("synergies", [])
+        ]
+        return cls(**payload)
+
+
+@dataclass(slots=True)
+class OpggPlayerChampionStat:
+    champion_id: str
+    champion_name_ko: str
+    wins: int = 0
+    losses: int = 0
+    page_updated_text: str = ""
+    fetched_at: str = ""
+    source_url: str = ""
+    status: str = "NO_DATA"
+
+    @property
+    def games(self) -> int:
+        return self.wins + self.losses
+
+    @property
+    def win_rate(self) -> float | None:
+        return self.wins / self.games * 100 if self.games else None
+
+
+@dataclass(slots=True)
+class OpggMcpChampionStat:
+    champion_key: int
+    champion_name: str
+    games: int = 0
+    wins: int = 0
+    losses: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class OpggMcpRecentMatch:
+    match_id: str
+    created_at: str
+    game_type: str
+    champion_key: int
+    champion_name: str
+    position: str
+    result: str
+    kills: int = 0
+    deaths: int = 0
+    assists: int = 0
+    op_score: float = 0.0
+    op_score_rank: int = 0
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class OpggMcpSummonerProfile:
+    riot_id: str
+    game_name: str
+    tag_line: str
+    region: str = "KR"
+    tier: str = "UNRANKED"
+    division: str = ""
+    league_points: int = 0
+    season_wins: int = 0
+    season_losses: int = 0
+    source_updated_at: str = ""
+    fetched_at: str = ""
+    champion_stats: list[OpggMcpChampionStat] = field(default_factory=list)
+    recent_matches: list[OpggMcpRecentMatch] = field(default_factory=list)
+    recent_matches_status: str = "NO_DATA"
+    status: str = "NO_DATA"
+
+    def champion_stat(self, champion_key: int) -> OpggMcpChampionStat | None:
+        return next(
+            (
+                stat for stat in self.champion_stats
+                if int(stat.champion_key) == int(champion_key)
+            ),
+            None,
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "champion_stats": [stat.to_dict() for stat in self.champion_stats],
+            "recent_matches": [match.to_dict() for match in self.recent_matches],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "OpggMcpSummonerProfile":
+        payload = dict(data)
+        payload["champion_stats"] = [
+            OpggMcpChampionStat(**item)
+            for item in data.get("champion_stats", [])
+        ]
+        payload["recent_matches"] = [
+            OpggMcpRecentMatch(**item)
+            for item in data.get("recent_matches", [])
+        ]
+        return cls(**payload)
+
+
+@dataclass(slots=True)
+class BuildAsset:
+    asset_id: int
+    name: str
+    icon_url: str = ""
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass(slots=True)
+class RuneBuild:
+    name: str
+    primary_style_id: int
+    sub_style_id: int
+    perks: list[BuildAsset] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "perks": [perk.to_dict() for perk in self.perks]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RuneBuild":
+        payload = dict(data)
+        payload["perks"] = [BuildAsset(**item) for item in data.get("perks", [])]
+        return cls(**payload)
+
+
+@dataclass(slots=True)
+class BuildItemGroup:
+    title: str
+    items: list[BuildAsset] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {**asdict(self), "items": [item.to_dict() for item in self.items]}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BuildItemGroup":
+        payload = dict(data)
+        payload["items"] = [BuildAsset(**item) for item in data.get("items", [])]
+        return cls(**payload)
+
+
+@dataclass(slots=True)
+class ChampionBuildGuide:
+    champion_id: str
+    champion_name_ko: str
+    position: str
+    patch: str = "UNKNOWN"
+    tier: str = "EMERALD_PLUS"
+    updated_at: str = ""
+    source_url: str = ""
+    rune_builds: list[RuneBuild] = field(default_factory=list)
+    summoner_spells: list[BuildAsset] = field(default_factory=list)
+    skill_priority: list[str] = field(default_factory=list)
+    skill_sequence: list[str] = field(default_factory=list)
+    item_groups: list[BuildItemGroup] = field(default_factory=list)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            **asdict(self),
+            "rune_builds": [build.to_dict() for build in self.rune_builds],
+            "summoner_spells": [spell.to_dict() for spell in self.summoner_spells],
+            "item_groups": [group.to_dict() for group in self.item_groups],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ChampionBuildGuide":
+        payload = dict(data)
+        payload["rune_builds"] = [
+            RuneBuild.from_dict(item) for item in data.get("rune_builds", [])
+        ]
+        payload["summoner_spells"] = [
+            BuildAsset(**item) for item in data.get("summoner_spells", [])
+        ]
+        payload["item_groups"] = [
+            BuildItemGroup.from_dict(item) for item in data.get("item_groups", [])
+        ]
+        return cls(**payload)
+
+
+@dataclass(slots=True)
 class Recommendation:
     rank: int
     champion_id: str
@@ -148,6 +404,10 @@ class PersonalStat:
     matchup_wins: int = 0
     matchup_losses: int = 0
     matchup_win_rate: float | None = None
+    ally_adc_games: int = 0
+    ally_adc_wins: int = 0
+    ally_adc_losses: int = 0
+    ally_adc_win_rate: float | None = None
 
     @property
     def matchup_confidence(self) -> str:
@@ -172,6 +432,8 @@ class LivePlayer:
     position: str = "UNKNOWN"
     level: int = 1
     is_active_player: bool = False
+    draft_pick_turn: int | None = None
+    draft_team_pick_order: int | None = None
 
     @property
     def riot_id(self) -> str:
@@ -198,6 +460,114 @@ class LiveGameSnapshot:
 
 
 @dataclass(slots=True)
+class GamePrediction:
+    prediction_key: str
+    captured_at: str
+    active_riot_id: str
+    active_champion_id: str
+    ally_champion_ids: tuple[str, ...]
+    enemy_champion_ids: tuple[str, ...]
+    ally_riot_ids: tuple[str, ...]
+    enemy_riot_ids: tuple[str, ...]
+    win_probability: float
+    predicted_win: bool
+    confidence: str
+    evidence: tuple[str, ...] = ()
+    evidence_score: float = 0.0
+    match_id: str = ""
+    actual_win: bool | None = None
+
+    @property
+    def correct(self) -> bool | None:
+        if self.actual_win is None:
+            return None
+        return self.predicted_win == self.actual_win
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "GamePrediction":
+        payload = dict(data)
+        for key in (
+            "ally_champion_ids", "enemy_champion_ids",
+            "ally_riot_ids", "enemy_riot_ids", "evidence",
+        ):
+            payload[key] = tuple(str(value) for value in payload.get(key, ()))
+        return cls(**payload)
+
+
+@dataclass(slots=True)
+class LaneMatchupStat:
+    position: str
+    ally_champion_id: str
+    ally_champion_name_ko: str
+    enemy_champion_id: str
+    enemy_champion_name_ko: str
+    ally_win_rate: float | None = None
+    ally_laning_win_rate: float | None = None
+    games: int = 0
+    patch: str = "UNKNOWN"
+    updated_at: str = ""
+    status: str = "LOADING"
+    cached: bool = False
+    message: str = ""
+
+    @property
+    def enemy_win_rate(self) -> float | None:
+        if self.ally_win_rate is None:
+            return None
+        return round(100.0 - self.ally_win_rate, 2)
+
+    @property
+    def enemy_laning_win_rate(self) -> float | None:
+        if self.ally_laning_win_rate is None:
+            return None
+        return round(100.0 - self.ally_laning_win_rate, 2)
+
+
+@dataclass(slots=True)
+class JungleTendencyStat:
+    """Evidence-backed jungle tendencies computed from cached solo queue games."""
+
+    puuid: str = ""
+    champion_id: str = ""
+    games: int = 0
+    champion_specific: bool = False
+    early_takedowns: float | None = None
+    early_lane_kills: float | None = None
+    jungle_cs_10: float | None = None
+    enemy_jungle_cs: float | None = None
+    spawn_objectives: float | None = None
+    labels: list[str] = field(default_factory=list)
+    status: str = "NO_DATA"
+    message: str = ""
+
+
+@dataclass(slots=True)
+class PlayerBehaviorStat:
+    """Recent role behavior derived from Riot match participant evidence."""
+
+    puuid: str = ""
+    champion_id: str = ""
+    position: str = "UNKNOWN"
+    games: int = 0
+    champion_specific: bool = False
+    first_blood_kills: int = 0
+    first_blood_assists: int = 0
+    first_blood_rate: float | None = None
+    early_advantage_rate: float | None = None
+    early_takedowns: float | None = None
+    kill_participation: float | None = None
+    average_deaths: float | None = None
+    vision_per_minute: float | None = None
+    control_wards: float | None = None
+    labels: list[str] = field(default_factory=list)
+    status: str = "NO_DATA"
+    message: str = ""
+
+
+@dataclass(slots=True)
 class PlayerProfileStat:
     puuid: str = ""
     queue_type: str = "RANKED_SOLO_5x5"
@@ -209,6 +579,21 @@ class PlayerProfileStat:
     champion_games: int = 0
     champion_wins: int = 0
     local_sample_games: int = 0
+    champion_data_source: str = "LOCAL"
+    champion_sample_target: int = 0
+    champion_source_detail: str = ""
+    recent_games: int = 0
+    recent_wins: int = 0
+    recent_kills: int = 0
+    recent_deaths: int = 0
+    recent_assists: int = 0
+    recent_op_score: float = 0.0
+    last_op_score_rank: int = 0
+    overall_streak: int = 0
+    champion_recent_games: int = 0
+    champion_recent_wins: int = 0
+    champion_streak: int = 0
+    recent_form_source: str = ""
     together_games: int = 0
     together_wins: int = 0
     against_games: int = 0
@@ -241,6 +626,16 @@ class PlayerProfileStat:
     @property
     def champion_win_rate(self) -> float | None:
         return self.rate(self.champion_wins, self.champion_games)
+
+    @property
+    def recent_win_rate(self) -> float | None:
+        return self.rate(self.recent_wins, self.recent_games)
+
+    @property
+    def recent_kda(self) -> float | None:
+        if not self.recent_games:
+            return None
+        return (self.recent_kills + self.recent_assists) / max(self.recent_deaths, 1)
 
     @property
     def together_win_rate(self) -> float | None:

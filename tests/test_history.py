@@ -7,6 +7,7 @@ from lol_support_advisor.history import analyze_history
 
 def history_match(
     match_id: str, champion: str, won: bool, creation: int, kills: int = 2,
+    position: str = "UTILITY",
 ) -> dict:
     return {
         "metadata": {"matchId": match_id},
@@ -17,19 +18,29 @@ def history_match(
             "participants": [
                 {
                     "puuid": "mine", "teamId": 100, "championName": champion,
-                    "teamPosition": "UTILITY", "win": won, "kills": kills,
+                    "teamPosition": position, "win": won, "kills": kills,
                     "deaths": 2, "assists": 10, "visionScore": 40,
                     "totalMinionsKilled": 20, "neutralMinionsKilled": 0,
                     "totalDamageDealtToChampions": 8000, "totalDamageTaken": 5000,
                     "goldEarned": 9000, "item0": 1001, "item1": 2003,
+                    "summoner1Id": 4, "summoner2Id": 14,
+                    "riotIdGameName": "Me", "riotIdTagline": "KR1",
+                    "perks": {"styles": [
+                        {"description": "primary", "style": 8200,
+                         "selections": [{"perk": 8214}]},
+                        {"description": "subStyle", "style": 8300,
+                         "selections": [{"perk": 8345}]},
+                    ]},
                 },
                 {
                     "puuid": "ally", "teamId": 100, "championName": "Jinx",
                     "kills": 8, "win": won,
+                    "riotIdGameName": "Ally", "riotIdTagline": "KR2",
                 },
                 {
                     "puuid": "enemy", "teamId": 200, "championName": "Leona",
                     "kills": 3, "win": not won,
+                    "riotIdGameName": "Enemy", "riotIdTagline": "KR3",
                 },
             ],
         },
@@ -48,6 +59,10 @@ class HistoryAnalysisTests(unittest.TestCase):
         self.assertAlmostEqual(overview.win_rate or 0, 66.666, places=2)
         self.assertEqual(overview.entries[0].match_id, "KR_3")
         self.assertEqual(overview.entries[0].items, (1001, 2003))
+        self.assertEqual(overview.entries[0].summoner_spell_ids, (4, 14))
+        self.assertEqual(overview.entries[0].primary_rune_id, 8214)
+        self.assertEqual(overview.entries[0].secondary_rune_style_id, 8300)
+        self.assertEqual(overview.entries[0].ally_players[0][1], "Me#KR1")
         self.assertEqual(overview.entries[0].cs_per_minute, 1.0)
         self.assertEqual(overview.champions[0].champion_id, "Janna")
         self.assertEqual(overview.champions[0].games, 2)
@@ -57,6 +72,21 @@ class HistoryAnalysisTests(unittest.TestCase):
         self.assertEqual(overview.games, 0)
         self.assertIsNone(overview.win_rate)
         self.assertEqual(overview.current_streak, 0)
+
+    def test_champion_performance_is_split_by_position(self) -> None:
+        overview = analyze_history([
+            history_match("KR_SUP_2", "Briar", True, 4000, position="UTILITY"),
+            history_match("KR_SUP_1", "Briar", False, 3000, position="UTILITY"),
+            history_match("KR_JGL_2", "Briar", True, 2000, position="JUNGLE"),
+            history_match("KR_JGL_1", "Briar", True, 1000, position="JUNGLE"),
+        ], "mine")
+        briar = {
+            stat.position: stat for stat in overview.champions
+            if stat.champion_id == "Briar"
+        }
+        self.assertEqual(set(briar), {"SUPPORT", "JUNGLE"})
+        self.assertEqual((briar["SUPPORT"].games, briar["SUPPORT"].wins), (2, 1))
+        self.assertEqual((briar["JUNGLE"].games, briar["JUNGLE"].wins), (2, 2))
 
 
 if __name__ == "__main__":

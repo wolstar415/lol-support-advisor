@@ -135,7 +135,8 @@ class ChampionRegistry:
         )
 
     def slug(self, champion_id: str) -> str:
-        special = {"Fiddlesticks": "fiddlesticks", "MonkeyKing": "wukong"}
+        # OP.GG keeps Riot's internal champion id in Wukong's canonical URL.
+        special = {"Fiddlesticks": "fiddlesticks", "MonkeyKing": "monkeyking"}
         return special.get(champion_id, champion_id.lower().replace("'", "").replace(" ", ""))
 
     def support_score(self, champion_id: str) -> int:

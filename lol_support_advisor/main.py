@@ -6,6 +6,7 @@ import sys
 import tkinter as tk
 
 from .champions import ChampionRegistry
+from .single_instance import SingleInstanceLock
 from .storage import Storage
 from .ui import AdvisorApp
 
@@ -15,16 +16,23 @@ def project_root() -> Path:
 
 
 def main(argv: list[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="Read-only LoL support pick advisor")
+    parser = argparse.ArgumentParser(description="LoL pick and user-triggered build advisor")
     parser.add_argument("--demo", action="store_true", help="show a populated offline preview")
     args = parser.parse_args(argv)
 
-    data_dir = project_root() / "data"
-    storage = Storage(data_dir / "advisor.db")
-    registry = ChampionRegistry(data_dir / "champions_ko.json")
-    root = tk.Tk()
-    AdvisorApp(root, storage, registry, demo=args.demo)
-    root.mainloop()
+    instance_lock = SingleInstanceLock()
+    if not instance_lock.acquire():
+        return 0
+
+    try:
+        data_dir = project_root() / "data"
+        storage = Storage(data_dir / "advisor.db")
+        registry = ChampionRegistry(data_dir / "champions_ko.json")
+        root = tk.Tk()
+        AdvisorApp(root, storage, registry, demo=args.demo)
+        root.mainloop()
+    finally:
+        instance_lock.release()
     return 0
 
 

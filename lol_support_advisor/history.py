@@ -27,11 +27,21 @@ class MatchHistoryEntry:
     items: tuple[int, ...]
     ally_champions: tuple[str, ...]
     enemy_champions: tuple[str, ...]
+    summoner_spell_ids: tuple[int, ...] = ()
+    primary_rune_id: int = 0
+    secondary_rune_style_id: int = 0
+    ally_players: tuple[tuple[str, str], ...] = ()
+    enemy_players: tuple[tuple[str, str], ...] = ()
+    predicted_win_rate: float | None = None
+    predicted_win: bool | None = None
+    prediction_confidence: str = ""
+    prediction_correct: bool | None = None
 
 
 @dataclass(slots=True)
 class ChampionHistoryStat:
     champion_id: str
+    position: str = "UNKNOWN"
     games: int = 0
     wins: int = 0
     kills: int = 0
@@ -93,11 +103,54 @@ def _integer(payload: dict[str, Any], key: str) -> int:
         return 0
 
 
+def _riot_id(payload: dict[str, Any]) -> str:
+    game_name = str(
+        payload.get("riotIdGameName") or payload.get("summonerName") or "이름 미상"
+    ).strip()
+    tag_line = str(
+        payload.get("riotIdTagline") or payload.get("riotIdTagLine") or ""
+    ).strip()
+    return f"{game_name}#{tag_line}" if tag_line else game_name
+
+
+def _position(value: Any) -> str:
+    normalized = str(value or "UNKNOWN").upper()
+    return {
+        "UTILITY": "SUPPORT",
+        "SUP": "SUPPORT",
+        "ADC": "BOTTOM",
+        "MID": "MIDDLE",
+        "JGL": "JUNGLE",
+    }.get(normalized, normalized)
+
+
+def _rune_loadout(payload: dict[str, Any]) -> tuple[int, int]:
+    styles = (payload.get("perks") or {}).get("styles") or []
+    primary = next(
+        (
+            int((style.get("selections") or [{}])[0].get("perk") or 0)
+            for style in styles
+            if str(style.get("description") or "").casefold() == "primary"
+            and style.get("selections")
+        ),
+        0,
+    )
+    secondary_style = next(
+        (
+            int(style.get("style") or 0)
+            for style in styles
+            if str(style.get("description") or "").casefold() == "substyle"
+        ),
+        int(payload.get("perkSubStyle") or 0),
+    )
+    return primary, secondary_style
+
+
 def analyze_history(
     matches: Iterable[dict[str, Any]], puuid: str, limit: int = 1000
 ) -> HistoryOverview:
     overview = HistoryOverview()
-    champion_totals: dict[str, ChampionHistoryStat] = {}
+    champion_totals: dict[tuple[str, str], ChampionHistoryStat] = {}
     for match in matches:
         info = match.get("info") or {}
         participants = info.get("participants") or []
@@ -117,16 +170,18 @@ def analyze_history(
             (kills + assists) / team_kills * 100 if team_kills else None
         )
         champion_id = str(mine.get("championName") or "Unknown")
+        position = _position(
+            mine.get("teamPosition") or mine.get("individualPosition")
+        )
         won = bool(mine.get("win"))
+        primary_rune_id, secondary_rune_style_id = _rune_loadout(mine)
         entry = MatchHistoryEntry(
             match_id=str((match.get("metadata") or {}).get("matchId") or info.get("gameId") or ""),
             game_creation=_integer(info, "gameCreation"),
             duration_seconds=duration,
             queue_id=_integer(info, "queueId"),
             champion_id=champion_id,
-            position=str(
-                mine.get("teamPosition") or mine.get("individualPosition") or "UNKNOWN"
-            ).upper(),
+            position=position,
             won=won,
             kills=kills,
             deaths=deaths,
@@ -145,6 +200,21 @@ def analyze_history(
             ),
             ally_champions=tuple(str(row.get("championName") or "Unknown") for row in allies),
             enemy_champions=tuple(str(row.get("championName") or "Unknown") for row in enemies),
+            summoner_spell_ids=tuple(
+                spell_id for spell_id in (
+                    _integer(mine, "summoner1Id"), _integer(mine, "summoner2Id")
+                ) if spell_id
+            ),
+            primary_rune_id=primary_rune_id,
+            secondary_rune_style_id=secondary_rune_style_id,
+            ally_players=tuple(
+                (str(row.get("championName") or "Unknown"), _riot_id(row))
+                for row in allies
+            ),
+            enemy_players=tuple(
+                (str(row.get("championName") or "Unknown"), _riot_id(row))
+                for row in enemies
+            ),
         )
         overview.entries.append(entry)
         overview.games += 1
@@ -154,7 +224,8 @@ def analyze_history(
         overview.assists += assists
         overview.total_vision += entry.vision_score
         champion = champion_totals.setdefault(
-            champion_id, ChampionHistoryStat(champion_id=champion_id)
+            (champion_id, position),
+            ChampionHistoryStat(champion_id=champion_id, position=position),
         )
         champion.games += 1
         champion.wins += int(won)
