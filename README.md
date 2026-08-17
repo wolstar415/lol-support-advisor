@@ -112,4 +112,3 @@ OP.GG는 공개 집계 API를 제공하지 않으므로 공개 웹페이지를 �
 ```powershell
 python -m unittest discover -v
 ```
-
