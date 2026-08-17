@@ -6,6 +6,7 @@ import tempfile
 import unittest
 
 from lol_support_advisor.storage import Storage
+from lol_support_advisor.models import OpggSnapshot
 
 
 def match_payload(
@@ -40,6 +41,23 @@ def match_payload(
 
 
 class StorageTests(unittest.TestCase):
+    def test_opgg_cache_is_separated_by_position(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            storage.save_opgg_snapshot(OpggSnapshot(
+                enemy_support_id="Poppy", enemy_support_name_ko="뽀삐",
+                position="SUPPORT", patch="26.1", updated_at="support",
+            ))
+            storage.save_opgg_snapshot(OpggSnapshot(
+                enemy_support_id="Poppy", enemy_support_name_ko="뽀삐",
+                position="JUNGLE", patch="26.2", updated_at="jungle",
+            ))
+            self.assertEqual(
+                storage.load_opgg_snapshot("Poppy", "SUPPORT").updated_at, "support"
+            )
+            self.assertEqual(
+                storage.load_opgg_snapshot("Poppy", "JUNGLE").updated_at, "jungle"
+            )
     def test_cooldown_and_personal_matchup_stats(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir) / "advisor.db")

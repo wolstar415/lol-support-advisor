@@ -12,6 +12,21 @@ from .champions import ChampionRegistry, POSSIBLE_SUPPORTS
 from .models import OpggCounter, OpggSnapshot
 
 
+POSITION_TO_OPGG = {
+    "TOP": "top",
+    "JUNGLE": "jungle",
+    "MIDDLE": "mid",
+    "BOTTOM": "adc",
+    "SUPPORT": "support",
+    "UTILITY": "support",
+}
+
+POSITION_KO = {
+    "TOP": "탑", "JUNGLE": "정글", "MIDDLE": "미드",
+    "BOTTOM": "원딜", "SUPPORT": "서포터", "UTILITY": "서포터",
+}
+
+
 class OpggError(RuntimeError):
     pass
 
@@ -96,8 +111,24 @@ class OpggClient:
         )
         return aliases
 
-    def _table_entries(self, tokens: list[str], target_id: str) -> list[OpggCounter]:
+    @staticmethod
+    def _position(position: str) -> str:
+        normalized = str(position or "SUPPORT").upper()
+        return normalized if normalized in POSITION_TO_OPGG else "SUPPORT"
+
+    def _allowed_candidates(self, position: str) -> set[str]:
+        if self._position(position) == "SUPPORT":
+            return set(POSSIBLE_SUPPORTS)
+        # The counter/position page itself is the authority for non-support
+        # lanes. Keeping all registered champions avoids a stale hard-coded
+        # lane list when Riot adds or flexes a champion.
+        return set(self.registry.by_id)
+
+    def _table_entries(
+        self, tokens: list[str], target_id: str, position: str = "SUPPORT"
+    ) -> list[OpggCounter]:
         aliases = self._champion_aliases()
+        allowed = self._allowed_candidates(position)
         entries: dict[str, OpggCounter] = {}
         table_start = 0
         for index in range(len(tokens) - 1):
@@ -108,7 +139,7 @@ class OpggClient:
         for index, token in enumerate(tokens[table_start:], start=table_start):
             normalized = token.replace("'", "").replace(" ", "").casefold()
             champion_id = aliases.get(token.casefold()) or aliases.get(normalized)
-            if not champion_id or champion_id == target_id or champion_id not in POSSIBLE_SUPPORTS:
+            if not champion_id or champion_id == target_id or champion_id not in allowed:
                 continue
             rate: float | None = None
             rate_index: int | None = None
@@ -156,17 +187,21 @@ class OpggClient:
                     return float(values[nearby_index])
         return None
 
-    def refresh_matchup(self, enemy_support_id: str) -> OpggSnapshot:
+    def refresh_matchup(
+        self, enemy_support_id: str, position: str = "SUPPORT"
+    ) -> OpggSnapshot:
+        position = self._position(position)
+        position_slug = POSITION_TO_OPGG[position]
         slug = self.registry.slug(enemy_support_id)
         url = (
-            f"https://op.gg/lol/champions/{slug}/counters/support"
+            f"https://op.gg/lol/champions/{slug}/counters/{position_slug}"
             "?region=global&tier=emerald_plus&type=ranked"
         )
         html = self._fetch(url)
         parser = _VisibleTextParser()
         parser.feed(html)
         tokens = parser.tokens
-        entries = self._table_entries(tokens, enemy_support_id)
+        entries = self._table_entries(tokens, enemy_support_id, position)
         if len(entries) < 2:
             raise OpggError(
                 "OP.GG 페이지에서 카운터 표를 읽지 못했습니다. 페이지 형식이 변경되었을 수 있습니다."
@@ -180,6 +215,7 @@ class OpggClient:
         snapshot = OpggSnapshot(
             enemy_support_id=enemy_support_id,
             enemy_support_name_ko=self.registry.ko_name(enemy_support_id),
+            position=position,
             region="GLOBAL",
             tier="EMERALD_PLUS",
             patch=patch_match.group(1) if patch_match else "UNKNOWN",
@@ -194,18 +230,21 @@ class OpggClient:
         )
         return snapshot
 
-    def refresh_overall(self) -> OpggSnapshot:
-        url = "https://op.gg/lol/champions?position=support&tier=emerald_plus"
+    def refresh_overall(self, position: str = "SUPPORT") -> OpggSnapshot:
+        position = self._position(position)
+        position_slug = POSITION_TO_OPGG[position]
+        url = f"https://op.gg/lol/champions?position={position_slug}&tier=emerald_plus"
         html = self._fetch(url)
         parser = _VisibleTextParser()
         parser.feed(html)
         tokens = parser.tokens
         aliases = self._champion_aliases()
+        allowed = self._allowed_candidates(position)
         entries: dict[str, OpggCounter] = {}
         for index, token in enumerate(tokens):
             normalized = token.replace("'", "").replace(" ", "").casefold()
             champion_id = aliases.get(token.casefold()) or aliases.get(normalized)
-            if not champion_id or champion_id not in POSSIBLE_SUPPORTS:
+            if not champion_id or champion_id not in allowed:
                 continue
             percentages: list[float] = []
             nearby_tokens = tokens[index + 1:index + 12]
@@ -229,7 +268,8 @@ class OpggClient:
             )
         if len(entries) < 3:
             raise OpggError(
-                "OP.GG 페이지에서 서포터 통계 표를 읽지 못했습니다. 페이지 형식이 변경되었을 수 있습니다."
+                f"OP.GG 페이지에서 {POSITION_KO[position]} 통계 표를 읽지 못했습니다. "
+                "페이지 형식이 변경되었을 수 있습니다."
             )
         joined = " ".join(tokens)
         patch_match = re.search(r"Patch\s+(\d+\.\d+)", joined, flags=re.IGNORECASE)
@@ -237,6 +277,7 @@ class OpggClient:
         return OpggSnapshot(
             enemy_support_id=None,
             enemy_support_name_ko=None,
+            position=position,
             region="GLOBAL",
             tier="EMERALD_PLUS",
             patch=patch_match.group(1) if patch_match else "UNKNOWN",

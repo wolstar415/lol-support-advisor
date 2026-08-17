@@ -118,6 +118,17 @@ def parse_lcu_session(data: dict[str, Any], registry: ChampionRegistry) -> Draft
     my_team_raw = data.get("myTeam", []) or []
     their_team_raw = data.get("theirTeam", []) or []
     my_cells = {int(member.get("cellId", -999)) for member in my_team_raw}
+    local_member = next(
+        (member for member in my_team_raw if int(member.get("cellId", -999)) == local_cell),
+        {},
+    )
+    my_role = ROLE_MAP.get(
+        str(local_member.get("assignedPosition", "")).lower(), "UNKNOWN"
+    )
+    # Riot can briefly leave assignedPosition empty while champ select opens.
+    # Preserve the app's original support-first behavior only for that short gap.
+    if my_role == "UNKNOWN":
+        my_role = "SUPPORT"
 
     completed: dict[int, int] = {}
     hovered: dict[int, int] = {}
@@ -179,6 +190,7 @@ def parse_lcu_session(data: dict[str, Any], registry: ChampionRegistry) -> Draft
     enemy_bans = [registry.from_key(key)[0] for key in bans.get("theirTeamBans", []) if int(key or 0)]
 
     snapshot = DraftSnapshot(
+        my_role=my_role,
         my_pick_order=pick_order_by_cell.get(local_cell),
         my_status=local_action_state,
         ally_locked=ally_locked,

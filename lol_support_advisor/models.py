@@ -45,6 +45,12 @@ class DraftSnapshot:
         return sorted({value for value in values if value})
 
     def payload(self) -> dict[str, Any]:
+        lane_opponent = {
+            "champion_id": self.selected_enemy_support_id,
+            "champion_name_ko": self.selected_enemy_support_name_ko,
+            "source": self.selected_enemy_support_source,
+            "position": self.my_role,
+        }
         return {
             "my_role": self.my_role,
             "my_pick_order": self.my_pick_order,
@@ -58,6 +64,7 @@ class DraftSnapshot:
                 "champion_name_ko": self.selected_enemy_support_name_ko,
                 "source": self.selected_enemy_support_source,
             },
+            "selected_lane_opponent": lane_opponent,
             "ally_bans": self.ally_bans,
             "enemy_bans": self.enemy_bans,
             "unavailable_champions": self.unavailable_champions(),
@@ -88,6 +95,7 @@ class OpggCounter:
 class OpggSnapshot:
     enemy_support_id: str | None
     enemy_support_name_ko: str | None
+    position: str = "SUPPORT"
     region: str = "GLOBAL"
     tier: str = "EMERALD_PLUS"
     patch: str = "UNKNOWN"

@@ -1,12 +1,51 @@
 from __future__ import annotations
 
 import unittest
+from types import SimpleNamespace
 
-from lol_support_advisor.ui import AdvisorApp, candidate_score, support_archetype
+from lol_support_advisor.ui import (
+    AdvisorApp, candidate_score, support_archetype, team_objective_counts,
+)
+from lol_support_advisor.icons import ItemIconCache
 from lol_support_advisor.models import OpggCounter, PersonalStat, PlayerProfileStat
 
 
 class DuoEvidenceTests(unittest.TestCase):
+    def test_mousewheel_routes_to_match_detail_canvas(self) -> None:
+        calls: list[tuple[int, str]] = []
+
+        class Canvas:
+            @staticmethod
+            def winfo_exists() -> bool:
+                return True
+
+            @staticmethod
+            def yview_scroll(amount: int, unit: str) -> None:
+                calls.append((amount, unit))
+
+        top = SimpleNamespace(_advisor_scroll_canvas=Canvas())
+        widget = SimpleNamespace(winfo_toplevel=lambda: top)
+        AdvisorApp._on_mousewheel(
+            SimpleNamespace(), SimpleNamespace(widget=widget, delta=-120, num=0)
+        )
+        self.assertEqual(calls, [(3, "units")])
+
+    def test_match_detail_objectives_include_grubs_and_herald(self) -> None:
+        counts = team_objective_counts({"objectives": {
+            "horde": {"kills": 5}, "riftHerald": {"kills": 1},
+            "dragon": {"kills": 2}, "baron": {"kills": 1},
+            "tower": {"kills": 7},
+        }})
+        self.assertEqual(counts["void_grubs"], 5)
+        self.assertEqual(counts["rift_heralds"], 1)
+
+    def test_item_description_html_is_readable(self) -> None:
+        text = ItemIconCache._plain_description(
+            "<mainText><stats>체력 +400</stats><br><passive>회복 효과</passive></mainText>"
+        )
+        self.assertIn("체력 +400", text)
+        self.assertIn("회복 효과", text)
+        self.assertNotIn("<", text)
     def test_duo_evidence_levels(self) -> None:
         self.assertEqual(
             AdvisorApp._classify_duo_evidence([(0, 0), (1, 1)])[0], "매우 유력"

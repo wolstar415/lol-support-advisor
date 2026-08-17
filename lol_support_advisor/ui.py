@@ -48,6 +48,11 @@ ROLE_LABELS = {
     "SUPPORT": "SUP", "UTILITY": "SUP", "UNKNOWN": "?",
 }
 
+POSITION_NAMES = {
+    "TOP": "탑", "JUNGLE": "정글", "MIDDLE": "미드", "BOTTOM": "원딜",
+    "SUPPORT": "서포터", "UTILITY": "서포터", "UNKNOWN": "포지션 미정",
+}
+
 SUPPORT_ARCHETYPES = {
     "UTILITY": {
         "Janna", "Karma", "Lulu", "Milio", "Nami", "Renata", "Senna",
@@ -89,6 +94,83 @@ def support_archetype(champion_id: str) -> str:
     return "OTHER"
 
 
+def position_name(position: str) -> str:
+    return POSITION_NAMES.get(str(position or "SUPPORT").upper(), "서포터")
+
+
+def team_objective_counts(team_payload: dict) -> dict[str, int]:
+    objectives = team_payload.get("objectives") or {}
+    return {
+        key: int((objectives.get(source) or {}).get("kills") or 0)
+        for key, source in (
+            ("void_grubs", "horde"),
+            ("rift_heralds", "riftHerald"),
+            ("dragons", "dragon"),
+            ("barons", "baron"),
+            ("towers", "tower"),
+        )
+    }
+
+
+class _HoverTooltip:
+    """Small delayed tooltip that stays inside the owning Tk application."""
+
+    def __init__(self, widget: tk.Widget, text_provider: Callable[[], str]) -> None:
+        self.widget = widget
+        self.text_provider = text_provider
+        self.window: tk.Toplevel | None = None
+        self.after_id: str | None = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+        widget.bind("<ButtonPress>", self._hide, add="+")
+        widget.bind("<Destroy>", self._hide, add="+")
+
+    def _schedule(self, _event: tk.Event | None = None) -> None:
+        self._cancel()
+        self.after_id = self.widget.after(280, self._show)
+
+    def _cancel(self) -> None:
+        if self.after_id:
+            try:
+                self.widget.after_cancel(self.after_id)
+            except tk.TclError:
+                pass
+            self.after_id = None
+
+    def _show(self) -> None:
+        self.after_id = None
+        try:
+            if not self.widget.winfo_exists():
+                return
+            text = self.text_provider().strip()
+            if not text:
+                return
+            window = tk.Toplevel(self.widget)
+            window.overrideredirect(True)
+            window.attributes("-topmost", True)
+            window.configure(bg=COLORS["gold"], padx=1, pady=1)
+            tk.Label(
+                window, text=text, justify="left", anchor="w", wraplength=390,
+                bg="#0b1220", fg=COLORS["text"], padx=11, pady=9,
+                font=("Malgun Gothic", 8),
+            ).pack()
+            x = self.widget.winfo_pointerx() + 14
+            y = self.widget.winfo_pointery() + 18
+            window.geometry(f"+{x}+{y}")
+            self.window = window
+        except tk.TclError:
+            self.window = None
+
+    def _hide(self, _event: tk.Event | None = None) -> None:
+        self._cancel()
+        if self.window:
+            try:
+                self.window.destroy()
+            except tk.TclError:
+                pass
+            self.window = None
+
+
 def candidate_score(
     counter: OpggCounter, personal: PersonalStat | None = None
 ) -> tuple[float, str]:
@@ -128,7 +210,9 @@ class AdvisorApp:
         self.icon_cache = ChampionIconCache(root, registry, storage.db_path.parent / "icons")
         self.item_icon_cache = ItemIconCache(root, registry, storage.db_path.parent / "items")
         self.draft = self._demo_draft() if demo else DraftSnapshot()
-        self.opgg_snapshot = self._demo_opgg() if demo else storage.load_opgg_snapshot(None)
+        self.opgg_snapshot = (
+            self._demo_opgg() if demo else storage.load_opgg_snapshot(None, self.draft.my_role)
+        )
         self.live_game = self._demo_live_game() if demo else LiveGameSnapshot()
         self.player_profiles = self._demo_player_profiles() if demo else {}
         self.duo_pairs: dict[str, list[tuple[str, str, str]]] = (
@@ -237,7 +321,9 @@ class AdvisorApp:
         self.notebook.add(self.history_tab, text="내 전적")
         self.notebook.select(self.selection_tab)
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
-        self.root.bind_all("<MouseWheel>", self._on_mousewheel)
+        self.root.bind_all("<MouseWheel>", self._on_mousewheel, add="+")
+        self.root.bind_all("<Button-4>", self._on_mousewheel, add="+")
+        self.root.bind_all("<Button-5>", self._on_mousewheel, add="+")
         self.content = self.selection_content
         self._build_draft_panel()
         self._build_opgg_panel()
@@ -260,12 +346,26 @@ class AdvisorApp:
         return tab, canvas, content
 
     def _on_mousewheel(self, event: tk.Event) -> None:
+        try:
+            top = event.widget.winfo_toplevel()
+            detail_canvas = getattr(top, "_advisor_scroll_canvas", None)
+            if detail_canvas and detail_canvas.winfo_exists():
+                delta = getattr(event, "delta", 0)
+                number = getattr(event, "num", 0)
+                direction = -1 if delta > 0 or number == 4 else 1
+                detail_canvas.yview_scroll(direction * 3, "units")
+                return
+        except tk.TclError:
+            return
         index = self.notebook.index(self.notebook.select())
         canvas = (
             self.play_canvas if index == 1 else
             self.history_canvas if index == 2 else self.selection_canvas
         )
-        canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        delta = getattr(event, "delta", 0)
+        number = getattr(event, "num", 0)
+        direction = -1 if delta > 0 or number == 4 else 1
+        canvas.yview_scroll(direction * 3, "units")
 
     def _on_tab_changed(self, _event: tk.Event | None = None) -> None:
         """Give the 10-player board more vertical room while the play tab is open."""
@@ -311,10 +411,11 @@ class AdvisorApp:
         top.pack(fill="x")
         left = tk.Frame(top, bg=COLORS["bg"])
         left.pack(side="left", fill="x", expand=True)
-        tk.Label(
-            left, text="LOL SUPPORT ADVISOR", bg=COLORS["bg"], fg=COLORS["gold"],
+        self.app_title_label = tk.Label(
+            left, text="LOL PICK ADVISOR", bg=COLORS["bg"], fg=COLORS["gold"],
             font=("Malgun Gothic", 19, "bold"),
-        ).pack(anchor="w")
+        )
+        self.app_title_label.pack(anchor="w")
         self.connection_label = tk.Label(
             left, text="롤 클라이언트 확인 중", bg=COLORS["bg"], fg=COLORS["muted"],
             font=("Malgun Gothic", 10),
@@ -435,10 +536,11 @@ class AdvisorApp:
         self.ally_picks_frame = tk.Frame(panel, bg=COLORS["panel"])
         self.ally_picks_frame.pack(fill="x", pady=(6, 12))
 
-        tk.Label(
+        self.enemy_instruction_label = tk.Label(
             panel, text="상대 팀  ·  적 서포터를 직접 클릭해서 지정", bg=COLORS["panel"],
             fg=COLORS["muted"], font=("Malgun Gothic", 9, "bold"),
-        ).pack(anchor="w")
+        )
+        self.enemy_instruction_label.pack(anchor="w")
         self.enemy_picks_frame = tk.Frame(panel, bg=COLORS["panel"])
         self.enemy_picks_frame.pack(fill="x", pady=(6, 8))
         self.enemy_support_label = tk.Label(
@@ -468,10 +570,11 @@ class AdvisorApp:
         self.opgg_summary_label.pack(fill="x", pady=(0, 9))
         controls = tk.Frame(panel, bg=COLORS["panel"])
         controls.pack(fill="x", pady=(0, 10))
-        tk.Label(
+        self.position_filter_label = tk.Label(
             controls, text="플레이 유형", bg=COLORS["panel"], fg=COLORS["muted"],
             font=("Malgun Gothic", 8, "bold"),
-        ).pack(side="left", padx=(0, 8))
+        )
+        self.position_filter_label.pack(side="left", padx=(0, 8))
         self.support_filter_buttons: dict[str, tk.Button] = {}
         for key, label in SUPPORT_FILTER_LABELS.items():
             button = self._button(
@@ -931,10 +1034,13 @@ class AdvisorApp:
         )
         self.header_metrics["phase"][0].configure(text=phase_value, fg=color)
         self.header_metrics["phase"][1].configure(text=phase_detail)
-        support = self.draft.selected_enemy_support_name_ko or "블라인드"
+        role_name = position_name(self.draft.my_role)
+        target = self.draft.selected_enemy_support_name_ko or "블라인드"
+        self.app_title_label.configure(text=f"LOL {role_name.upper()} PICK ADVISOR")
+        self.root.title(f"LOL Pick Advisor · {role_name}")
         order = f"우리 팀 {self.draft.my_pick_order}픽" if self.draft.my_pick_order else "픽 순서 미확인"
-        self.header_metrics["draft"][0].configure(text=support)
-        self.header_metrics["draft"][1].configure(text=f"적 서폿 기준 · {order}")
+        self.header_metrics["draft"][0].configure(text=target)
+        self.header_metrics["draft"][1].configure(text=f"적 {role_name} 기준 · {order}")
         match_count = self.storage.count_matches()
         self.header_metrics["cache"][0].configure(text=f"{match_count:,} 경기")
         self.header_metrics["cache"][1].configure(text="내 전적·관계 기록 로컬 계산")
@@ -947,11 +1053,15 @@ class AdvisorApp:
         )
 
     def _render_draft(self) -> None:
+        role_name = position_name(self.draft.my_role)
         order = f"우리 팀 {self.draft.my_pick_order}픽" if self.draft.my_pick_order else "픽 순서 확인 전"
         states = {"WAITING": "픽 대기", "SELECTING": "내 픽 진행 중", "LOCKED": "내 픽 확정"}
         self.pick_order_label.configure(
-            text=f"나의 픽 순서: {order}    현재 상태: {states.get(self.draft.my_status, self.draft.my_status)}    "
+            text=f"내 포지션: {role_name}    나의 픽 순서: {order}    현재 상태: {states.get(self.draft.my_status, self.draft.my_status)}    "
                  f"스냅샷: {self.draft.snapshot_id}"
+        )
+        self.enemy_instruction_label.configure(
+            text=f"상대 팀  ·  적 {role_name} 챔피언을 직접 클릭해서 지정"
         )
         for frame, values in ((self.ally_bans_frame, self.draft.ally_bans),
                               (self.enemy_bans_frame, self.draft.enemy_bans)):
@@ -982,7 +1092,7 @@ class AdvisorApp:
         unknown_selected = self.draft.selected_enemy_support_source == "MANUAL_UNKNOWN"
         self._chip(
             self.enemy_picks_frame,
-            "?  서포터 모르겠음",
+            f"?  적 {role_name} 모르겠음",
             COLORS["orange"] if unknown_selected else COLORS["muted"],
             command=self._select_unknown_enemy_support,
             selected=unknown_selected,
@@ -1001,16 +1111,16 @@ class AdvisorApp:
             )
         if unknown_selected:
             self.enemy_support_label.configure(
-                text="선택한 적 서포터: 모르겠음 · ChatGPT가 블라인드 안정성을 우선 판단"
+                text=f"선택한 적 {role_name}: 모르겠음 · ChatGPT가 블라인드 안정성을 우선 판단"
             )
         elif self.draft.selected_enemy_support_id:
             source = "직접 확정" if self.draft.selected_enemy_support_source == "MANUAL_ENEMY_SUPPORT" else "자동 추정 · 확실하지 않음"
             self.enemy_support_label.configure(
-                text=f"선택한 적 서포터: {self.draft.selected_enemy_support_name_ko} · {source}"
+                text=f"선택한 적 {role_name}: {self.draft.selected_enemy_support_name_ko} · {source}"
             )
         else:
             self.enemy_support_label.configure(
-                text="선택한 적 서포터: 아직 모름 · ChatGPT에는 미확정 정보로 전달"
+                text=f"선택한 적 {role_name}: 아직 모름 · ChatGPT에는 미확정 정보로 전달"
             )
         stale = bool(self.recommendations and self.recommendation_snapshot_id != self.draft.snapshot_id)
         self.stale_label.configure(
@@ -1031,17 +1141,18 @@ class AdvisorApp:
             self.opgg_calc_label.configure(text="")
             return
         self.copy_top3_button.configure(state="normal")
+        role_name = position_name(self.draft.my_role)
         if snapshot.enemy_support_id:
             self.counter_tree.heading("winrate", text="OP.GG 상대 승률")
             summary = (
-                f"{snapshot.enemy_support_name_ko} 서포터 · 패치 {snapshot.patch} · {snapshot.region} · "
+                f"{snapshot.enemy_support_name_ko} 적 {role_name} · 패치 {snapshot.patch} · {snapshot.region} · "
                 f"{snapshot.tier}    전체 승률 {_fmt_rate(snapshot.target_overall_win_rate)} · "
                 f"픽률 {_fmt_rate(snapshot.target_pick_rate)} · 밴률 {_fmt_rate(snapshot.target_ban_rate)}"
             )
         else:
             self.counter_tree.heading("winrate", text="OP.GG 전체 승률")
             summary = (
-                f"상대 서포터 미확인 · 패치 {snapshot.patch} · {snapshot.region} · {snapshot.tier} · "
+                f"상대 {role_name} 미확인 · 패치 {snapshot.patch} · {snapshot.region} · {snapshot.tier} · "
                 "블라인드 픽용 전체 승률 순위"
             )
         self.opgg_summary_label.configure(text=summary)
@@ -1057,7 +1168,10 @@ class AdvisorApp:
             self.opgg_calc_label.configure(text="내 전적 조합 계산 중…", fg=COLORS["blue"])
         else:
             self.opgg_calc_label.configure(
-                text=f"{SUPPORT_FILTER_LABELS[self._support_filter]} {len(counters)}개 · 점수 계산 완료",
+                text=(
+                    f"{SUPPORT_FILTER_LABELS[self._support_filter] if self.draft.my_role == 'SUPPORT' else role_name + ' 전체'} "
+                    f"{len(counters)}개 · 점수 계산 완료"
+                ),
                 fg=COLORS["muted"],
             )
         for index, counter in enumerate(counters, start=1):
@@ -1098,7 +1212,7 @@ class AdvisorApp:
     def _filtered_counters(self) -> list[OpggCounter]:
         if not self.opgg_snapshot:
             return []
-        if self._support_filter == "ALL":
+        if self.draft.my_role != "SUPPORT" or self._support_filter == "ALL":
             return self.opgg_snapshot.counters[:10]
         return [
             counter for counter in self.opgg_snapshot.counters
@@ -1108,11 +1222,28 @@ class AdvisorApp:
     def _set_support_filter(self, support_filter: str) -> None:
         if support_filter not in SUPPORT_FILTER_LABELS:
             return
-        self._support_filter = support_filter
+        self._support_filter = (
+            support_filter if self.draft.my_role == "SUPPORT" else "ALL"
+        )
         self._render_opgg()
 
     def _refresh_filter_buttons(self) -> None:
+        support_mode = self.draft.my_role == "SUPPORT"
+        if not support_mode:
+            self._support_filter = "ALL"
+        self.position_filter_label.configure(
+            text="플레이 유형" if support_mode else f"추천 포지션 · {position_name(self.draft.my_role)}"
+        )
         for key, button in self.support_filter_buttons.items():
+            if key != "ALL" and not support_mode:
+                button.pack_forget()
+                continue
+            if not button.winfo_manager():
+                button.pack(side="left", padx=(0, 5))
+            button.configure(
+                text=(position_name(self.draft.my_role) + " 전체")
+                if key == "ALL" and not support_mode else SUPPORT_FILTER_LABELS[key]
+            )
             selected = key == self._support_filter
             button.configure(
                 bg="#284c73" if selected else COLORS["chip"],
@@ -1137,9 +1268,14 @@ class AdvisorApp:
             key=lambda counter: candidate_score(counter, personal_stats.get(counter.champion_id))[0],
             reverse=True,
         )[:3]
+        role_name = position_name(self.draft.my_role)
+        filter_name = (
+            SUPPORT_FILTER_LABELS[self._support_filter]
+            if self.draft.my_role == "SUPPORT" else f"{role_name} 전체"
+        )
         lines = [
-            f"적 서포터: {self.draft.selected_enemy_support_name_ko or '블라인드'} · "
-            f"유형: {SUPPORT_FILTER_LABELS[self._support_filter]}"
+            f"내 포지션: {role_name} · 적 {role_name}: "
+            f"{self.draft.selected_enemy_support_name_ko or '블라인드'} · 유형: {filter_name}"
         ]
         for index, counter in enumerate(ranked, start=1):
             personal = personal_stats.get(counter.champion_id)
@@ -1157,7 +1293,8 @@ class AdvisorApp:
         self.opgg_calc_label.configure(text="TOP 3 후보를 복사했습니다.", fg=COLORS["gold"])
 
     def _render_prompt_summary(self) -> None:
-        support = self.draft.selected_enemy_support_name_ko or "모르겠음"
+        target = self.draft.selected_enemy_support_name_ko or "모르겠음"
+        role_name = position_name(self.draft.my_role)
         certainty = {
             "MANUAL_ENEMY_SUPPORT": "사용자 확정",
             "AUTO_ENEMY_SUPPORT": "자동 추정 · 확실하지 않음",
@@ -1168,9 +1305,9 @@ class AdvisorApp:
         opgg = "포함" if self.opgg_snapshot else "캐시 없음"
         self.prompt_summary_label.configure(
             text=(
-                f"복사 내용: 내 픽 순서 · 확정 픽 {ally_locked + len(self.draft.enemy_locked)}명 · "
+                f"복사 내용: 내 포지션 {role_name} · 내 픽 순서 · 확정 픽 {ally_locked + len(self.draft.enemy_locked)}명 · "
                 f"아군 픽 의사 {ally_hover}명 · 밴 {len(self.draft.ally_bans) + len(self.draft.enemy_bans)}명\n"
-                f"적 서포터: {support} ({certainty}) · OP.GG 데이터: {opgg} · 응답 스냅샷: {self.draft.snapshot_id}"
+                f"적 {role_name}: {target} ({certainty}) · OP.GG 데이터: {opgg} · 응답 스냅샷: {self.draft.snapshot_id}"
             )
         )
 
@@ -1796,11 +1933,17 @@ class AdvisorApp:
             ).pack(side="left")
         for item_id in entry.items[:7]:
             image = self.item_icon_cache.get(item_id, 24, self._schedule_history_render)
-            tk.Label(
+            item_label = tk.Label(
                 item_row, image=image or "", text="" if image else str(item_id)[-2:],
                 bg=COLORS["chip"], fg=COLORS["muted"], width=24 if not image else 0,
                 font=("Consolas", 6),
-            ).pack(side="left", padx=(0, 2))
+            )
+            item_label.pack(side="left", padx=(0, 2))
+            tooltip = _HoverTooltip(
+                item_label,
+                lambda value=item_id: self.item_icon_cache.tooltip_text(value),
+            )
+            setattr(item_label, "_advisor_tooltip", tooltip)
 
         lineup = tk.Frame(card, bg=COLORS["surface"])
         lineup.pack(side="left", fill="y", expand=True)
@@ -1868,9 +2011,9 @@ class AdvisorApp:
         canvas.configure(yscrollcommand=scrollbar.set)
         canvas.pack(side="left", fill="both", expand=True)
         scrollbar.pack(side="right", fill="y")
+        setattr(dialog, "_advisor_scroll_canvas", canvas)
         content.bind("<Configure>", lambda _e: canvas.configure(scrollregion=canvas.bbox("all")))
         canvas.bind("<Configure>", lambda e: canvas.itemconfigure(content_window, width=e.width))
-        canvas.bind("<MouseWheel>", lambda e: canvas.yview_scroll(int(-e.delta / 120), "units"))
 
         won = bool(mine.get("win"))
         result_color = COLORS["green"] if won else COLORS["red"]
@@ -1984,13 +2127,14 @@ class AdvisorApp:
         team_payload = next(
             (row for row in (info.get("teams") or []) if row.get("teamId") == team_id), {}
         )
-        objectives = team_payload.get("objectives") or {}
-        dragons = int((objectives.get("dragon") or {}).get("kills") or 0)
-        barons = int((objectives.get("baron") or {}).get("kills") or 0)
-        towers = int((objectives.get("tower") or {}).get("kills") or 0)
+        objective_counts = team_objective_counts(team_payload)
         panel = self._panel(
             parent,
-            f"{title} · {kills}/{deaths}/{assists} · {gold:,}골드 · 용 {dragons} / 바론 {barons} / 타워 {towers}",
+            f"{title} · {kills}/{deaths}/{assists} · {gold:,}골드 · "
+            f"공허 유충 {objective_counts['void_grubs']} / "
+            f"전령 {objective_counts['rift_heralds']} / "
+            f"용 {objective_counts['dragons']} / 바론 {objective_counts['barons']} / "
+            f"타워 {objective_counts['towers']}",
             accent,
         )
         header = tk.Frame(panel, bg=COLORS["chip"], padx=7, pady=5)
@@ -2085,6 +2229,11 @@ class AdvisorApp:
                 )
                 if item_icon:
                     item_label.configure(image=item_icon, text="", width=0)
+                tooltip = _HoverTooltip(
+                    item_label,
+                    lambda value=item_id: self.item_icon_cache.tooltip_text(value),
+                )
+                setattr(item_label, "_advisor_tooltip", tooltip)
 
     def _apply_detail_item_icon(self, label: tk.Label, item_id: int) -> None:
         try:
@@ -2121,7 +2270,7 @@ class AdvisorApp:
         self.draft.selected_enemy_support_name_ko = self.registry.ko_name(champion_id)
         self.draft.selected_enemy_support_source = "MANUAL_ENEMY_SUPPORT"
         self.draft.refresh_snapshot_id()
-        cached = self.storage.load_opgg_snapshot(champion_id)
+        cached = self.storage.load_opgg_snapshot(champion_id, self.draft.my_role)
         self.opgg_snapshot = cached
         self._render_selection()
 
@@ -2131,7 +2280,7 @@ class AdvisorApp:
         self.draft.selected_enemy_support_name_ko = "모르겠음"
         self.draft.selected_enemy_support_source = "MANUAL_UNKNOWN"
         self.draft.refresh_snapshot_id()
-        self.opgg_snapshot = self.storage.load_opgg_snapshot(None)
+        self.opgg_snapshot = self.storage.load_opgg_snapshot(None, self.draft.my_role)
         self._render_selection()
 
     def _auto_select_enemy_support(self, draft: DraftSnapshot) -> None:
@@ -2147,10 +2296,20 @@ class AdvisorApp:
             draft.selected_enemy_support_source = "MANUAL_ENEMY_SUPPORT"
             return
         self._manual_enemy_support = None
-        role_match = next((member for member in draft.enemy_locked if member.role == "SUPPORT"), None)
-        candidates = [member for member in draft.enemy_locked if self.registry.support_score(member.champion_id)]
-        chosen = role_match or (max(candidates, key=lambda m: self.registry.support_score(m.champion_id))
-                                if candidates else None)
+        role_match = next(
+            (member for member in draft.enemy_locked if member.role == draft.my_role), None
+        )
+        candidates = (
+            [
+                member for member in draft.enemy_locked
+                if self.registry.support_score(member.champion_id)
+            ]
+            if draft.my_role == "SUPPORT" else []
+        )
+        chosen = role_match or (
+            max(candidates, key=lambda m: self.registry.support_score(m.champion_id))
+            if candidates else None
+        )
         if chosen:
             draft.selected_enemy_support_id = chosen.champion_id
             draft.selected_enemy_support_name_ko = chosen.champion_name_ko
@@ -2231,11 +2390,12 @@ class AdvisorApp:
         self._opgg_refreshing = True
         self._render_header()
         enemy_support = self.draft.selected_enemy_support_id
+        position = self.draft.my_role
 
         def work() -> OpggSnapshot:
             if enemy_support:
-                return self.opgg_client.refresh_matchup(enemy_support)
-            return self.opgg_client.refresh_overall()
+                return self.opgg_client.refresh_matchup(enemy_support, position)
+            return self.opgg_client.refresh_overall(position)
 
         def success(snapshot: OpggSnapshot) -> None:
             self._opgg_refreshing = False
@@ -2526,15 +2686,19 @@ class AdvisorApp:
                     self.storage.set_setting("riot_puuid", puuid)
                 self._identity_checked = bool(game_name and tag_line and puuid)
             if phase == "ChampSelect" and draft:
+                role_changed = draft.my_role != self.draft.my_role
+                if role_changed:
+                    self._manual_enemy_support = None
+                    self._support_filter = "ALL"
                 self._auto_select_enemy_support(draft)
                 draft.refresh_snapshot_id()
                 old_support = self.draft.selected_enemy_support_id
                 draft_changed = draft.snapshot_id != self.draft.snapshot_id
                 if draft_changed:
                     self.draft = draft
-                if draft.selected_enemy_support_id != old_support:
+                if role_changed or draft.selected_enemy_support_id != old_support:
                     self.opgg_snapshot = self.storage.load_opgg_snapshot(
-                        draft.selected_enemy_support_id
+                        draft.selected_enemy_support_id, draft.my_role
                     )
                 if previous_phase != "ChampSelect":
                     self.notebook.select(self.selection_tab)
@@ -2570,7 +2734,10 @@ class AdvisorApp:
             if self.draft.connection_state not in {"DISCONNECTED", "IN_GAME"}:
                 self.draft = DraftSnapshot()
                 self._manual_enemy_support = None
-                self.opgg_snapshot = self.storage.load_opgg_snapshot(None)
+                self._support_filter = "ALL"
+                self.opgg_snapshot = self.storage.load_opgg_snapshot(
+                    None, self.draft.my_role
+                )
                 self._render_all()
             self.root.after(2400, self._poll_lcu)
 

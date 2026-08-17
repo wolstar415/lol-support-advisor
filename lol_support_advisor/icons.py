@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+from html import unescape
+import json
 from pathlib import Path
 import queue
+import re
 import ssl
 import threading
 import tkinter as tk
@@ -129,12 +132,94 @@ class ItemIconCache:
         self._pending: set[str] = set()
         self._failed: set[str] = set()
         self._callbacks: dict[str, list[Callable[[], None]]] = {}
+        self._item_data: dict[str, dict] = {}
+        self._metadata_version = ""
+        self._metadata_loading = False
         self._downloads: queue.Queue[
             tuple[str, Path, str, Callable[[], None] | None]
         ] = queue.Queue()
         self._ready: queue.SimpleQueue[Callable[[], None]] = queue.SimpleQueue()
         threading.Thread(target=self._download_worker, daemon=True).start()
         self.root.after(140, self._drain_ready)
+
+    def _metadata_path(self, version: str) -> Path:
+        return self.cache_dir / version / "item-ko_KR.json"
+
+    def _apply_metadata(self, payload: dict, version: str) -> None:
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            return
+        self._item_data = {
+            str(item_id): item for item_id, item in data.items() if isinstance(item, dict)
+        }
+        self._metadata_version = version
+
+    def _ensure_metadata(self) -> None:
+        version = self.registry.version
+        if version == "fallback" or self._metadata_version == version:
+            return
+        path = self._metadata_path(version)
+        if path.exists():
+            try:
+                self._apply_metadata(json.loads(path.read_text(encoding="utf-8")), version)
+                return
+            except (OSError, ValueError, TypeError):
+                pass
+        if self._metadata_loading:
+            return
+        self._metadata_loading = True
+
+        def download() -> None:
+            try:
+                url = (
+                    f"https://ddragon.leagueoflegends.com/cdn/{version}/"
+                    "data/ko_KR/item.json"
+                )
+                request = Request(url, headers={"User-Agent": "LOL-Support-Advisor/0.2"})
+                with urlopen(
+                    request, timeout=12, context=ssl.create_default_context()
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                self._ready.put(lambda: self._apply_metadata(payload, version))
+            except (OSError, ValueError, TypeError):
+                pass
+            finally:
+                self._metadata_loading = False
+
+        threading.Thread(target=download, daemon=True).start()
+
+    @staticmethod
+    def _plain_description(value: str) -> str:
+        text = re.sub(r"<br\s*/?>", "\n", value or "", flags=re.IGNORECASE)
+        text = re.sub(
+            r"</(?:li|p|maintext|stats|attention|passive|active)>",
+            "\n",
+            text,
+            flags=re.IGNORECASE,
+        )
+        text = re.sub(r"<[^>]+>", " ", text)
+        lines = [" ".join(line.split()) for line in unescape(text).splitlines()]
+        return "\n".join(line for line in lines if line)
+
+    def tooltip_text(self, item_id: int | str) -> str:
+        normalized = str(item_id or "")
+        self._ensure_metadata()
+        item = self._item_data.get(normalized)
+        if not item:
+            return f"아이템 #{normalized}\n설명을 불러오는 중입니다."
+        name = str(item.get("name") or f"아이템 #{normalized}")
+        plaintext = str(item.get("plaintext") or "").strip()
+        description = self._plain_description(str(item.get("description") or ""))
+        gold = item.get("gold") or {}
+        total_gold = int(gold.get("total") or 0) if isinstance(gold, dict) else 0
+        lines = [name, f"가격 {total_gold:,}골드 · ID {normalized}"]
+        if plaintext:
+            lines.append(plaintext)
+        if description and description.casefold() != plaintext.casefold():
+            lines.append(description)
+        return "\n".join(lines)
 
     def _path(self, item_id: str) -> Path:
         return self.cache_dir / self.registry.version / f"{item_id}.png"
@@ -145,6 +230,7 @@ class ItemIconCache:
         size: int,
         on_ready: Callable[[], None] | None = None,
     ) -> tk.PhotoImage | None:
+        self._ensure_metadata()
         normalized = str(item_id or "")
         if not normalized or normalized == "0":
             return None

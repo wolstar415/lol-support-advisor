@@ -77,6 +77,17 @@ class PromptingTests(unittest.TestCase):
         self.assertIn("적 서포터를 모르므로 임의 확정하지 말고", prompt)
         self.assertIn('"draft_mode": "BLIND"', prompt)
 
+    def test_jungle_role_changes_prompt_and_lane_opponent_contract(self) -> None:
+        self.draft.my_role = "JUNGLE"
+        self.draft.selected_enemy_support_id = None
+        self.draft.selected_enemy_support_name_ko = "모르겠음"
+        self.draft.selected_enemy_support_source = "MANUAL_UNKNOWN"
+        prompt = build_prompt(self.draft, None)
+        self.assertIn("정글 픽 추천 분석기", prompt)
+        self.assertIn('"my_role": "JUNGLE"', prompt)
+        self.assertIn('"selected_lane_opponent"', prompt)
+        self.assertIn("적 정글 챔피언을 모르므로", prompt)
+
     def test_stale_response_is_rejected(self) -> None:
         with self.assertRaises(StaleResponseError):
             parse_response(self._response("DRAFT-OLD"), self.draft, self.registry)

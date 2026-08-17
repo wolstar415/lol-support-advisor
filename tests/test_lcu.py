@@ -34,6 +34,7 @@ class LcuParsingTests(unittest.TestCase):
                 "bans": {"myTeamBans": [350], "theirTeamBans": [412]},
             }
             draft = parse_lcu_session(session, registry)
+            self.assertEqual(draft.my_role, "SUPPORT")
             self.assertEqual(draft.my_pick_order, 2)
             self.assertEqual(draft.my_status, "SELECTING")
             self.assertEqual(draft.ally_locked[0].champion_id, "LeeSin")
@@ -42,6 +43,21 @@ class LcuParsingTests(unittest.TestCase):
             self.assertEqual(draft.enemy_locked[0].champion_id, "Leona")
             self.assertEqual(draft.ally_bans, ["Yuumi"])
             self.assertEqual(draft.enemy_bans, ["Thresh"])
+
+    def test_local_assigned_position_drives_recommendation_role(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            draft = parse_lcu_session({
+                "localPlayerCellId": 3,
+                "myTeam": [{"cellId": 3, "assignedPosition": "jungle"}],
+                "theirTeam": [
+                    {"cellId": 8, "assignedPosition": "jungle", "championId": 120}
+                ],
+                "actions": [],
+                "bans": {},
+            }, registry)
+            self.assertEqual(draft.my_role, "JUNGLE")
+            self.assertEqual(draft.enemy_locked[0].role, "JUNGLE")
 
 
 if __name__ == "__main__":

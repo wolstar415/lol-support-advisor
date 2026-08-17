@@ -25,6 +25,22 @@ class OpggParsingTests(unittest.TestCase):
             self.assertEqual(entries["Janna"].games, 1480)
             self.assertAlmostEqual(entries["Nautilus"].versus_win_rate, 45.93)
 
+    def test_non_support_position_accepts_position_page_candidates(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            client = OpggClient(registry)
+            tokens = [
+                "Nidalee", "Win rate", "50.0", "%", "Win rate", "Games",
+                "LeeSin", "47.5", "%", "2,000",
+                "Hecarim", "51.0", "%", "1,500",
+            ]
+            entries = {
+                item.champion_id: item
+                for item in client._table_entries(tokens, "Nidalee", "JUNGLE")
+            }
+            self.assertIn("LeeSin", entries)
+            self.assertIn("Hecarim", entries)
+
 
 if __name__ == "__main__":
     unittest.main()

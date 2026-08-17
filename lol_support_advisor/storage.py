@@ -153,7 +153,8 @@ class Storage:
         self.set_setting("riot_last_sync", (when or datetime.now()).isoformat(timespec="seconds"))
 
     def save_opgg_snapshot(self, snapshot: OpggSnapshot) -> None:
-        cache_key = snapshot.enemy_support_id or "__overall__"
+        position = str(snapshot.position or "SUPPORT").upper()
+        cache_key = f"{position}:{snapshot.enemy_support_id or '__overall__'}"
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO opgg_snapshots(cache_key, updated_at, payload_json) VALUES(?, ?, ?) "
@@ -162,12 +163,21 @@ class Storage:
                 (cache_key, snapshot.updated_at, json.dumps(snapshot.to_dict(), ensure_ascii=False)),
             )
 
-    def load_opgg_snapshot(self, enemy_support_id: str | None) -> OpggSnapshot | None:
-        cache_key = enemy_support_id or "__overall__"
+    def load_opgg_snapshot(
+        self, enemy_support_id: str | None, position: str = "SUPPORT"
+    ) -> OpggSnapshot | None:
+        normalized_position = str(position or "SUPPORT").upper()
+        cache_key = f"{normalized_position}:{enemy_support_id or '__overall__'}"
         with self._connect() as connection:
             row = connection.execute(
                 "SELECT payload_json FROM opgg_snapshots WHERE cache_key = ?", (cache_key,)
             ).fetchone()
+            # Read caches created before position-aware keys were introduced.
+            if not row and normalized_position == "SUPPORT":
+                legacy_key = enemy_support_id or "__overall__"
+                row = connection.execute(
+                    "SELECT payload_json FROM opgg_snapshots WHERE cache_key = ?", (legacy_key,)
+                ).fetchone()
         if not row:
             return None
         try:
