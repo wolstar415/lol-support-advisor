@@ -58,8 +58,8 @@ class PromptingTests(unittest.TestCase):
 
     @staticmethod
     def _query_payload(prompt: str) -> dict:
-        body = prompt.split("LOL_PICK_QUERY_V4\n", 1)[1].split(
-            "\nEND_LOL_PICK_QUERY_V4", 1
+        body = prompt.split("LOL_PICK_QUERY_V5\n", 1)[1].split(
+            "\nEND_LOL_PICK_QUERY_V5", 1
         )[0]
         return json.loads(body)
 
@@ -76,7 +76,7 @@ class PromptingTests(unittest.TestCase):
 
     def test_memory_prompt_contains_rules_and_response_contract(self) -> None:
         prompt = build_memory_prompt()
-        self.assertIn("LOL_PICK_MEMORY_V4", prompt)
+        self.assertIn("LOL_PICK_MEMORY_V5", prompt)
         self.assertIn("LOCKED는 확정", prompt)
         self.assertIn("아군 원딜 궁합", prompt)
         self.assertIn("LOL_SUPPORT_V2", prompt)
@@ -176,6 +176,23 @@ class PromptingTests(unittest.TestCase):
         self.assertEqual(payload["role"], "JUNGLE")
         self.assertEqual(payload["selected_lane_opponent"]["position"], "JUNGLE")
         self.assertIn("적 정글 챔피언을 모르므로", payload["opponent"]["instruction"])
+        self.assertIn("jungle_matchup_and_pathing", payload["decision_focus"])
+        self.assertIn("objective_control", payload["decision_focus"])
+
+    def test_each_role_has_position_specific_decision_focus(self) -> None:
+        expected = {
+            "TOP": "side_lane_and_frontline",
+            "JUNGLE": "lane_gank_synergy",
+            "MIDDLE": "roaming_and_jungle_synergy",
+            "BOTTOM": "support_synergy",
+            "SUPPORT": "ally_adc_synergy",
+        }
+        for role, focus in expected.items():
+            with self.subTest(role=role):
+                self.draft.my_role = role
+                payload = self._query_payload(build_prompt(self.draft, None))
+                self.assertEqual(payload["role"], role)
+                self.assertIn(focus, payload["decision_focus"])
 
     def test_stale_response_is_rejected(self) -> None:
         with self.assertRaises(StaleResponseError):

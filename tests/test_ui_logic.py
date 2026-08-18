@@ -38,6 +38,8 @@ from lol_support_advisor.history import (
     HistoryOverview, MatchHistoryEntry, MatchLpChange,
 )
 from lol_support_advisor.icons import ItemIconCache
+from lol_support_advisor.player_history import OtherPlayerHistoryPager
+from lol_support_advisor.storage import Storage
 from lol_support_advisor.models import (
     BuildAsset, BuildItemGroup, ChampionBuildGuide, DraftBan, DraftMember,
     DraftSnapshot, GamePrediction,
@@ -51,6 +53,39 @@ from lol_support_advisor.models import (
 
 
 class DuoEvidenceTests(unittest.TestCase):
+    def test_codex_request_is_blocked_until_user_enables_feature(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.codex_recommendations_enabled = False
+        app.root = object()
+        with patch("lol_support_advisor.ui.messagebox.showinfo") as showinfo:
+            app._request_codex_recommendations()
+        showinfo.assert_called_once()
+
+    def test_demo_history_contains_only_fictional_solo_ranked_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = AdvisorApp.__new__(AdvisorApp)
+            app.storage = Storage(Path(directory) / "advisor.db")
+
+            overview = app._demo_history_overview()
+
+            self.assertEqual(overview.games, 12)
+            self.assertEqual(len(overview.entries), 12)
+            self.assertTrue(all(entry.queue_id == 420 for entry in overview.entries))
+            self.assertTrue(all(entry.match_id.startswith("DEMO_") for entry in overview.entries))
+            self.assertTrue(all(entry.lp_confidence == "EXACT" for entry in overview.entries))
+            stored = app.storage.player_matches("demo-player-puuid", limit=20)
+            self.assertEqual(len(stored), 12)
+            participants = [
+                participant
+                for match in stored
+                for participant in match.get("info", {}).get("participants", [])
+            ]
+            self.assertTrue(participants)
+            self.assertTrue(all(
+                str(participant.get("riotIdTagline") or "") == "DEMO"
+                for participant in participants
+            ))
+
     def test_enemy_ban_hover_rerenders_only_enemy_ban_strip(self) -> None:
         class FakeWidget:
             def configure(self, **_values: object) -> None:
@@ -204,7 +239,7 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertFalse(lux_auto_ban_monitor_due(28_000, 11_000, deadline, 102.5))
         self.assertTrue(lux_auto_ban_monitor_due(11_000, 11_000, deadline, 117.0))
 
-    def test_lux_monitor_executes_when_ui_queue_is_not_drained(self) -> None:
+    def test_selected_auto_ban_champion_executes_when_ui_queue_is_not_drained(self) -> None:
         performed = threading.Event()
         calls: list[tuple[int, str, int | None]] = []
 
@@ -225,6 +260,11 @@ class DuoEvidenceTests(unittest.TestCase):
 
         app = AdvisorApp.__new__(AdvisorApp)
         app.lux_auto_ban_enabled = True
+        app.auto_ban_champion_key = 89
+        app.registry = SimpleNamespace(
+            by_key={89: ("Leona", "레오나")},
+            from_key=lambda key: ("Leona", "레오나"),
+        )
         # This UI-only flag can remain stale while Tk is blocked.  The LCU
         # write lock and fresh preflight, not Tk, serialize the real action.
         app._champion_action_running = True
@@ -260,7 +300,7 @@ class DuoEvidenceTests(unittest.TestCase):
             time.sleep(0.005)
 
         self.assertEqual(calls, [
-            (99, "ban_hover", 77), (99, "ban", 77),
+            (89, "ban_hover", 77), (89, "ban", 77),
         ])
         self.assertFalse(app._lux_auto_ban_monitoring)
         self.assertEqual(app._lux_auto_ban_completed_action_id, 77)
@@ -1483,6 +1523,29 @@ class DuoEvidenceTests(unittest.TestCase):
             "D#KR1": [("C#KR1", "매우 유력", "직전 2경기 동팀")],
         })
         self.assertNotEqual(first, app._single_play_card_signature(players[2]))
+
+    def test_populated_other_player_tab_is_not_reloaded_on_tab_switch(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        pager = OtherPlayerHistoryPager()
+        pager.accept_page(["KR_1"], has_more=True)
+        app._player_history_tabs = {
+            "other#kr1": {
+                "pager": pager,
+                "rendered_match_ids": {"KR_1"},
+                "loading": False,
+                "local_hydrated": True,
+                "remote_confirmed": True,
+            }
+        }
+        calls: list[str] = []
+        app._ensure_player_history_profile = lambda _key: calls.append("profile")
+        app._hydrate_player_history_cache = lambda _key: calls.append("hydrate")
+        app._load_more_player_history = lambda _key: calls.append("load")
+        app._render_player_history_matches = lambda _state: calls.append("render")
+
+        app._ensure_player_history_page("other#kr1")
+
+        self.assertEqual(calls, [])
 
     def test_play_cards_do_not_rebuild_when_only_game_time_changes(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)

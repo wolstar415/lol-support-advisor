@@ -16,12 +16,21 @@ from tkinter import messagebox, ttk
 from typing import Callable, TypeVar
 import webbrowser
 
+from .auto_ban import (
+    AUTO_BAN_STALE_TIMER_GRACE_SECONDS,
+    AUTO_BAN_TARGET_MAX_MS,
+    AUTO_BAN_TARGET_MIN_MS,
+    auto_ban_deadline_after_timer_sample,
+    auto_ban_monitor_due,
+    choose_auto_ban_target_ms,
+    projected_auto_ban_remaining_ms,
+)
 from .builds import BuildApplicator, BuildApplyError
 from .champions import ChampionRegistry
 from .codex_cli import CodexCliClient, CodexCliError, CodexTurn
 from .history import (
     HistoryOverview, MatchHistoryEntry, analyze_history,
-    attach_match_lp_changes,
+    attach_match_lp_changes, refresh_recent_20_summary,
 )
 from .icons import BuildAssetPreloader, ChampionIconCache, ItemIconCache, RemoteIconCache
 from .lcu import (
@@ -102,13 +111,10 @@ DATA_PREFERENCE_LIMITS = {
     for key, _label, _unit, default, minimum, maximum in DATA_PREFERENCE_SPECS
 }
 
-LUX_AUTO_BAN_TARGET_MIN_MS = 15_000
-LUX_AUTO_BAN_TARGET_MAX_MS = 18_000
 LUX_AUTO_BAN_FALLBACK_MIN_SECONDS = 1.4
 LUX_AUTO_BAN_FALLBACK_MAX_SECONDS = 2.4
 LUX_AUTO_BAN_MONITOR_INTERVAL_SECONDS = 0.12
 LUX_AUTO_BAN_STATUS_INTERVAL_SECONDS = 0.25
-LUX_AUTO_BAN_STALE_TIMER_GRACE_SECONDS = 0.35
 LUX_AUTO_BAN_DISCOVERY_INTERVAL_SECONDS = 0.15
 LUX_AUTO_BAN_IDLE_INTERVAL_SECONDS = 0.60
 LUX_AUTO_BAN_DISPLAY_INTERVAL_MS = 160
@@ -117,60 +123,12 @@ PREDICTION_SAVE_DEBOUNCE_MS = 550
 BUILD_STATISTICS_SCHEMA_VERSION = 1
 
 
-def choose_lux_auto_ban_target_ms(
-    randint: Callable[[int, int], int] | None = None,
-) -> int:
-    """Choose a safe, non-identical point before the ban timer expires."""
-    picker = randint or random.randint
-    return int(picker(LUX_AUTO_BAN_TARGET_MIN_MS, LUX_AUTO_BAN_TARGET_MAX_MS))
-
-
-def lux_auto_ban_monitor_due(
-    remaining_ms: int | None,
-    target_ms: int,
-    deadline: float,
-    now_monotonic: float,
-) -> bool:
-    """Combine Riot's timer with a guarded monotonic stale-timer watchdog."""
-    if remaining_ms is None:
-        return now_monotonic >= deadline
-    return (
-        remaining_ms <= max(0, int(target_ms))
-        or now_monotonic
-        >= deadline + LUX_AUTO_BAN_STALE_TIMER_GRACE_SECONDS
-    )
-
-
-def lux_auto_ban_deadline_after_timer_sample(
-    previous_remaining_ms: int | None,
-    fresh_remaining_ms: int | None,
-    target_ms: int,
-    now_monotonic: float,
-    current_deadline: float,
-) -> float:
-    """Anchor the watchdog when Riot's real timer appears or is extended."""
-    if fresh_remaining_ms is None:
-        return current_deadline
-    if (
-        previous_remaining_ms is not None
-        and fresh_remaining_ms <= previous_remaining_ms + 750
-    ):
-        return current_deadline
-    return now_monotonic + max(
-        0.0, (fresh_remaining_ms - max(0, int(target_ms))) / 1000.0,
-    )
-
-
-def projected_lux_auto_ban_remaining_ms(
-    remaining_ms: int | None,
-    sampled_at: float,
-    now_monotonic: float,
-) -> int | None:
-    """Project one Riot timer sample for display without driving the action."""
-    if remaining_ms is None or sampled_at <= 0:
-        return None
-    elapsed_ms = max(0.0, now_monotonic - sampled_at) * 1000.0
-    return max(0, int(round(float(remaining_ms) - elapsed_ms)))
+# Backward-compatible names remain importable for existing integrations and
+# tests while the implementation is now champion-agnostic.
+choose_lux_auto_ban_target_ms = choose_auto_ban_target_ms
+lux_auto_ban_monitor_due = auto_ban_monitor_due
+lux_auto_ban_deadline_after_timer_sample = auto_ban_deadline_after_timer_sample
+projected_lux_auto_ban_remaining_ms = projected_auto_ban_remaining_ms
 
 
 def recent_prediction_accuracy(
@@ -274,6 +232,13 @@ BUTTON_FILLS = {
     COLORS["red"]: "#572633",
     COLORS["muted"]: "#2a3548",
 }
+
+
+def history_result_style(won: bool) -> tuple[str, str, str]:
+    """Return accent, card tint, and badge tint for a match result."""
+    if won:
+        return COLORS["green"], "#0d2827", "#17483c"
+    return COLORS["red"], "#2a151e", "#4a202d"
 
 RANK_COLORS = {
     "IRON": "#8c8a87", "BRONZE": "#b8794c", "SILVER": "#b8c4cf",
@@ -1704,29 +1669,51 @@ class AdvisorApp:
         storage: Storage,
         registry: ChampionRegistry,
         demo: bool = False,
+        asset_dir: Path | None = None,
     ) -> None:
         self.root = root
         self.storage = storage
         self.registry = registry
         self.demo = demo
+        self.asset_dir = asset_dir or storage.db_path.parent
+        if demo:
+            # These values live in the temporary demo database created by
+            # main.py.  They are deliberately generic and can never leak the
+            # user's real Riot identity or settings into public screenshots.
+            storage.set_setting("riot_game_name", "DemoPlayer")
+            storage.set_setting("riot_tag_line", "DEMO")
+            storage.set_setting("riot_puuid", "demo-player-puuid")
+            # Keep the public preview complete while external Codex/LCU
+            # actions remain blocked in demo mode.
+            storage.set_setting("codex_recommendations_enabled", "1")
+            storage.save_live_profile(
+                "DemoPlayer#DEMO",
+                "demo-player-puuid",
+                {
+                    "solo_entry": {
+                        "tier": "EMERALD", "rank": "II", "leaguePoints": 64,
+                        "wins": 42, "losses": 36,
+                    }
+                },
+            )
         self._data_preferences: dict[str, int] = {}
         self._reload_data_preferences()
         self.lcu = LcuClient(storage.get_setting("lcu_lockfile_path"))
         self.live_client = LiveClient(registry)
         self.opgg_client = OpggClient(registry)
         self.build_applicator = BuildApplicator(self.lcu, registry)
-        self.icon_cache = ChampionIconCache(root, registry, storage.db_path.parent / "icons")
-        self.item_icon_cache = ItemIconCache(root, registry, storage.db_path.parent / "items")
+        self.icon_cache = ChampionIconCache(root, registry, self.asset_dir / "icons")
+        self.item_icon_cache = ItemIconCache(root, registry, self.asset_dir / "items")
         self.build_icon_cache = RemoteIconCache(
-            root, storage.db_path.parent / "build_assets"
+            root, self.asset_dir / "build_assets"
         )
         self.build_asset_preloader = BuildAssetPreloader(
             registry,
-            storage.db_path.parent / "items",
-            storage.db_path.parent / "build_assets",
+            self.asset_dir / "items",
+            self.asset_dir / "build_assets",
         )
         self.rune_catalog = RuneCatalog(
-            storage.db_path.parent / "runes" / "runes-ko_KR.json"
+            self.asset_dir / "runes" / "runes-ko_KR.json"
         )
         self.draft = self._demo_draft() if demo else DraftSnapshot()
         # The live endpoint is polled every three seconds.  Keep the last full
@@ -1788,7 +1775,27 @@ class AdvisorApp:
             self.codex_cli = None
             self._codex_cli_error = str(exc)
         self.auto_accept_enabled = storage.get_setting("auto_accept_enabled", "0") == "1"
-        self.lux_auto_ban_enabled = storage.get_setting("lux_auto_ban_enabled", "0") == "1"
+        # ``lux_auto_ban_enabled`` was the original public setting.  Read it
+        # only as a migration fallback so existing users keep their choice,
+        # while new versions expose a champion-agnostic auto-ban feature.
+        stored_auto_ban = storage.get_setting("auto_ban_enabled")
+        if not stored_auto_ban:
+            stored_auto_ban = storage.get_setting("lux_auto_ban_enabled", "0")
+            storage.set_setting("auto_ban_enabled", stored_auto_ban)
+        self.lux_auto_ban_enabled = stored_auto_ban == "1"
+        try:
+            selected_auto_ban_key = int(
+                storage.get_setting("auto_ban_champion_key", "99") or 99
+            )
+        except ValueError:
+            selected_auto_ban_key = 99
+        self.auto_ban_champion_key = (
+            selected_auto_ban_key
+            if selected_auto_ban_key in registry.by_key else 99
+        )
+        self.codex_recommendations_enabled = (
+            storage.get_setting("codex_recommendations_enabled", "0") == "1"
+        )
         self._auto_accept_status = "게임 수락 대기"
         self._lux_auto_ban_status = "내 밴 차례 대기"
         self._lux_auto_ban_action_id: int | None = None
@@ -1809,7 +1816,7 @@ class AdvisorApp:
         self._lux_auto_ban_watcher_running = False
         self._lux_auto_ban_watcher_wake = threading.Event()
         self._lux_auto_ban_audit_path = (
-            storage.db_path.parent / "lux_auto_ban_audit.jsonl"
+            storage.db_path.parent / "auto_ban_audit.jsonl"
         )
         self._lux_auto_ban_audit_lock = threading.Lock()
         self._pick_order_change_notice = ""
@@ -1912,7 +1919,9 @@ class AdvisorApp:
         self._personal_stats_loading = False
         self._personal_load_scheduled = False
         self._support_filter = "ALL"
-        self.history_overview: HistoryOverview | None = None
+        self.history_overview: HistoryOverview | None = (
+            self._demo_history_overview() if demo else None
+        )
         self._history_loading = False
         self._history_reload_requested = False
         self._history_revision: tuple[int, int] | None = None
@@ -2160,9 +2169,6 @@ class AdvisorApp:
         self.history_notebook.bind(
             "<<NotebookTabChanged>>", self._on_player_history_tab_changed,
         )
-        self.history_notebook.bind(
-            "<ButtonPress-1>", self._on_player_history_tab_press, add="+",
-        )
         self.build_tab, self.build_canvas, self.build_content = self._scroll_tab()
         self.notebook.add(self.selection_tab, text="1  선택창")
         self.notebook.add(self.play_tab, text="2  플레이")
@@ -2182,6 +2188,7 @@ class AdvisorApp:
         self._build_draft_panel()
         self._build_recommendations_panel()
         self._build_selection_detail_tabs()
+        self._apply_codex_recommendation_visibility()
         self._build_play_panel()
         self._build_history_panel()
         self._build_build_panel()
@@ -2391,23 +2398,6 @@ class AdvisorApp:
                 state["last_opened_at"] = time.monotonic()
             self._ensure_player_history_page(key)
 
-    def _on_player_history_tab_press(self, event: tk.Event) -> str | None:
-        """Treat only the right edge of a dynamic tab as its close button."""
-        try:
-            index = self.history_notebook.index(f"@{event.x},{event.y}")
-            bounds = self.history_notebook.bbox(index)
-            tabs = self.history_notebook.tabs()
-        except (tk.TclError, IndexError):
-            return None
-        if not bounds or index >= len(tabs):
-            return None
-        x, _y, width, _height = bounds
-        key = self._player_history_tab_keys.get(str(tabs[index]), "")
-        if key and event.x >= x + max(width - 24, 0):
-            self.root.after_idle(lambda selected=key: self._close_player_history_tab(selected))
-            return "break"
-        return None
-
     def _owner_riot_id_key(self) -> str:
         game_name = self.storage.get_setting("riot_game_name")
         tag_line = self.storage.get_setting("riot_tag_line")
@@ -2453,7 +2443,7 @@ class AdvisorApp:
         generation = self._player_history_generation
         tab, canvas, content = self._scroll_tab(self.history_notebook)
         short_name = game_name if len(game_name) <= 9 else game_name[:8] + "…"
-        self.history_notebook.add(tab, text=f"{short_name}   ×")
+        self.history_notebook.add(tab, text=short_name)
         state: dict[str, object] = {
             "key": key,
             "riot_id": f"{game_name}#{tag_line}",
@@ -2537,6 +2527,11 @@ class AdvisorApp:
             top, text=riot_id, bg=COLORS["panel"], fg=COLORS["gold"],
             font=("Malgun Gothic", 14, "bold"), cursor="hand2",
         ).pack(side="left")
+        self._button(
+            top, "이 탭 닫기  ×",
+            lambda selected=str(state["key"]): self._close_player_history_tab(selected),
+            COLORS["red"], width=12,
+        ).pack(side="right")
         status = tk.Label(
             top, text="저장된 정보 확인 중…", bg=COLORS["panel"],
             fg=COLORS["blue"], font=("Malgun Gothic", 8),
@@ -2598,6 +2593,12 @@ class AdvisorApp:
     def _ensure_player_history_page(self, key: str) -> None:
         state = self._player_history_tabs.get(key)
         if not state:
+            return
+        # Selecting an already populated player tab must be a pure view switch.
+        # In particular, do not start another profile/page refresh or replace
+        # the existing ten cards just because the user briefly viewed 내 전적.
+        rendered = state.get("rendered_match_ids")
+        if isinstance(rendered, set) and rendered and not bool(state.get("loading")):
             return
         self._ensure_player_history_profile(key)
         if not bool(state.get("local_hydrated")):
@@ -3078,10 +3079,12 @@ class AdvisorApp:
         marker = tk.Frame(heading, bg=accent or COLORS["blue"], width=4, height=20)
         marker.pack(side="left", padx=(0, 9))
         marker.pack_propagate(False)
-        tk.Label(
+        title_label = tk.Label(
             heading, text=title, bg=COLORS["panel"], fg=COLORS["text"],
             font=("Malgun Gothic", 11, "bold"),
-        ).pack(side="left")
+        )
+        title_label.pack(side="left")
+        setattr(inner, "_advisor_title_label", title_label)
         tk.Frame(inner, bg=COLORS["border"], height=1).pack(fill="x", pady=(0, 11))
         return inner
 
@@ -3115,7 +3118,7 @@ class AdvisorApp:
         )
         self.auto_accept_button.grid(row=0, column=0, padx=(0, 7))
         self.lux_auto_ban_button = self._button(
-            actions, "럭스 자동 밴 OFF", self._toggle_lux_auto_ban, COLORS["red"]
+            actions, "자동 밴 OFF", self._toggle_lux_auto_ban, COLORS["red"]
         )
         self.lux_auto_ban_button.grid(row=0, column=1, padx=(0, 7))
         self.automation_status_label = tk.Label(
@@ -3165,7 +3168,7 @@ class AdvisorApp:
             outer.pack(side="left", fill="x", expand=True, padx=(0 if index == 0 else 5, 5))
         self.legal_notice_label = tk.Label(
             header,
-            text=("비공식 개인용 도구 · 자동 수락/럭스 자동 밴은 기본 OFF · 픽/밴/빌드는 명시적 버튼으로만 변경 · "
+            text=("비공식 개인용 도구 · 자동 수락/자동 밴은 기본 OFF · 픽/밴/빌드는 명시적 버튼으로만 변경 · "
                   "Riot Games가 보증하거나 공식 지원하지 않습니다."),
             bg=COLORS["bg"], fg="#5f6c82", font=("Malgun Gothic", 7),
         )
@@ -3267,7 +3270,7 @@ class AdvisorApp:
             return
 
     def _toggle_auto_accept(self) -> None:
-        if self.demo:
+        if getattr(self, "demo", False):
             return
         self.auto_accept_enabled = not self.auto_accept_enabled
         self.storage.set_setting(
@@ -3278,13 +3281,47 @@ class AdvisorApp:
         )
         self._render_automation_toggles()
 
+    def _auto_ban_champion(
+        self, champion_key: int | None = None,
+    ) -> tuple[int, str, str]:
+        """Return the persisted auto-ban target with a safe Lux fallback."""
+        key = int(
+            champion_key
+            if champion_key is not None
+            else getattr(self, "auto_ban_champion_key", 99) or 99
+        )
+        registry = getattr(self, "registry", None)
+        if registry is None:
+            return 99, "Lux", "럭스"
+        if key not in registry.by_key:
+            key = 99
+        champion_id, champion_name_ko = registry.from_key(key)
+        return key, champion_id, champion_name_ko
+
+    def _set_auto_ban_champion(self, champion_key: int) -> None:
+        key = int(champion_key)
+        if key not in self.registry.by_key:
+            key = 99
+        if key == getattr(self, "auto_ban_champion_key", 99):
+            return
+        self.auto_ban_champion_key = key
+        self.storage.set_setting("auto_ban_champion_key", str(key))
+        self._reset_lux_auto_ban_schedule()
+        self._lux_auto_ban_status = "내 밴 차례 대기"
+        self._lux_auto_ban_watcher_wake.set()
+        self._audit_lux_auto_ban(
+            "target_changed", champion_key=key,
+            champion_id=self.registry.from_key(key)[0],
+        )
+        self._render_automation_toggles()
+
     def _toggle_lux_auto_ban(self) -> None:
-        if self.demo:
+        if getattr(self, "demo", False):
             return
         self.lux_auto_ban_enabled = not self.lux_auto_ban_enabled
         self._reset_lux_auto_ban_schedule()
         self.storage.set_setting(
-            "lux_auto_ban_enabled", "1" if self.lux_auto_ban_enabled else "0"
+            "auto_ban_enabled", "1" if self.lux_auto_ban_enabled else "0"
         )
         self._lux_auto_ban_status = (
             "내 밴 차례 대기" if self.lux_auto_ban_enabled else "사용 안 함"
@@ -3373,12 +3410,15 @@ class AdvisorApp:
                 continue
             interval = LUX_AUTO_BAN_IDLE_INTERVAL_SECONDS
             try:
+                champion_key, _champion_id, champion_name = (
+                    self._auto_ban_champion()
+                )
                 session = self.lcu.champ_select_session()
                 missing_session_count = 0
                 interval = LUX_AUTO_BAN_DISCOVERY_INTERVAL_SECONDS
                 inner_phase = champ_select_timer_phase(session)
-                if 99 in session_banned_champion_ids(session):
-                    publish_waiting("BANNED", "럭스 이미 밴됨")
+                if champion_key in session_banned_champion_ids(session):
+                    publish_waiting("BANNED", f"{champion_name} 이미 밴됨")
                 elif inner_phase != "BAN_PICK":
                     publish_waiting(
                         f"WAIT:{inner_phase}",
@@ -3448,9 +3488,10 @@ class AdvisorApp:
                     return
             self._render_automation_toggles()
             if completed:
+                _key, _champion_id, champion_name = self._auto_ban_champion()
                 self.champion_action_status.configure(
                     text=(
-                        "럭스 자동 밴 완료 · 백그라운드에서 밴 단계·"
+                        f"{champion_name} 자동 밴 완료 · 백그라운드에서 밴 단계·"
                         "내 순서·밴 가능 여부를 재확인했습니다."
                     ),
                     fg=COLORS["green"],
@@ -3510,8 +3551,9 @@ class AdvisorApp:
             )
         except LcuUnavailable:
             return False
+        champion_key, champion_id, champion_name = self._auto_ban_champion()
         current_champion_id = int(current_action.get("championId") or 0)
-        if current_champion_id not in {0, 99}:
+        if current_champion_id not in {0, champion_key}:
             with self._lux_auto_ban_lock:
                 if self._lux_auto_ban_completed_action_id == action_id:
                     return False
@@ -3529,7 +3571,7 @@ class AdvisorApp:
             return False
         remaining_ms = champ_select_time_left_ms(session)
         now = time.monotonic()
-        target_ms = choose_lux_auto_ban_target_ms()
+        target_ms = choose_auto_ban_target_ms()
         fallback_seconds = random.uniform(
             LUX_AUTO_BAN_FALLBACK_MIN_SECONDS,
             LUX_AUTO_BAN_FALLBACK_MAX_SECONDS,
@@ -3559,7 +3601,7 @@ class AdvisorApp:
             self._lux_auto_ban_fallback_deadline = deadline
             self._lux_auto_ban_last_remaining_ms = remaining_ms
             self._lux_auto_ban_last_sampled_at = now
-            self._lux_auto_ban_staged = current_champion_id == 99
+            self._lux_auto_ban_staged = current_champion_id == champion_key
 
         self._audit_lux_auto_ban(
             "monitor_scheduled",
@@ -3567,7 +3609,9 @@ class AdvisorApp:
             action_id=action_id,
             remaining_ms=remaining_ms,
             target_ms=target_ms,
-            already_staged=current_champion_id == 99,
+            champion_key=champion_key,
+            champion_id=champion_id,
+            already_staged=current_champion_id == champion_key,
         )
 
         if remaining_ms is None:
@@ -3590,9 +3634,9 @@ class AdvisorApp:
             target=self._run_lux_auto_ban_monitor,
             args=(
                 generation, action_id, target_ms, deadline, remaining_ms,
-                current_champion_id == 99,
+                current_champion_id == champion_key, champion_key,
             ),
-            name="lux-auto-ban-monitor",
+            name="auto-ban-monitor",
             daemon=True,
         ).start()
         return True
@@ -3605,12 +3649,13 @@ class AdvisorApp:
         deadline: float,
         initial_remaining_ms: int | None,
         initial_staged: bool = False,
+        champion_key: int | None = None,
     ) -> None:
         """Guard monitor ownership against every unexpected worker failure."""
         try:
             self._run_lux_auto_ban_monitor_loop(
                 generation, action_id, target_ms, deadline,
-                initial_remaining_ms, initial_staged,
+                initial_remaining_ms, initial_staged, champion_key,
             )
         except Exception as exc:
             self._audit_lux_auto_ban(
@@ -3635,8 +3680,13 @@ class AdvisorApp:
         deadline: float,
         initial_remaining_ms: int | None,
         initial_staged: bool = False,
+        champion_key: int | None = None,
     ) -> None:
         """Watch Riot's ban timer at 120ms independently of Tk rendering."""
+        selected_key = int(champion_key or self._auto_ban_champion()[0])
+        _selected_key, champion_id, champion_name = self._auto_ban_champion(
+            selected_key
+        )
         remaining_ms = initial_remaining_ms
         previous_remaining_ms = initial_remaining_ms
         next_status_at = 0.0
@@ -3656,12 +3706,12 @@ class AdvisorApp:
                 )
                 try:
                     self.lcu.perform_champion_action(
-                        99,
+                        selected_key,
                         "ban_hover",
                         expected_action_id=action_id,
-                        expected_current_champion_ids={0, 99},
-                        # The live failure showed this endpoint could reject or
-                        # omit valid Lux bans. The authoritative session action
+                        expected_current_champion_ids={0, selected_key},
+                        # The live failure showed this endpoint can reject or
+                        # omit a valid ban. The authoritative session action
                         # and Riot's PATCH response remain the hard guards.
                         verify_bannable=False,
                         pre_commit_check=lambda: (
@@ -3709,7 +3759,7 @@ class AdvisorApp:
                     ):
                         self._post_lux_auto_ban_status(
                             generation,
-                            f"럭스 선택 실패 · {exc}",
+                            f"{champion_name} 선택 실패 · {exc}",
                             remaining_ms=remaining_ms,
                         )
                     return
@@ -3753,13 +3803,13 @@ class AdvisorApp:
                     self._post_lux_auto_ban_status(
                         generation,
                         (
-                            f"럭스 선택 완료 · {target_ms / 1000:.1f}초에 "
+                            f"{champion_name} 선택 완료 · {target_ms / 1000:.1f}초에 "
                             "밴 확정"
                         ),
                         remaining_ms=remaining_ms,
                     )
 
-            due = lux_auto_ban_monitor_due(
+            due = auto_ban_monitor_due(
                 remaining_ms, target_ms, deadline, now,
             )
             if due:
@@ -3771,7 +3821,7 @@ class AdvisorApp:
                     )
                 self._post_lux_auto_ban_status(
                     generation,
-                    "럭스 밴 실행 검사 중 · 단계·순서·가능 여부 재확인",
+                    f"{champion_name} 밴 실행 검사 중 · 단계·순서·가능 여부 재확인",
                     remaining_ms=remaining_ms,
                 )
                 try:
@@ -3780,10 +3830,10 @@ class AdvisorApp:
                     ):
                         return
                     self.lcu.perform_champion_action(
-                        99,
+                        selected_key,
                         "ban",
                         expected_action_id=action_id,
-                        expected_current_champion_ids={99},
+                        expected_current_champion_ids={selected_key},
                         verify_bannable=False,
                         pre_commit_check=lambda: (
                             self._lux_auto_ban_monitor_is_current(
@@ -3830,7 +3880,7 @@ class AdvisorApp:
                     ):
                         self._post_lux_auto_ban_status(
                             generation,
-                            f"럭스 밴 실패 · {exc}",
+                            f"{champion_name} 밴 실패 · {exc}",
                             remaining_ms=remaining_ms,
                         )
                     return
@@ -3866,7 +3916,7 @@ class AdvisorApp:
                     ):
                         self._post_lux_auto_ban_status(
                             generation,
-                            "럭스 자동 밴 완료",
+                            f"{champion_name} 자동 밴 완료",
                             remaining_ms=remaining_ms,
                             completed=True,
                         )
@@ -3874,10 +3924,10 @@ class AdvisorApp:
 
             if now >= next_status_at and not due:
                 status = (
-                    f"럭스 선택됨 · 현재 {remaining_ms / 1000:.1f}초 · "
+                    f"{champion_name} 선택됨 · 현재 {remaining_ms / 1000:.1f}초 · "
                     f"{target_ms / 1000:.1f}초 전 백그라운드 예약"
                     if remaining_ms is not None else (
-                        "럭스 선택됨 · LCU 타이머 없음 · "
+                        f"{champion_name} 선택됨 · LCU 타이머 없음 · "
                         "로컬 예약 시각 감시 중"
                     )
                 )
@@ -3895,12 +3945,12 @@ class AdvisorApp:
                 session = self.lcu.champ_select_session()
                 if champ_select_timer_phase(session) != "BAN_PICK":
                     raise LcuActionStateChanged("실제 밴 단계가 종료되었습니다.")
-                if 99 in session_banned_champion_ids(session):
+                if selected_key in session_banned_champion_ids(session):
                     if self._finish_lux_auto_ban_monitor(
                         generation, action_id, completed=True,
                     ):
                         self._post_lux_auto_ban_status(
-                            generation, "럭스 이미 밴됨",
+                            generation, f"{champion_name} 이미 밴됨",
                         )
                     return
                 fresh_action = find_local_champion_action(
@@ -3913,11 +3963,11 @@ class AdvisorApp:
                 fresh_champion_id = int(
                     fresh_action.get("championId") or 0
                 )
-                if fresh_champion_id not in {0, 99}:
+                if fresh_champion_id not in {0, selected_key}:
                     raise LcuActionManualOverride(
                         "사용자가 다른 밴 챔피언을 선택했습니다."
                     )
-                staged = staged or fresh_champion_id == 99
+                staged = staged or fresh_champion_id == selected_key
                 if staged:
                     with self._lux_auto_ban_lock:
                         if (
@@ -3927,7 +3977,7 @@ class AdvisorApp:
                             self._lux_auto_ban_staged = True
                 fresh_remaining_ms = champ_select_time_left_ms(session)
                 now = time.monotonic()
-                adjusted_deadline = lux_auto_ban_deadline_after_timer_sample(
+                adjusted_deadline = auto_ban_deadline_after_timer_sample(
                     previous_remaining_ms,
                     fresh_remaining_ms,
                     target_ms,
@@ -4016,12 +4066,13 @@ class AdvisorApp:
     def _render_automation_toggles(self) -> None:
         auto_on = bool(self.auto_accept_enabled and not self.demo)
         lux_on = bool(self.lux_auto_ban_enabled and not self.demo)
+        _champion_key, _champion_id, champion_name = self._auto_ban_champion()
         self.auto_accept_button.configure(
             text=f"자동 수락 {'ON' if auto_on else 'OFF'}",
             state="disabled" if self.demo else "normal",
         )
         self.lux_auto_ban_button.configure(
-            text=f"럭스 자동 밴 {'ON' if lux_on else 'OFF'}",
+            text=f"{champion_name} 자동 밴 {'ON' if lux_on else 'OFF'}",
             state="disabled" if self.demo else "normal",
         )
         self._set_button_selected(self.auto_accept_button, auto_on, COLORS["green"])
@@ -4030,6 +4081,7 @@ class AdvisorApp:
 
     def _lux_auto_ban_display_text(self) -> str:
         now = time.monotonic()
+        _champion_key, _champion_id, champion_name = self._auto_ban_champion()
         with self._lux_auto_ban_lock:
             status = self._lux_auto_ban_status
             monitoring = self._lux_auto_ban_monitoring
@@ -4040,24 +4092,24 @@ class AdvisorApp:
             fallback_deadline = self._lux_auto_ban_fallback_deadline
         if not monitoring:
             return status
-        projected = projected_lux_auto_ban_remaining_ms(
+        projected = projected_auto_ban_remaining_ms(
             remaining_ms, sampled_at, now,
         )
         if projected is None:
             until_check = max(0.0, fallback_deadline - now)
             return (
-                f"{'럭스 선택됨' if staged else '럭스 선택 준비'} · "
+                f"{champion_name} {'선택됨' if staged else '선택 준비'} · "
                 f"LCU 타이머 없음 · 안전 검사까지 약 {until_check:.1f}초"
             )
         remaining_seconds = projected / 1000.0
         until_commit = max(0, projected - max(0, target_ms)) / 1000.0
         if until_commit <= 0:
             return (
-                f"{'럭스 선택됨' if staged else '럭스 선택 준비'} · "
+                f"{champion_name} {'선택됨' if staged else '선택 준비'} · "
                 f"남은 약 {remaining_seconds:.1f}초 · 밴 확정 검사 중"
             )
         return (
-            f"{'럭스 선택됨' if staged else '럭스 선택 준비'} · "
+            f"{champion_name} {'선택됨' if staged else '선택 준비'} · "
             f"남은 약 {remaining_seconds:.1f}초 · 확정까지 약 {until_commit:.1f}초"
         )
 
@@ -4068,7 +4120,7 @@ class AdvisorApp:
         if auto_on:
             enabled_status.append(f"수락: {self._auto_accept_status}")
         if lux_on:
-            enabled_status.append(f"럭스 밴: {self._lux_auto_ban_display_text()}")
+            enabled_status.append(f"자동 밴: {self._lux_auto_ban_display_text()}")
         text = " · ".join(enabled_status) if enabled_status else "자동화 모두 OFF"
         color = COLORS["green"] if enabled_status else COLORS["muted"]
         signature = (text, color)
@@ -5240,7 +5292,18 @@ class AdvisorApp:
         )
 
     def _build_draft_panel(self) -> None:
-        panel = self._panel(self.content, "1 · 현재 드래프트와 추천 요청", COLORS["gold"])
+        panel = self._panel(
+            self.content,
+            (
+                "1 · 현재 드래프트와 추천 요청"
+                if self.codex_recommendations_enabled
+                else "1 · 현재 드래프트"
+            ),
+            COLORS["gold"],
+        )
+        self.draft_panel_title_label = getattr(
+            panel, "_advisor_title_label", None
+        )
         self.pick_order_label = tk.Label(
             panel, bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 9)
         )
@@ -5370,6 +5433,7 @@ class AdvisorApp:
             highlightthickness=1, highlightbackground=COLORS["divider"],
         )
         workflow.pack(fill="x", pady=(12, 0))
+        self.codex_workflow_frame = workflow
         step_row = tk.Frame(workflow, bg=COLORS["surface"])
         step_row.pack(fill="x")
         self.workflow_steps: list[tuple[tk.Frame, tk.Label, tk.Label]] = []
@@ -5448,12 +5512,14 @@ class AdvisorApp:
     def _build_selection_detail_tabs(self) -> None:
         section = tk.Frame(self.content, bg=COLORS["bg"])
         section.pack(fill="x", padx=22, pady=(0, 11))
+        self.selection_detail_section = section
         heading = tk.Frame(section, bg=COLORS["bg"])
         heading.pack(fill="x", pady=(0, 7))
-        tk.Label(
+        self.selection_detail_heading_label = tk.Label(
             heading, text="3 · 상세 분석", bg=COLORS["bg"], fg=COLORS["text"],
             font=("Malgun Gothic", 11, "bold"),
-        ).pack(side="left")
+        )
+        self.selection_detail_heading_label.pack(side="left")
         tk.Label(
             heading, text="필요한 정보만 탭으로 열어 한 화면에서 비교합니다.",
             bg=COLORS["bg"], fg=COLORS["muted"],
@@ -5803,6 +5869,7 @@ class AdvisorApp:
 
     def _build_recommendations_panel(self) -> None:
         outer = self._panel(self.content, "2 · 추천 결과", COLORS["green"])
+        self.codex_recommendations_outer = outer.master
         self.champion_action_status = tk.Label(
             outer,
             text="추천 챔피언의 HOVER/픽/밴은 버튼을 누를 때마다 최신 롤 세션을 재확인합니다.",
@@ -5812,6 +5879,53 @@ class AdvisorApp:
         self.champion_action_status.pack(fill="x", pady=(0, 9))
         self.cards_frame = tk.Frame(outer, bg=COLORS["panel"])
         self.cards_frame.pack(fill="x")
+
+    def _apply_codex_recommendation_visibility(self) -> None:
+        """Show the pick-recommendation UI only after explicit opt-in."""
+        enabled = bool(getattr(self, "codex_recommendations_enabled", False))
+        workflow = getattr(self, "codex_workflow_frame", None)
+        results = getattr(self, "codex_recommendations_outer", None)
+        detail_section = getattr(self, "selection_detail_section", None)
+        notebook = getattr(self, "selection_detail_notebook", None)
+        chat_tab = getattr(self, "selection_chat_tab", None)
+        if isinstance(workflow, tk.Widget):
+            if enabled:
+                if not workflow.winfo_manager():
+                    workflow.pack(fill="x", pady=(12, 0))
+            elif workflow.winfo_manager():
+                workflow.pack_forget()
+        if isinstance(results, tk.Widget):
+            if enabled:
+                if not results.winfo_manager():
+                    pack_options: dict[str, object] = {
+                        "fill": "x", "padx": 22, "pady": (0, 11),
+                    }
+                    if isinstance(detail_section, tk.Widget):
+                        pack_options["before"] = detail_section
+                    results.pack(**pack_options)
+            elif results.winfo_manager():
+                results.pack_forget()
+        if isinstance(notebook, ttk.Notebook) and isinstance(chat_tab, tk.Widget):
+            try:
+                if enabled:
+                    notebook.add(chat_tab, text="ChatGPT 답변 편집")
+                else:
+                    if notebook.select() == str(chat_tab):
+                        notebook.select(self.selection_synergy_tab)
+                    notebook.hide(chat_tab)
+            except tk.TclError:
+                pass
+        heading = getattr(self, "selection_detail_heading_label", None)
+        if isinstance(heading, tk.Label):
+            heading.configure(text="3 · 상세 분석" if enabled else "2 · 상세 분석")
+        draft_heading = getattr(self, "draft_panel_title_label", None)
+        if isinstance(draft_heading, tk.Label):
+            draft_heading.configure(
+                text=(
+                    "1 · 현재 드래프트와 추천 요청"
+                    if enabled else "1 · 현재 드래프트"
+                )
+            )
 
     def _build_play_panel(self) -> None:
         panel = self._panel(self.play_content, "현재 게임 플레이어", COLORS["gold"])
@@ -8328,7 +8442,10 @@ class AdvisorApp:
     def _render_header(self) -> None:
         self._render_automation_toggles()
         if self.demo:
-            text, color = "● 데모 화면 · 실제 게임에는 입력하지 않습니다", COLORS["gold"]
+            text, color = (
+                "● DEMO · 100% 가상 데이터 · 실계정과 실제 전적을 읽지 않습니다",
+                COLORS["gold"],
+            )
         elif self.game_phase == "InProgress":
             text, color = "● 게임 진행 중 · 플레이 탭에서 플레이어 전적 확인", COLORS["green"]
         elif self.draft.connection_state == "CHAMP_SELECT":
@@ -8368,7 +8485,13 @@ class AdvisorApp:
             self.riot_button.configure(state="normal", text="전적 갱신")
         key = self.storage.get_setting("riot_api_key")
         key_remaining = self.storage.riot_api_key_refresh_remaining()
-        if not key:
+        if self.demo:
+            self.api_key_status_label.configure(
+                text="DEMO · 실제 Riot API 키 미사용", fg=COLORS["gold"],
+            )
+            self.settings_button.configure(text="가상 데이터 전용", state="disabled")
+            self.riot_button.configure(text="더미 전적", state="disabled")
+        elif not key:
             self.api_key_status_label.configure(text="Riot API 키 없음", fg=COLORS["red"])
             self.settings_button.configure(text="Riot 설정")
         elif key_remaining.total_seconds() <= 0:
@@ -8405,15 +8528,35 @@ class AdvisorApp:
         self.header_metrics["draft"][0].configure(text=target)
         self.header_metrics["draft"][1].configure(text=f"적 {role_name} 기준 · {order}")
         match_count = self.storage.count_matches()
-        self.header_metrics["cache"][0].configure(text=f"{match_count:,} 경기")
-        self.header_metrics["cache"][1].configure(text="내 전적·관계 기록 로컬 계산")
+        self.header_metrics["cache"][0].configure(
+            text="가상 표본" if self.demo else f"{match_count:,} 경기"
+        )
+        self.header_metrics["cache"][1].configure(
+            text=(
+                "코드에 포함된 공개용 더미 데이터"
+                if self.demo else "내 전적·관계 기록 로컬 계산"
+            )
+        )
         key_ready = bool(key and key_remaining.total_seconds() > 0)
         opgg_ready = bool(self.opgg_meta_snapshot or self.opgg_snapshot)
-        data_value = "READY" if key_ready and opgg_ready else ("부분 준비" if key_ready or opgg_ready else "설정 필요")
-        data_color = COLORS["green"] if data_value == "READY" else (COLORS["orange"] if data_value == "부분 준비" else COLORS["red"])
+        data_value = (
+            "DEMO DATA" if self.demo else
+            "READY" if key_ready and opgg_ready else
+            "부분 준비" if key_ready or opgg_ready else "설정 필요"
+        )
+        data_color = (
+            COLORS["gold"] if self.demo else
+            COLORS["green"] if data_value == "READY" else
+            COLORS["orange"] if data_value == "부분 준비" else COLORS["red"]
+        )
         self.header_metrics["data"][0].configure(text=data_value, fg=data_color)
         self.header_metrics["data"][1].configure(
-            text=f"Riot {'OK' if key_ready else '갱신 필요'} · OP.GG {'OK' if opgg_ready else '없음'}"
+            text=(
+                "외부 계정 연결 없음"
+                if self.demo else
+                f"Riot {'OK' if key_ready else '갱신 필요'} · "
+                f"OP.GG {'OK' if opgg_ready else '없음'}"
+            )
         )
 
     def _draft_team_slots(self, ally: bool) -> list[DraftMember | None]:
@@ -9382,10 +9525,18 @@ class AdvisorApp:
         self.codex_cli_status_label.configure(text=cli_status, fg=cli_color)
         self.codex_recommend_button.configure(
             state=(
-                "normal" if self.codex_cli is not None and not self._codex_cli_running
+                "normal" if (
+                    self.codex_recommendations_enabled
+                    and not getattr(self, "demo", False)
+                    and self.codex_cli is not None
+                    and not self._codex_cli_running
+                )
                 else "disabled"
             ),
-            text="Codex 분석 중…" if self._codex_cli_running else "Codex CLI로 추천 받기",
+            text=(
+                "Codex 분석 중…" if self._codex_cli_running
+                else f"Codex로 {role_name} 픽 추천"
+            ),
         )
 
     def _local_synergy_stats_for_prompt(
@@ -12200,6 +12351,12 @@ class AdvisorApp:
             if force:
                 self._history_reload_requested = True
             return
+        if getattr(self, "demo", False):
+            if self.history_overview is None:
+                self.history_overview = self._demo_history_overview()
+            self._history_revision = self.storage.match_revision()
+            self._render_history()
+            return
         puuid = self._history_puuid()
         if not puuid:
             self.history_overview = HistoryOverview()
@@ -12425,7 +12582,15 @@ class AdvisorApp:
                 text="새 게임부터 기록"
             )
 
-        if self._history_loading:
+        if getattr(self, "demo", False):
+            self.history_status_label.configure(
+                text=(
+                    f"DEMO · 가상 솔로랭크 {overview.games:,}경기 · "
+                    "실제 계정 데이터 없음"
+                ),
+                fg=COLORS["gold"],
+            )
+        elif self._history_loading:
             self.history_status_label.configure(text="새 로컬 데이터 분석 중…", fg=COLORS["blue"])
         else:
             self.history_status_label.configure(
@@ -12714,13 +12879,13 @@ class AdvisorApp:
         parent: tk.Widget | None = None,
         perspective_puuid: str = "",
     ) -> None:
-        result_color = COLORS["green"] if entry.won else COLORS["red"]
+        result_color, result_bg, result_badge_bg = history_result_style(entry.won)
         target = parent or self.history_matches_frame
-        outer = tk.Frame(target, bg=result_color, padx=1, pady=1)
-        outer.pack(fill="x", pady=3)
-        card = tk.Frame(outer, bg=COLORS["surface"], padx=9, pady=7)
+        outer = tk.Frame(target, bg=result_color, padx=2, pady=2)
+        outer.pack(fill="x", pady=4)
+        card = tk.Frame(outer, bg=result_bg, padx=9, pady=7)
         card.pack(fill="x")
-        summary = tk.Frame(card, bg=COLORS["surface"])
+        summary = tk.Frame(card, bg=result_bg)
         summary.pack(fill="x")
         # Reserve the action first. The previous left-to-right fixed widths
         # could consume the whole row and push this button beyond the card.
@@ -12732,7 +12897,7 @@ class AdvisorApp:
             COLORS["purple"], width=9,
         ).pack(side="right", padx=(8, 0), anchor="n")
 
-        loadout = tk.Frame(summary, bg=COLORS["surface"])
+        loadout = tk.Frame(summary, bg=result_bg)
         loadout.pack(side="left", fill="y", padx=(0, 9))
         champion_label = tk.Label(
             loadout, text=self.registry.ko_name(entry.champion_id)[:1],
@@ -12753,7 +12918,7 @@ class AdvisorApp:
         icon = self.icon_cache.get(entry.champion_id, 52, apply_champion_icon)
         if icon:
             champion_label.configure(image=icon, text="", width=0)
-        loadout_icons = tk.Frame(loadout, bg=COLORS["surface"])
+        loadout_icons = tk.Frame(loadout, bg=result_bg)
         loadout_icons.pack(side="left", anchor="n")
         self._render_loadout_icons(
             loadout_icons,
@@ -12761,20 +12926,28 @@ class AdvisorApp:
             entry.primary_rune_id,
             entry.secondary_rune_style_id,
             size=20,
-            bg=COLORS["surface"],
+            bg=result_bg,
         )
-        result = tk.Frame(summary, bg=COLORS["surface"], width=170)
+        result = tk.Frame(summary, bg=result_bg, width=178)
         result.pack(side="left", fill="y")
         result.pack_propagate(False)
+        result_heading = tk.Frame(result, bg=result_bg)
+        result_heading.pack(fill="x")
         tk.Label(
-            result, text=f"{'승리' if entry.won else '패배'} · {self.registry.ko_name(entry.champion_id)}",
-            bg=COLORS["surface"], fg=result_color, font=("Malgun Gothic", 9, "bold"),
-        ).pack(anchor="w")
+            result_heading, text="승리" if entry.won else "패배",
+            bg=result_color, fg="#07101b", padx=7, pady=2,
+            font=("Malgun Gothic", 8, "bold"),
+        ).pack(side="left")
+        tk.Label(
+            result_heading, text=self.registry.ko_name(entry.champion_id),
+            bg=result_bg, fg=result_color, padx=6,
+            font=("Malgun Gothic", 9, "bold"),
+        ).pack(side="left")
         tk.Label(
             result,
             text=f"{self._history_time(entry.game_creation)} · {entry.duration_seconds // 60}:{entry.duration_seconds % 60:02d}",
-            bg=COLORS["surface"], fg=COLORS["muted"], font=("Malgun Gothic", 7),
-        ).pack(anchor="w", pady=(2, 0))
+            bg=result_bg, fg=COLORS["muted"], font=("Malgun Gothic", 7),
+        ).pack(anchor="w", pady=(4, 0))
         lp_badge = exact_lp_badge_text(entry)
         if lp_badge:
             lp_color = (
@@ -12783,7 +12956,7 @@ class AdvisorApp:
                 else COLORS["gold"]
             )
             tk.Label(
-                result, text=lp_badge, bg=COLORS["chip"], fg=lp_color,
+                result, text=lp_badge, bg=result_badge_bg, fg=lp_color,
                 padx=5, pady=1, font=("Malgun Gothic", 6, "bold"),
             ).pack(anchor="w", pady=(4, 0))
         if entry.predicted_win_rate is not None and entry.predicted_win is not None:
@@ -12803,35 +12976,35 @@ class AdvisorApp:
                     f"예측 {entry.predicted_win_rate:.1f}% "
                     f"{'승' if entry.predicted_win else '패'} · {accuracy}"
                 ),
-                bg=COLORS["chip"], fg=prediction_color,
+                bg=result_badge_bg, fg=prediction_color,
                 padx=5, pady=1, font=("Malgun Gothic", 6, "bold"),
             ).pack(anchor="w", pady=(4, 0))
 
-        core = tk.Frame(summary, bg=COLORS["surface"], width=180)
+        core = tk.Frame(summary, bg=result_bg, width=180)
         core.pack(side="left", fill="y")
         core.pack_propagate(False)
         tk.Label(
             core, text=f"KDA {entry.kda:.2f}  ·  {entry.kills}/{entry.deaths}/{entry.assists}",
-            bg=COLORS["surface"], fg=COLORS["gold"], font=("Malgun Gothic", 8, "bold"),
+            bg=result_bg, fg=COLORS["gold"], font=("Malgun Gothic", 8, "bold"),
         ).pack(anchor="w")
         tk.Label(
             core,
             text=f"CS {entry.cs} ({entry.cs_per_minute:.1f}/분) · 시야 {entry.vision_score}",
-            bg=COLORS["surface"], fg=COLORS["muted"], font=("Malgun Gothic", 7),
+            bg=result_bg, fg=COLORS["muted"], font=("Malgun Gothic", 7),
         ).pack(anchor="w", pady=(2, 0))
 
-        items = tk.Frame(summary, bg=COLORS["surface"], width=210)
+        items = tk.Frame(summary, bg=result_bg, width=210)
         items.pack(side="left", fill="y", padx=(3, 8))
         items.pack_propagate(False)
         tk.Label(
-            items, text="아이템", bg=COLORS["surface"], fg=COLORS["muted"],
+            items, text="아이템", bg=result_bg, fg=COLORS["muted"],
             font=("Malgun Gothic", 6, "bold"),
         ).pack(anchor="w")
-        item_row = tk.Frame(items, bg=COLORS["surface"])
+        item_row = tk.Frame(items, bg=result_bg)
         item_row.pack(anchor="w", pady=(2, 0))
         if not entry.items:
             tk.Label(
-                item_row, text="기록 없음", bg=COLORS["surface"], fg=COLORS["muted"],
+                item_row, text="기록 없음", bg=result_bg, fg=COLORS["muted"],
                 font=("Malgun Gothic", 7),
             ).pack(side="left")
         for item_id in entry.items[:7]:
@@ -13494,6 +13667,20 @@ class AdvisorApp:
         self._render_prompt_summary()
 
     def _request_codex_recommendations(self) -> None:
+        if getattr(self, "demo", False):
+            messagebox.showinfo(
+                "데모 모드",
+                "데모에서는 Codex CLI로 내용을 전송하지 않습니다.",
+                parent=self.root,
+            )
+            return
+        if not self.codex_recommendations_enabled:
+            messagebox.showinfo(
+                "픽 추천 꺼짐",
+                "Riot 설정에서 ‘픽 추천 사용 (Codex CLI)’을 허용한 뒤 이용하세요.",
+                parent=self.root,
+            )
+            return
         if self._codex_cli_running:
             return
         thread_id = self.storage.get_setting("codex_thread_id").strip()
@@ -13536,6 +13723,8 @@ class AdvisorApp:
         def success(turn: CodexTurn) -> None:
             self._codex_cli_running = False
             self.storage.set_setting("codex_thread_id", turn.thread_id)
+            if not self.codex_recommendations_enabled:
+                return
             self.response_text.delete("1.0", "end")
             self.response_text.insert("1.0", turn.message)
             applied = self._apply_recommendation_text(
@@ -14071,6 +14260,71 @@ class AdvisorApp:
             bg=COLORS["panel"], fg=COLORS["orange"], font=("Malgun Gothic", 8),
         ).pack(anchor="w", padx=20, pady=(8, 12))
 
+        feature_outer = tk.Frame(
+            settings_body, bg=COLORS["border"], padx=1, pady=1,
+        )
+        feature_outer.pack(fill="x", padx=20, pady=(0, 12))
+        feature_panel = tk.Frame(
+            feature_outer, bg=COLORS["panel_2"], padx=14, pady=12,
+        )
+        feature_panel.pack(fill="x")
+        tk.Label(
+            feature_panel, text="자동화 · AI 기능 허용",
+            bg=COLORS["panel_2"], fg=COLORS["purple"],
+            font=("Malgun Gothic", 10, "bold"),
+        ).pack(anchor="w")
+        tk.Label(
+            feature_panel,
+            text=(
+                "픽 추천은 명시적으로 허용한 경우에만 선택창에 표시되고 Codex CLI로 전송됩니다. "
+                "자동 밴은 아래에서 선택한 챔피언을 사용합니다."
+            ),
+            bg=COLORS["panel_2"], fg=COLORS["muted"],
+            font=("Malgun Gothic", 8), justify="left", wraplength=680,
+        ).pack(anchor="w", pady=(4, 9))
+        feature_grid = tk.Frame(feature_panel, bg=COLORS["panel_2"])
+        feature_grid.pack(fill="x")
+        codex_enabled_var = tk.BooleanVar(
+            value=bool(self.codex_recommendations_enabled)
+        )
+        codex_check = tk.Checkbutton(
+            feature_grid, text="픽 추천 사용 (Codex CLI)",
+            variable=codex_enabled_var,
+            bg=COLORS["panel_2"], fg=COLORS["text"],
+            activebackground=COLORS["panel_2"], activeforeground=COLORS["text"],
+            selectcolor=COLORS["surface_selected"],
+            font=("Malgun Gothic", 9, "bold"), cursor="hand2",
+        )
+        codex_check.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 9))
+
+        tk.Label(
+            feature_grid, text="자동 밴 챔피언",
+            bg=COLORS["panel_2"], fg=COLORS["text"],
+            font=("Malgun Gothic", 9, "bold"), width=15, anchor="w",
+        ).grid(row=1, column=0, sticky="w")
+        auto_ban_choices = [
+            (f"{name_ko} · {champion_id}", int(champion_key))
+            for champion_id, (champion_key, name_ko) in sorted(
+                self.registry.by_id.items(), key=lambda item: item[1][1]
+            )
+        ]
+        auto_ban_key_by_label = dict(auto_ban_choices)
+        selected_auto_ban_label = next(
+            (
+                label for label, key in auto_ban_choices
+                if key == self._auto_ban_champion()[0]
+            ),
+            "럭스 · Lux",
+        )
+        auto_ban_choice_var = tk.StringVar(value=selected_auto_ban_label)
+        auto_ban_combo = ttk.Combobox(
+            feature_grid, textvariable=auto_ban_choice_var,
+            values=[label for label, _key in auto_ban_choices],
+            state="readonly", width=34, font=("Malgun Gothic", 9),
+        )
+        auto_ban_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), ipady=4)
+        feature_grid.columnconfigure(1, weight=1)
+
         data_outer = tk.Frame(
             settings_body, bg=COLORS["border"], padx=1, pady=1,
         )
@@ -14149,7 +14403,13 @@ class AdvisorApp:
         def set_codex_controls_enabled(enabled: bool) -> None:
             state = "normal" if enabled else "disabled"
             codex_status_button.configure(state=state)
-            memory_send_button.configure(state=state)
+            memory_send_button.configure(
+                state=(
+                    "normal"
+                    if enabled and bool(codex_enabled_var.get()) and not self.demo
+                    else "disabled"
+                )
+            )
 
         def check_codex_status() -> None:
             try:
@@ -14183,6 +14443,18 @@ class AdvisorApp:
             )
 
         def register_codex_memory() -> None:
+            if self.demo:
+                validation_status.configure(
+                    text="데모에서는 Codex CLI로 내용을 전송하지 않습니다.",
+                    fg=COLORS["orange"],
+                )
+                return
+            if not codex_enabled_var.get():
+                validation_status.configure(
+                    text="먼저 ‘픽 추천 사용 (Codex CLI)’을 허용하세요.",
+                    fg=COLORS["orange"],
+                )
+                return
             if self._codex_cli_running:
                 validation_status.configure(
                     text="Codex CLI 요청이 이미 진행 중입니다.", fg=COLORS["orange"]
@@ -14255,6 +14527,10 @@ class AdvisorApp:
             COLORS["blue"], width=17,
         )
         codex_status_button.pack(side="left")
+        codex_check.configure(
+            command=lambda: set_codex_controls_enabled(True)
+        )
+        set_codex_controls_enabled(True)
         tk.Label(
             codex_controls,
             text="빈 thread_id면 새 대화를 만들고 자동 입력합니다.",
@@ -14291,6 +14567,8 @@ class AdvisorApp:
             game_name: str, tag_line: str, new_api_key: str,
             puuid: str = "", codex_thread_id: str = "",
             data_preferences: dict[str, int] | None = None,
+            codex_recommendations_enabled: bool = False,
+            auto_ban_champion_key: int = 99,
         ) -> None:
             self.storage.set_setting("riot_game_name", game_name)
             self.storage.set_setting("riot_tag_line", tag_line)
@@ -14308,11 +14586,20 @@ class AdvisorApp:
                 self.storage.set_setting("codex_memory_version", "")
             for key, value in (data_preferences or {}).items():
                 self.storage.set_setting(key, str(value))
+            self.codex_recommendations_enabled = bool(
+                codex_recommendations_enabled
+            )
+            self.storage.set_setting(
+                "codex_recommendations_enabled",
+                "1" if self.codex_recommendations_enabled else "0",
+            )
+            self._set_auto_ban_champion(auto_ban_champion_key)
             self._reload_data_preferences()
             self._tab_build_refresh_attempted.clear()
             self._synergy_checked_adc = ""
             self._opgg_profiles_checked_signature = ""
             self._selection_panel_signatures.pop("meta", None)
+            self._apply_codex_recommendation_visibility()
             dialog.destroy()
             status_text = (
                 "Riot API 키 검증 및 저장 완료" if new_api_key else "Riot 설정 저장 완료"
@@ -14345,11 +14632,17 @@ class AdvisorApp:
             data_preferences = read_data_preferences()
             if data_preferences is None:
                 return
+            selected_auto_ban_key = auto_ban_key_by_label.get(
+                auto_ban_choice_var.get(), 99,
+            )
+            codex_allowed = bool(codex_enabled_var.get())
             if not new_api_key:
                 finish_save(
                     game_name, tag_line, "",
                     codex_thread_id=codex_thread_id,
                     data_preferences=data_preferences,
+                    codex_recommendations_enabled=codex_allowed,
+                    auto_ban_champion_key=selected_auto_ban_key,
                 )
                 return
             if not game_name or not tag_line:
@@ -14377,6 +14670,8 @@ class AdvisorApp:
                 finish_save(
                     game_name, tag_line, new_api_key, puuid, codex_thread_id,
                     data_preferences,
+                    codex_allowed,
+                    selected_auto_ban_key,
                 )
 
             def error(exc: Exception) -> None:
@@ -14729,6 +15024,7 @@ class AdvisorApp:
         need_identity = not self._identity_checked
         auto_accept_enabled = self.auto_accept_enabled
         lux_auto_ban_enabled = self.lux_auto_ban_enabled
+        auto_ban_champion_key = self._auto_ban_champion()[0]
 
         def work() -> tuple[str, DraftSnapshot | None, dict, dict[str, object]]:
             phase = str(self.lcu.get("/lol-gameflow/v1/gameflow-phase"))
@@ -14757,7 +15053,8 @@ class AdvisorApp:
                 if (
                     lux_auto_ban_enabled
                     and champ_select_timer_phase(session) == "BAN_PICK"
-                    and 99 not in session_banned_champion_ids(session)
+                    and auto_ban_champion_key
+                    not in session_banned_champion_ids(session)
                 ):
                     try:
                         lux_action = find_local_champion_action(
@@ -15937,6 +16234,147 @@ class AdvisorApp:
     def _tick(self) -> None:
         self._render_header()
         self.root.after(1000, self._tick)
+
+    def _demo_history_overview(self) -> HistoryOverview:
+        """Create screenshot-safe solo-queue history using fictional players."""
+        demo_puuid = "demo-player-puuid"
+        now_ms = int(time.time() * 1000)
+        games = [
+            ("Janna", True, 2, 3, 18, 38, (3870, 3158, 6617, 3107, 2055)),
+            ("Thresh", True, 1, 5, 16, 46, (3860, 3117, 3190, 3107, 2055)),
+            ("Leona", False, 1, 8, 11, 41, (3860, 3009, 3190, 3109, 2055)),
+            ("Nami", True, 3, 4, 19, 52, (3870, 3158, 6620, 3107, 2055)),
+            ("Braum", False, 0, 6, 13, 44, (3860, 3117, 3190, 3109, 2055)),
+            ("Janna", True, 1, 2, 21, 61, (3870, 3158, 6617, 3222, 2055)),
+            ("Thresh", False, 2, 7, 9, 35, (3860, 3117, 3109, 3050, 2055)),
+            ("Leona", True, 4, 5, 17, 48, (3860, 3009, 3190, 3107, 2055)),
+            ("Nami", True, 2, 3, 20, 57, (3870, 3158, 6620, 3222, 2055)),
+            ("Braum", False, 1, 9, 10, 39, (3860, 3117, 3190, 3075, 2055)),
+            ("Janna", True, 0, 4, 23, 66, (3870, 3158, 6617, 3107, 2055)),
+            ("Thresh", False, 3, 8, 12, 43, (3860, 3117, 3190, 3109, 2055)),
+        ]
+        ally_champions = ("Garen", "LeeSin", "Ahri", "Jinx")
+        enemy_champions = ("Darius", "Viego", "Syndra", "Samira", "Leona")
+        positions = ("TOP", "JUNGLE", "MIDDLE", "BOTTOM")
+        matches: list[dict[str, object]] = []
+
+        for index, (champion, won, kills, deaths, assists, vision, items) in enumerate(games):
+            duration = 1_470 + index * 37
+            my_team = 100
+            mine = {
+                "puuid": demo_puuid,
+                "teamId": my_team,
+                "championName": champion,
+                "teamPosition": "UTILITY",
+                "riotIdGameName": "DemoPlayer",
+                "riotIdTagline": "DEMO",
+                "win": won,
+                "kills": kills,
+                "deaths": deaths,
+                "assists": assists,
+                "totalMinionsKilled": 29 + index * 2,
+                "neutralMinionsKilled": 0,
+                "visionScore": vision,
+                "totalDamageDealtToChampions": 7_200 + index * 530,
+                "totalDamageTaken": 11_400 + index * 410,
+                "goldEarned": 8_300 + index * 260,
+                "summoner1Id": 4,
+                "summoner2Id": 14 if index % 3 else 3,
+                "timePlayed": duration,
+                "perks": {
+                    "styles": [
+                        {
+                            "description": "primary", "style": 8400,
+                            "selections": [{"perk": 8351}]
+                        },
+                        {
+                            "description": "subStyle", "style": 8300,
+                            "selections": [{"perk": 8340}]
+                        },
+                    ]
+                },
+            }
+            for item_index, item_id in enumerate(items):
+                mine[f"item{item_index}"] = item_id
+            participants: list[dict[str, object]] = [mine]
+            for slot, (ally_champion, position) in enumerate(
+                zip(ally_champions, positions), start=1
+            ):
+                participants.append({
+                    "puuid": f"demo-ally-{index}-{slot}",
+                    "teamId": my_team,
+                    "championName": ally_champion,
+                    "teamPosition": position,
+                    "riotIdGameName": f"Ally{slot}",
+                    "riotIdTagline": "DEMO",
+                    "win": won,
+                    "kills": 3 + (slot + index) % 7,
+                    "deaths": 2 + (slot * 2 + index) % 6,
+                    "assists": 4 + (slot + index) % 9,
+                })
+            for slot, enemy_champion in enumerate(enemy_champions, start=1):
+                participants.append({
+                    "puuid": f"demo-enemy-{index}-{slot}",
+                    "teamId": 200,
+                    "championName": enemy_champion,
+                    "teamPosition": (*positions, "UTILITY")[slot - 1],
+                    "riotIdGameName": f"Enemy{slot}",
+                    "riotIdTagline": "DEMO",
+                    "win": not won,
+                    "kills": 2 + (slot + index) % 6,
+                    "deaths": 3 + (slot * 2 + index) % 7,
+                    "assists": 3 + (slot + index) % 8,
+                })
+            match_id = f"DEMO_{12_000 - index}"
+            matches.append({
+                "metadata": {"matchId": match_id},
+                "info": {
+                    "gameId": 12_000 - index,
+                    "gameCreation": now_ms - index * 7_200_000,
+                    "gameEndTimestamp": now_ms - index * 7_200_000 + duration * 1000,
+                    "gameDuration": duration,
+                    "queueId": 420,
+                    "participants": participants,
+                    "teams": [
+                        {
+                            "teamId": 100, "win": won,
+                            "objectives": {
+                                "dragon": {"kills": 2 + index % 3},
+                                "baron": {"kills": int(index % 2 == 0)},
+                                "riftHerald": {"kills": int(index % 3 == 0)},
+                                "horde": {"kills": 3 + index % 4},
+                                "tower": {"kills": 6 + index % 4},
+                            },
+                        },
+                        {
+                            "teamId": 200, "win": not won,
+                            "objectives": {
+                                "dragon": {"kills": 1 + index % 2},
+                                "baron": {"kills": int(index % 2 == 1)},
+                                "riftHerald": {"kills": int(index % 3 != 0)},
+                                "horde": {"kills": 2 + index % 3},
+                                "tower": {"kills": 3 + index % 5},
+                            },
+                        },
+                    ],
+                },
+            })
+
+        # The demo Storage belongs to a TemporaryDirectory, so these rows are
+        # discarded at exit and can never mix with data/advisor.db.
+        self.storage.save_matches(matches)
+        overview = analyze_history(matches, demo_puuid)
+        for index, entry in enumerate(overview.entries):
+            entry.lp_delta = (19 + index % 4) if entry.won else -(17 + index % 5)
+            entry.lp_confidence = "EXACT"
+            entry.lp_before_rank = f"EMERALD II {42 + index}LP"
+            entry.lp_after_rank = f"EMERALD II {42 + index + entry.lp_delta}LP"
+            entry.predicted_win_rate = 52.0 + ((index * 7) % 13) if entry.won else 47.0
+            entry.predicted_win = entry.predicted_win_rate >= 50.0
+            entry.prediction_confidence = "데모"
+            entry.prediction_correct = entry.predicted_win == entry.won
+        refresh_recent_20_summary(overview)
+        return overview
 
     def _demo_draft(self) -> DraftSnapshot:
         top = DraftMember("Ornn", "오른", "TOP", "HOVER", 0, 1, 1)

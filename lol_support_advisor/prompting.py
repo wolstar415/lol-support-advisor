@@ -16,7 +16,34 @@ ROLE_NAMES = {
     "BOTTOM": "원딜", "SUPPORT": "서포터", "UTILITY": "서포터",
 }
 
-MEMORY_PROMPT_VERSION = "4"
+MEMORY_PROMPT_VERSION = "5"
+
+ROLE_DECISION_FOCUS = {
+    "TOP": [
+        "lane_matchup", "side_lane_and_frontline", "team_engage_and_peel",
+        "damage_balance", "pick_timing_and_blind_safety",
+    ],
+    "JUNGLE": [
+        "jungle_matchup_and_pathing", "lane_gank_synergy", "objective_control",
+        "team_engage_and_peel", "damage_balance", "pick_timing_and_blind_safety",
+    ],
+    "MIDDLE": [
+        "lane_matchup", "roaming_and_jungle_synergy", "team_engage_and_peel",
+        "damage_balance", "pick_timing_and_blind_safety",
+    ],
+    "BOTTOM": [
+        "lane_matchup", "support_synergy", "range_and_damage_profile",
+        "frontline_and_peel", "pick_timing_and_blind_safety",
+    ],
+    "SUPPORT": [
+        "lane_matchup", "ally_adc_synergy", "team_engage_and_peel",
+        "damage_balance", "frontline", "pick_timing_and_blind_safety",
+    ],
+    "UTILITY": [
+        "lane_matchup", "ally_adc_synergy", "team_engage_and_peel",
+        "damage_balance", "frontline", "pick_timing_and_blind_safety",
+    ],
+}
 
 REQUEST_RULES = """LOCKED는 확정, HOVER는 픽 의사, EMPTY/UNKNOWN은 미확정이다.
 밴·확정 픽·다른 아군 HOVER는 추천하지 않는다. 사용자는 모든 챔피언을 보유한다.
@@ -51,8 +78,8 @@ def build_memory_prompt() -> str:
         ],
     }
     return (
-        "LOL_PICK_MEMORY_V4\n"
-        "앞으로 이 채팅에서 LOL_PICK_QUERY_V4가 오면 리그 오브 레전드 픽 추천기로 동작해.\n"
+        "LOL_PICK_MEMORY_V5\n"
+        "앞으로 이 채팅에서 LOL_PICK_QUERY_V5가 오면 리그 오브 레전드 픽 추천기로 동작해.\n"
         + REQUEST_RULES
         + "\nrole은 추천할 내 포지션이고 opponent는 같은 포지션의 상대 챔피언이다. "
           "ally/enemy 항목 형식은 [챔피언ID, 포지션, 상태, 팀내픽순서, 전체픽턴]이다. "
@@ -63,7 +90,7 @@ def build_memory_prompt() -> str:
           "답변은 인사말·설명·마크다운 없이 반드시 아래 패턴의 JSON만 출력해.\n"
           "LOL_SUPPORT_V2\n"
         + json.dumps(response_example, ensure_ascii=False, indent=2)
-        + "\nEND_LOL_SUPPORT_V2\nEND_LOL_PICK_MEMORY_V4"
+        + "\nEND_LOL_SUPPORT_V2\nEND_LOL_PICK_MEMORY_V5"
     )
 
 
@@ -314,17 +341,16 @@ def build_prompt(
         "ally_adc_synergy": _compact_synergy_payload(
             synergy_snapshot, draft, local_synergy_stats,
         ),
-        "decision_focus": [
-            "lane_matchup", "ally_adc_synergy", "team_engage_and_peel",
-            "damage_balance", "frontline", "pick_timing_and_blind_safety",
-        ],
+        "decision_focus": ROLE_DECISION_FOCUS.get(
+            draft.my_role, ROLE_DECISION_FOCUS["SUPPORT"]
+        ),
     }
     return (
-        "LOL_PICK_QUERY_V4\n"
+        "LOL_PICK_QUERY_V5\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        + "\nEND_LOL_PICK_QUERY_V4\n"
+        + "\nEND_LOL_PICK_QUERY_V5\n"
           "파일·명령·웹 도구를 사용하지 말고 위 입력만 즉시 판단해. "
-          "기억한 LOL_PICK_MEMORY_V4 규칙대로 전체 조합 흐름을 종합해 정확히 3개를 "
+          "기억한 LOL_PICK_MEMORY_V5 규칙대로 현재 역할군과 전체 조합 흐름을 종합해 정확히 3개를 "
           "LOL_SUPPORT_V2 형식으로만 답해."
     )
 
