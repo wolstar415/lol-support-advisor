@@ -13,6 +13,14 @@ Windows용 리그 오브 레전드 픽·전적·빌드 보조 데스크톱 앱�
 
 위 화면과 아래 스크린샷은 모두 `--demo`에서 만든 **가상 데이터**입니다. 실제 Riot ID, 전적, API 키 또는 Codex 대화 정보가 포함되지 않습니다.
 
+## Windows EXE 다운로드
+
+[최신 GitHub Release](https://github.com/wolstar415/lol-support-advisor/releases/latest)에서 `LOL-Support-Advisor-v*.exe`를 내려받아 바로 실행할 수 있습니다. EXE 버전은 Python을 별도로 설치할 필요가 없습니다.
+
+- 실행 파일 옆의 `data` 폴더에 설정, 이미지 캐시, 전적 DB가 저장됩니다.
+- 프로젝트는 코드 서명 인증서가 없는 개인 프로젝트이므로 Windows SmartScreen 경고가 나타날 수 있습니다.
+- 릴리스에 함께 첨부된 `SHA256SUMS.txt`로 파일 해시를 확인할 수 있습니다.
+
 ## 주요 화면
 
 | 화면 | 주요 기능 |
@@ -216,6 +224,14 @@ Choose **English** under **Riot Settings → Display language** to switch the ap
 ![Draft demo](docs/images/selection.png)
 
 Every screenshot in this README was captured with `--demo`. It contains fictional data only—no real Riot ID, match history, API key, or Codex conversation data.
+
+### Download the Windows EXE
+
+Download `LOL-Support-Advisor-v*.exe` from the [latest GitHub Release](https://github.com/wolstar415/lol-support-advisor/releases/latest) and run it directly. The packaged EXE does not require a separate Python installation.
+
+- Settings, image caches, and the match database are stored in a `data` folder beside the executable.
+- This personal project is not code-signed, so Windows SmartScreen may show a warning.
+- Use the accompanying `SHA256SUMS.txt` to verify the downloaded file.
 
 ### Main screens
 

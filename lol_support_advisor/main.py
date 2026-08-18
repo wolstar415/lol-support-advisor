@@ -13,6 +13,11 @@ from .ui import AdvisorApp
 
 
 def project_root() -> Path:
+    if getattr(sys, "frozen", False):
+        # PyInstaller one-file apps are extracted into a temporary _MEIPASS
+        # directory. User settings, the Riot key, and match caches must live
+        # beside the portable executable instead of disappearing on exit.
+        return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent.parent
 
 
