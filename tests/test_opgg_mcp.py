@@ -6,8 +6,10 @@ import tempfile
 import unittest
 
 from lol_support_advisor.opgg_mcp import (
-    mcp_champion_token, parse_champion_synergies_text,
-    parse_summoner_matches_text, parse_summoner_profile_text,
+    OPGG_MCP_MATCH_LIMIT_MAX, OPGG_MCP_MATCH_LIMIT_MIN, OpggMcpClient,
+    completed_solo_ranked_matches, mcp_champion_token,
+    parse_champion_synergies_text, parse_summoner_matches_text,
+    parse_summoner_profile_text,
 )
 from lol_support_advisor.storage import Storage
 
@@ -71,6 +73,40 @@ class OpggMcpTests(unittest.TestCase):
         ))
         self.assertEqual((matches[0].result, matches[0].op_score_rank), ("WIN", 2))
         self.assertEqual(matches[2].result, "UNKNOWN")
+
+    def test_completed_solo_ranked_filter_excludes_unfinished_rows(self) -> None:
+        matches = completed_solo_ranked_matches(
+            parse_summoner_matches_text(MATCHES_TEXT)
+        )
+        self.assertEqual([match.match_id for match in matches], ["KR_1", "KR_2"])
+
+    def test_client_uses_public_limit_bounds_and_returns_only_completed_solo(
+        self,
+    ) -> None:
+        class RecordingClient(OpggMcpClient):
+            def __init__(self) -> None:
+                super().__init__(endpoint="https://example.invalid")
+                self.calls: list[tuple[str, dict]] = []
+
+            def connect(self) -> None:
+                return
+
+            def _request(self, method: str, params: dict) -> dict:
+                self.calls.append((method, params))
+                return {"content": [{"type": "text", "text": MATCHES_TEXT}]}
+
+        client = RecordingClient()
+        matches = client.summoner_recent_matches("테스트 유저", "KR1", limit=1)
+        arguments = client.calls[-1][1]["arguments"]
+        self.assertEqual(arguments["limit"], OPGG_MCP_MATCH_LIMIT_MIN)
+        self.assertEqual([match.match_id for match in matches], ["KR_1", "KR_2"])
+
+        client.summoner_recent_matches("테스트 유저", "KR1", limit=1000)
+        arguments = client.calls[-1][1]["arguments"]
+        self.assertEqual(arguments["limit"], OPGG_MCP_MATCH_LIMIT_MAX)
+        self.assertNotIn("page", arguments)
+        self.assertNotIn("cursor", arguments)
+        self.assertNotIn("offset", arguments)
 
     def test_profile_parser_reads_rank_and_champion_season_record(self) -> None:
         profile = parse_summoner_profile_text(

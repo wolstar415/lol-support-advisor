@@ -8,6 +8,7 @@ import sqlite3
 import threading
 from typing import Any, Iterable, Iterator
 
+from .history import MatchLpChange, RankSnapshot
 from .models import (
     ChampionBuildGuide, GamePrediction, JungleTendencyStat,
     OpggMcpSummonerProfile, OpggSnapshot,
@@ -90,6 +91,8 @@ class Storage:
                     match_id TEXT PRIMARY KEY,
                     game_creation INTEGER NOT NULL DEFAULT 0,
                     queue_id INTEGER NOT NULL DEFAULT 0,
+                    cached_at TEXT NOT NULL DEFAULT '',
+                    protected_owner_puuid TEXT NOT NULL DEFAULT '',
                     payload_json TEXT NOT NULL
                 );
                 CREATE INDEX IF NOT EXISTS idx_matches_game_creation
@@ -105,6 +108,17 @@ class Storage:
                     puuid TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS player_match_pages (
+                    riot_id TEXT NOT NULL COLLATE NOCASE,
+                    page_start INTEGER NOT NULL,
+                    puuid TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    has_more INTEGER NOT NULL DEFAULT 1,
+                    match_ids_json TEXT NOT NULL,
+                    PRIMARY KEY(riot_id, page_start)
+                );
+                CREATE INDEX IF NOT EXISTS idx_player_match_pages_updated
+                    ON player_match_pages(updated_at);
                 CREATE TABLE IF NOT EXISTS game_predictions (
                     prediction_key TEXT PRIMARY KEY,
                     created_at TEXT NOT NULL,
@@ -114,7 +128,63 @@ class Storage:
                 );
                 CREATE INDEX IF NOT EXISTS idx_game_predictions_created_at
                     ON game_predictions(created_at DESC);
+                CREATE TABLE IF NOT EXISTS rank_snapshots (
+                    snapshot_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    puuid TEXT NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    stage TEXT NOT NULL,
+                    session_key TEXT NOT NULL DEFAULT '',
+                    tier TEXT NOT NULL,
+                    division TEXT NOT NULL DEFAULT '',
+                    league_points INTEGER NOT NULL,
+                    wins INTEGER NOT NULL,
+                    losses INTEGER NOT NULL,
+                    source TEXT NOT NULL DEFAULT 'RIOT_LEAGUE_V4'
+                );
+                CREATE INDEX IF NOT EXISTS idx_rank_snapshots_player_time
+                    ON rank_snapshots(puuid, observed_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_rank_snapshots_session_stage
+                    ON rank_snapshots(puuid, session_key, stage)
+                    WHERE session_key <> '';
+                CREATE TABLE IF NOT EXISTS match_lp_changes (
+                    match_id TEXT PRIMARY KEY,
+                    puuid TEXT NOT NULL,
+                    before_snapshot_id INTEGER NOT NULL,
+                    after_snapshot_id INTEGER NOT NULL,
+                    before_tier TEXT NOT NULL,
+                    before_division TEXT NOT NULL DEFAULT '',
+                    before_lp INTEGER NOT NULL,
+                    after_tier TEXT NOT NULL,
+                    after_division TEXT NOT NULL DEFAULT '',
+                    after_lp INTEGER NOT NULL,
+                    lp_delta INTEGER,
+                    confidence TEXT NOT NULL,
+                    resolved_at TEXT NOT NULL,
+                    UNIQUE(puuid, before_snapshot_id, after_snapshot_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_match_lp_changes_player
+                    ON match_lp_changes(puuid, resolved_at DESC);
                 """
+            )
+            match_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(matches)").fetchall()
+            }
+            if "cached_at" not in match_columns:
+                connection.execute(
+                    "ALTER TABLE matches ADD COLUMN cached_at TEXT NOT NULL DEFAULT ''"
+                )
+            if "protected_owner_puuid" not in match_columns:
+                connection.execute(
+                    "ALTER TABLE matches ADD COLUMN protected_owner_puuid "
+                    "TEXT NOT NULL DEFAULT ''"
+                )
+            # Old databases cannot tell when a non-owner match was cached.
+            # Give those rows one full retention window instead of guessing
+            # from the date the game itself was played.
+            connection.execute(
+                "UPDATE matches SET cached_at = ? WHERE cached_at = ''",
+                (datetime.now().isoformat(timespec="seconds"),),
             )
             identity_count = int(
                 connection.execute("SELECT COUNT(*) AS count FROM player_identities").fetchone()["count"]
@@ -510,8 +580,8 @@ class Storage:
         remaining = updated_at + timedelta(hours=hours) - (now or datetime.now())
         return max(remaining, timedelta(0))
 
-    def save_game_prediction(self, prediction: GamePrediction) -> None:
-        """Upsert one local pre-game estimate without changing a matched result."""
+    def save_game_prediction(self, prediction: GamePrediction) -> GamePrediction:
+        """Persist the first eligible estimate as the immutable accuracy baseline."""
         now = datetime.now().isoformat(timespec="seconds")
         with self._connect() as connection:
             existing = connection.execute(
@@ -519,17 +589,33 @@ class Storage:
                 "WHERE prediction_key = ?",
                 (prediction.prediction_key,),
             ).fetchone()
-            if existing and existing["match_id"]:
-                return
             if existing:
-                prediction.captured_at = str(existing["created_at"])
+                try:
+                    stored = GamePrediction.from_dict(
+                        json.loads(existing["payload_json"])
+                    )
+                    stored.captured_at = str(existing["created_at"])
+                    return stored
+                except (ValueError, TypeError, KeyError):
+                    # A corrupt row can be repaired only while it has not yet
+                    # been attached to a real match.
+                    if existing["match_id"]:
+                        return prediction
+                    connection.execute(
+                        "UPDATE game_predictions SET created_at = ?, updated_at = ?, "
+                        "payload_json = ? WHERE prediction_key = ? AND match_id IS NULL",
+                        (
+                            prediction.captured_at,
+                            now,
+                            json.dumps(prediction.to_dict(), ensure_ascii=False),
+                            prediction.prediction_key,
+                        ),
+                    )
+                    return prediction
             connection.execute(
                 "INSERT INTO game_predictions("
                 "prediction_key, created_at, updated_at, match_id, payload_json"
-                ") VALUES(?, ?, ?, NULL, ?) "
-                "ON CONFLICT(prediction_key) DO UPDATE SET "
-                "updated_at = excluded.updated_at, payload_json = excluded.payload_json "
-                "WHERE game_predictions.match_id IS NULL",
+                ") VALUES(?, ?, ?, NULL, ?)",
                 (
                     prediction.prediction_key,
                     prediction.captured_at,
@@ -537,6 +623,27 @@ class Storage:
                     json.dumps(prediction.to_dict(), ensure_ascii=False),
                 ),
             )
+        return prediction
+
+    def load_game_prediction_by_key(
+        self, prediction_key: str,
+    ) -> GamePrediction | None:
+        if not prediction_key:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT created_at, payload_json FROM game_predictions "
+                "WHERE prediction_key = ?",
+                (prediction_key,),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            prediction = GamePrediction.from_dict(json.loads(row["payload_json"]))
+        except (ValueError, TypeError, KeyError):
+            return None
+        prediction.captured_at = str(row["created_at"])
+        return prediction
 
     def load_game_predictions(
         self, match_ids: Iterable[str],
@@ -720,6 +827,489 @@ class Storage:
             resolved += 1
         return resolved
 
+    @staticmethod
+    def _rank_snapshot_from_row(row: sqlite3.Row) -> RankSnapshot:
+        return RankSnapshot(
+            snapshot_id=int(row["snapshot_id"]),
+            puuid=str(row["puuid"]),
+            observed_at=str(row["observed_at"]),
+            stage=str(row["stage"]),
+            session_key=str(row["session_key"]),
+            tier=str(row["tier"]),
+            division=str(row["division"]),
+            league_points=int(row["league_points"]),
+            wins=int(row["wins"]),
+            losses=int(row["losses"]),
+            source=str(row["source"]),
+        )
+
+    def save_rank_snapshot(
+        self,
+        puuid: str,
+        solo_entry: dict[str, Any] | None,
+        *,
+        stage: str,
+        session_key: str = "",
+        observed_at: datetime | str | None = None,
+        source: str = "RIOT_LEAGUE_V4",
+    ) -> RankSnapshot | None:
+        """Persist one pre/post solo-rank observation.
+
+        A keyed PRE observation is immutable: retrying after a restart must not
+        replace the actual baseline with a post-game rank.  Keyed POST rows are
+        updated in place so Riot's initially stale league response can settle.
+        """
+        normalized_puuid = str(puuid or "").strip()
+        if not normalized_puuid:
+            return None
+        entry = dict(solo_entry or {})
+        queue_type = str(
+            entry.get("queueType") or "RANKED_SOLO_5x5"
+        ).upper()
+        if queue_type != "RANKED_SOLO_5X5":
+            return None
+        normalized_stage = str(stage or "OBSERVED").strip().upper()
+        normalized_session = str(session_key or "").strip()
+        if isinstance(observed_at, datetime):
+            stamp = observed_at.isoformat(timespec="seconds")
+        elif observed_at is None:
+            stamp = datetime.now().isoformat(timespec="seconds")
+        else:
+            stamp = str(observed_at).strip()
+            # Reject malformed timestamps now rather than creating an
+            # observation that can never be matched safely.
+            datetime.fromisoformat(stamp)
+        tier = str(entry.get("tier") or "UNRANKED").strip().upper()
+        division = str(entry.get("rank") or "").strip().upper()
+
+        def bounded_integer(key: str) -> int:
+            try:
+                return max(0, int(entry.get(key) or 0))
+            except (TypeError, ValueError):
+                return 0
+
+        values = (
+            tier, division, bounded_integer("leaguePoints"),
+            bounded_integer("wins"), bounded_integer("losses"),
+            str(source or "RIOT_LEAGUE_V4").strip() or "RIOT_LEAGUE_V4",
+        )
+        with self._connect() as connection:
+            existing = None
+            if normalized_session:
+                existing = connection.execute(
+                    "SELECT * FROM rank_snapshots WHERE puuid = ? "
+                    "AND session_key = ? AND stage = ?",
+                    (normalized_puuid, normalized_session, normalized_stage),
+                ).fetchone()
+            else:
+                existing = connection.execute(
+                    "SELECT * FROM rank_snapshots WHERE puuid = ? "
+                    "AND session_key = '' AND stage = ? AND observed_at = ?",
+                    (normalized_puuid, normalized_stage, stamp),
+                ).fetchone()
+            if existing and normalized_stage == "PRE":
+                return self._rank_snapshot_from_row(existing)
+            if existing:
+                connection.execute(
+                    "UPDATE rank_snapshots SET observed_at = ?, tier = ?, "
+                    "division = ?, league_points = ?, wins = ?, losses = ?, "
+                    "source = ? WHERE snapshot_id = ?",
+                    (stamp, *values, int(existing["snapshot_id"])),
+                )
+                snapshot_id = int(existing["snapshot_id"])
+            else:
+                cursor = connection.execute(
+                    "INSERT INTO rank_snapshots("
+                    "puuid, observed_at, stage, session_key, tier, division, "
+                    "league_points, wins, losses, source"
+                    ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (
+                        normalized_puuid, stamp, normalized_stage,
+                        normalized_session, *values,
+                    ),
+                )
+                snapshot_id = int(cursor.lastrowid)
+            row = connection.execute(
+                "SELECT * FROM rank_snapshots WHERE snapshot_id = ?",
+                (snapshot_id,),
+            ).fetchone()
+        return self._rank_snapshot_from_row(row)
+
+    def load_rank_snapshots(
+        self, puuid: str, *, limit: int = 200,
+    ) -> list[RankSnapshot]:
+        if not puuid or limit <= 0:
+            return []
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM ("
+                "SELECT * FROM rank_snapshots WHERE puuid = ? "
+                "ORDER BY observed_at DESC, snapshot_id DESC LIMIT ?"
+                ") ORDER BY observed_at ASC, snapshot_id ASC",
+                (puuid, int(limit)),
+            ).fetchall()
+        return [self._rank_snapshot_from_row(row) for row in rows]
+
+    @staticmethod
+    def _match_lp_change_from_row(row: sqlite3.Row) -> MatchLpChange:
+        raw_delta = row["lp_delta"]
+        return MatchLpChange(
+            match_id=str(row["match_id"]),
+            puuid=str(row["puuid"]),
+            before_snapshot_id=int(row["before_snapshot_id"]),
+            after_snapshot_id=int(row["after_snapshot_id"]),
+            before_tier=str(row["before_tier"]),
+            before_division=str(row["before_division"]),
+            before_lp=int(row["before_lp"]),
+            after_tier=str(row["after_tier"]),
+            after_division=str(row["after_division"]),
+            after_lp=int(row["after_lp"]),
+            lp_delta=int(raw_delta) if raw_delta is not None else None,
+            confidence=str(row["confidence"]),
+            resolved_at=str(row["resolved_at"]),
+        )
+
+    def load_match_lp_changes(
+        self, match_ids: Iterable[str],
+    ) -> dict[str, MatchLpChange]:
+        ids = list(dict.fromkeys(str(match_id) for match_id in match_ids if match_id))
+        result: dict[str, MatchLpChange] = {}
+        with self._connect() as connection:
+            for offset in range(0, len(ids), 400):
+                chunk = ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                rows = connection.execute(
+                    f"SELECT * FROM match_lp_changes WHERE match_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                for row in rows:
+                    change = self._match_lp_change_from_row(row)
+                    result[change.match_id] = change
+        return result
+
+    @staticmethod
+    def _snapshot_epoch(snapshot: RankSnapshot) -> float:
+        return datetime.fromisoformat(snapshot.observed_at).timestamp()
+
+    @staticmethod
+    def _match_end_epoch(match: dict[str, Any]) -> float:
+        info = match.get("info") or {}
+        try:
+            explicit = int(info.get("gameEndTimestamp") or 0)
+        except (TypeError, ValueError):
+            explicit = 0
+        if explicit:
+            return explicit / 1000.0
+        try:
+            creation = int(info.get("gameCreation") or 0) / 1000.0
+        except (TypeError, ValueError):
+            creation = 0.0
+        try:
+            duration = max(0, int(info.get("gameDuration") or 0))
+        except (TypeError, ValueError):
+            duration = 0
+        return creation + duration
+
+    @staticmethod
+    def _match_player_result(
+        match: dict[str, Any], puuid: str,
+    ) -> bool | None:
+        participants = (match.get("info") or {}).get("participants") or []
+        player = next(
+            (participant for participant in participants
+             if str(participant.get("puuid") or "") == puuid),
+            None,
+        )
+        return bool(player.get("win")) if player is not None else None
+
+    @staticmethod
+    def _rank_transition_delta(
+        before: RankSnapshot, after: RankSnapshot, won: bool,
+    ) -> tuple[int | None, str]:
+        same_rank = (
+            before.tier == after.tier
+            and before.division == after.division
+            and before.tier != "UNRANKED"
+        )
+        if not same_rank:
+            # League-v4 gives states, not the awarded LP.  Across promotion,
+            # demotion, placements, or apex tier changes retain the transition
+            # but do not invent a numeric 100-LP conversion.
+            return None, "TRANSITION"
+        delta = after.league_points - before.league_points
+        if (won and delta < 0) or (not won and delta > 0):
+            return None, "UNKNOWN"
+        return delta, "EXACT"
+
+    def resolve_match_lp_changes(
+        self, puuid: str, matches: Iterable[dict[str, Any]],
+    ) -> int:
+        """Link only unambiguous PRE/POST rank observations to solo matches."""
+        snapshots = self.load_rank_snapshots(puuid)
+        match_list = list(matches)
+        if not puuid or len(snapshots) < 2 or not match_list:
+            return 0
+        with self._connect() as connection:
+            existing_rows = connection.execute(
+                "SELECT match_id, before_snapshot_id, after_snapshot_id "
+                "FROM match_lp_changes WHERE puuid = ?",
+                (puuid,),
+            ).fetchall()
+        used_matches = {str(row["match_id"]) for row in existing_rows}
+        used_pairs = {
+            (int(row["before_snapshot_id"]), int(row["after_snapshot_id"]))
+            for row in existing_rows
+        }
+        solo_matches: list[tuple[str, float, bool]] = []
+        for match in match_list:
+            info = match.get("info") or {}
+            if int(info.get("queueId") or 0) != 420:
+                continue
+            match_id = str(
+                (match.get("metadata") or {}).get("matchId")
+                or info.get("gameId") or ""
+            )
+            result = self._match_player_result(match, puuid)
+            if not match_id or result is None:
+                continue
+            solo_matches.append((match_id, self._match_end_epoch(match), result))
+
+        resolved = 0
+        for before_index, before in enumerate(snapshots[:-1]):
+            if before.stage != "PRE":
+                continue
+            before_time = self._snapshot_epoch(before)
+            for after in snapshots[before_index + 1:]:
+                if after.stage == "PRE":
+                    # A new tracked game started before the former session got
+                    # a trustworthy post state. Never span across it.
+                    break
+                if after.stage not in {"POST", "RECOVERY"}:
+                    continue
+                if (
+                    before.session_key and after.session_key
+                    and before.session_key != after.session_key
+                ):
+                    continue
+                pair = (before.snapshot_id, after.snapshot_id)
+                if pair in used_pairs:
+                    break
+                wins_delta = after.wins - before.wins
+                losses_delta = after.losses - before.losses
+                if wins_delta < 0 or losses_delta < 0:
+                    break
+                if wins_delta + losses_delta == 0:
+                    continue
+                if wins_delta + losses_delta != 1:
+                    break
+                after_time = self._snapshot_epoch(after)
+                candidates = [
+                    item for item in solo_matches
+                    if item[0] not in used_matches
+                    and before_time < item[1] <= after_time
+                ]
+                if len(candidates) != 1:
+                    continue
+                match_id, _ended_at, won = candidates[0]
+                if (wins_delta, losses_delta) != ((1, 0) if won else (0, 1)):
+                    continue
+                lp_delta, confidence = self._rank_transition_delta(
+                    before, after, won,
+                )
+                resolved_at = datetime.now().isoformat(timespec="seconds")
+                with self._connect() as connection:
+                    cursor = connection.execute(
+                        "INSERT OR IGNORE INTO match_lp_changes("
+                        "match_id, puuid, before_snapshot_id, after_snapshot_id, "
+                        "before_tier, before_division, before_lp, after_tier, "
+                        "after_division, after_lp, lp_delta, confidence, resolved_at"
+                        ") VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            match_id, puuid, before.snapshot_id,
+                            after.snapshot_id, before.tier, before.division,
+                            before.league_points, after.tier, after.division,
+                            after.league_points, lp_delta, confidence, resolved_at,
+                        ),
+                    )
+                if cursor.rowcount:
+                    used_matches.add(match_id)
+                    used_pairs.add(pair)
+                    resolved += 1
+                break
+        return resolved
+
+    def prune_non_owner_data(
+        self,
+        owner_puuid: str,
+        owner_riot_id: str,
+        now: datetime | None = None,
+        days: int = 1,
+    ) -> dict[str, int]:
+        """Delete only stale non-owner cache rows.
+
+        Owner match history is the durable local record and is never aged out.
+        Malformed match payloads are also retained because absence of owner
+        evidence cannot be proven safely.
+        """
+        normalized_puuid = str(owner_puuid or "").strip()
+        normalized_riot_id = str(owner_riot_id or "").strip()
+        if not normalized_puuid or not normalized_riot_id:
+            raise ValueError("owner_puuid and owner_riot_id are required")
+        current = now or datetime.now()
+        cutoff = current - timedelta(days=max(1, int(days)))
+
+        def stale_timestamp(value: object) -> bool:
+            try:
+                observed = datetime.fromisoformat(str(value))
+            except (TypeError, ValueError):
+                return False
+            comparable_cutoff = cutoff
+            if observed.tzinfo is None and comparable_cutoff.tzinfo is not None:
+                observed = observed.replace(tzinfo=comparable_cutoff.tzinfo)
+            elif observed.tzinfo is not None and comparable_cutoff.tzinfo is None:
+                comparable_cutoff = comparable_cutoff.replace(tzinfo=observed.tzinfo)
+            return observed < comparable_cutoff
+
+        deleted_match_rows: list[tuple[str, str]] = []
+        deleted = {
+            "matches": 0,
+            "live_profiles": 0,
+            "opgg_player_profiles": 0,
+            "player_identities": 0,
+            "player_match_pages": 0,
+        }
+        with self._connect() as connection:
+            old_matches = connection.execute(
+                "SELECT match_id, payload_json, cached_at FROM matches "
+                "WHERE protected_owner_puuid = '' "
+                "OR protected_owner_puuid != ?",
+                (normalized_puuid,),
+            ).fetchall()
+            protected_owner_ids: list[str] = []
+            for row in old_matches:
+                if not stale_timestamp(row["cached_at"]):
+                    continue
+                try:
+                    payload = json.loads(row["payload_json"])
+                    participants = (payload.get("info") or {}).get("participants") or []
+                except (ValueError, TypeError, AttributeError):
+                    continue
+                if any(
+                    str(participant.get("puuid") or "") == normalized_puuid
+                    for participant in participants
+                    if isinstance(participant, dict)
+                ):
+                    protected_owner_ids.append(str(row["match_id"]))
+                    continue
+                deleted_match_rows.append(
+                    (str(row["match_id"]), str(row["cached_at"]))
+                )
+            for offset in range(0, len(protected_owner_ids), 400):
+                chunk = protected_owner_ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                connection.execute(
+                    f"UPDATE matches SET protected_owner_puuid = ? "
+                    f"WHERE match_id IN ({placeholders})",
+                    (normalized_puuid, *chunk),
+                )
+            deleted_match_ids: list[str] = []
+            for match_id, cached_at in deleted_match_rows:
+                cursor = connection.execute(
+                    "DELETE FROM matches WHERE match_id = ? AND cached_at = ? "
+                    "AND (protected_owner_puuid = '' OR protected_owner_puuid != ?)",
+                    (match_id, cached_at, normalized_puuid),
+                )
+                if cursor.rowcount:
+                    deleted_match_ids.append(match_id)
+            deleted["matches"] = len(deleted_match_ids)
+
+            page_rows = connection.execute(
+                "SELECT riot_id, page_start, updated_at FROM player_match_pages"
+            ).fetchall()
+            stale_pages = [
+                (
+                    str(row["riot_id"]), int(row["page_start"]),
+                    str(row["updated_at"]),
+                )
+                for row in page_rows
+                if str(row["riot_id"]).casefold() != normalized_riot_id.casefold()
+                and stale_timestamp(row["updated_at"])
+            ]
+            deleted_pages = 0
+            for riot_id, page_start, updated_at in stale_pages:
+                cursor = connection.execute(
+                    "DELETE FROM player_match_pages "
+                    "WHERE riot_id = ? COLLATE NOCASE AND page_start = ? "
+                    "AND updated_at = ?",
+                    (riot_id, page_start, updated_at),
+                )
+                deleted_pages += int(bool(cursor.rowcount))
+            deleted["player_match_pages"] = deleted_pages
+
+            live_rows = connection.execute(
+                "SELECT riot_id, puuid, updated_at FROM live_profiles"
+            ).fetchall()
+            stale_live_ids = [
+                (str(row["riot_id"]), str(row["updated_at"])) for row in live_rows
+                if str(row["puuid"]) != normalized_puuid
+                and str(row["riot_id"]).casefold() != normalized_riot_id.casefold()
+                and stale_timestamp(row["updated_at"])
+            ]
+            deleted_live = 0
+            for riot_id, updated_at in stale_live_ids:
+                cursor = connection.execute(
+                    "DELETE FROM live_profiles WHERE riot_id = ? AND updated_at = ?",
+                    (riot_id, updated_at),
+                )
+                deleted_live += int(bool(cursor.rowcount))
+            deleted["live_profiles"] = deleted_live
+
+            opgg_rows = connection.execute(
+                "SELECT riot_id, updated_at FROM opgg_player_profiles"
+            ).fetchall()
+            stale_opgg_ids = [
+                (str(row["riot_id"]), str(row["updated_at"])) for row in opgg_rows
+                if str(row["riot_id"]).casefold() != normalized_riot_id.casefold()
+                and stale_timestamp(row["updated_at"])
+            ]
+            deleted_opgg = 0
+            for riot_id, updated_at in stale_opgg_ids:
+                cursor = connection.execute(
+                    "DELETE FROM opgg_player_profiles WHERE riot_id = ? COLLATE NOCASE "
+                    "AND updated_at = ?",
+                    (riot_id, updated_at),
+                )
+                deleted_opgg += int(bool(cursor.rowcount))
+            deleted["opgg_player_profiles"] = deleted_opgg
+
+            identity_rows = connection.execute(
+                "SELECT riot_id, puuid, updated_at FROM player_identities"
+            ).fetchall()
+            stale_identity_ids = [
+                (str(row["riot_id"]), str(row["updated_at"])) for row in identity_rows
+                if str(row["puuid"]) != normalized_puuid
+                and str(row["riot_id"]).casefold() != normalized_riot_id.casefold()
+                and stale_timestamp(row["updated_at"])
+            ]
+            deleted_identities = 0
+            for riot_id, updated_at in stale_identity_ids:
+                cursor = connection.execute(
+                    "DELETE FROM player_identities WHERE riot_id = ? COLLATE NOCASE "
+                    "AND updated_at = ?",
+                    (riot_id, updated_at),
+                )
+                deleted_identities += int(bool(cursor.rowcount))
+            deleted["player_identities"] = deleted_identities
+
+        if deleted_match_ids:
+            # Match-derived readers share both caches. Invalidating rather than
+            # mutating in place avoids stale counts and stale decoded payloads.
+            with self._match_revision_lock:
+                self._match_revision_cache = None
+            with self._decoded_match_cache_lock:
+                self._decoded_match_cache = None
+        return deleted
+
     def known_match_ids(self) -> set[str]:
         with self._connect() as connection:
             rows = connection.execute("SELECT match_id FROM matches").fetchall()
@@ -790,9 +1380,14 @@ class Storage:
             self._decoded_match_cache = tuple(decoded)
             return self._decoded_match_cache
 
-    def save_matches(self, matches: Iterable[dict[str, Any]]) -> int:
+    def save_matches(
+        self,
+        matches: Iterable[dict[str, Any]],
+        cached_at: datetime | None = None,
+    ) -> int:
         saved = 0
         cache_updates: list[tuple[str, int, dict[str, Any]]] = []
+        cache_stamp = (cached_at or datetime.now()).isoformat(timespec="seconds")
         with self._connect() as connection:
             for match in matches:
                 metadata = match.get("metadata", {})
@@ -801,20 +1396,22 @@ class Storage:
                 if not match_id:
                     continue
                 connection.execute(
-                    "INSERT INTO matches(match_id, game_creation, queue_id, payload_json) "
-                    "VALUES(?, ?, ?, ?) ON CONFLICT(match_id) DO UPDATE SET "
+                    "INSERT INTO matches(match_id, game_creation, queue_id, cached_at, payload_json) "
+                    "VALUES(?, ?, ?, ?, ?) ON CONFLICT(match_id) DO UPDATE SET "
                     "game_creation = excluded.game_creation, queue_id = excluded.queue_id, "
-                    "payload_json = excluded.payload_json",
+                    "cached_at = excluded.cached_at, payload_json = excluded.payload_json",
                     (
                         match_id,
                         int(info.get("gameCreation", 0)),
                         int(info.get("queueId", 0)),
+                        cache_stamp,
                         json.dumps(match, ensure_ascii=False),
                     ),
                 )
-                identity_stamp = datetime.fromtimestamp(
-                    int(info.get("gameCreation", 0)) / 1000
-                ).isoformat(timespec="seconds") if int(info.get("gameCreation", 0)) else datetime.now().isoformat(timespec="seconds")
+                # Identity retention is based on when this program observed the
+                # player, not when an old match happened. Otherwise newly
+                # downloaded older pages would be deleted immediately.
+                identity_stamp = cache_stamp
                 for participant in info.get("participants", []):
                     game_name = str(participant.get("riotIdGameName") or "").strip()
                     tag_line = str(
@@ -827,13 +1424,40 @@ class Storage:
                         connection.execute(
                             "INSERT INTO player_identities(riot_id, puuid, updated_at) VALUES(?, ?, ?) "
                             "ON CONFLICT(riot_id) DO UPDATE SET puuid = excluded.puuid, "
-                            "updated_at = excluded.updated_at",
+                            "updated_at = CASE "
+                            "WHEN player_identities.updated_at >= excluded.updated_at "
+                            "THEN player_identities.updated_at ELSE excluded.updated_at END",
                             (f"{game_name}#{tag_line}", participant_puuid, identity_stamp),
                         )
                 cache_updates.append((match_id, int(info.get("queueId", 0)), match))
                 saved += 1
         self._merge_decoded_match_cache(cache_updates)
         return saved
+
+    def touch_match_cache(
+        self, match_ids: Iterable[str], when: datetime | None = None,
+    ) -> int:
+        """Refresh retention for cached details reused by an explicit page."""
+        unique_ids = list(dict.fromkeys(
+            str(match_id).strip()
+            for match_id in match_ids
+            if str(match_id).strip()
+        ))
+        if not unique_ids:
+            return 0
+        stamp = (when or datetime.now()).isoformat(timespec="seconds")
+        updated = 0
+        with self._connect() as connection:
+            for offset in range(0, len(unique_ids), 400):
+                chunk = unique_ids[offset:offset + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                cursor = connection.execute(
+                    f"UPDATE matches SET cached_at = ? "
+                    f"WHERE match_id IN ({placeholders})",
+                    (stamp, *chunk),
+                )
+                updated += max(int(cursor.rowcount or 0), 0)
+        return updated
 
     def count_matches(self) -> int:
         return self.match_revision()[0]
@@ -889,6 +1513,96 @@ class Storage:
                 "updated_at = excluded.updated_at",
                 (riot_id, puuid, updated_at),
             )
+
+    def save_player_match_page(
+        self,
+        riot_id: str,
+        puuid: str,
+        page_start: int,
+        match_ids: Iterable[str],
+        has_more: bool,
+        updated_at: datetime | None = None,
+    ) -> None:
+        """Persist one explicit ten-game Riot page as its own cache unit."""
+        normalized_id = str(riot_id or "").strip()
+        normalized_puuid = str(puuid or "").strip()
+        if not normalized_id or not normalized_puuid:
+            return
+        page = list(dict.fromkeys(
+            str(match_id).strip()
+            for match_id in match_ids
+            if str(match_id).strip()
+        ))[:10]
+        stamp = (updated_at or datetime.now()).isoformat(timespec="seconds")
+        page_start = max(int(page_start), 0)
+        with self._connect() as connection:
+            previous = connection.execute(
+                "SELECT match_ids_json FROM player_match_pages "
+                "WHERE riot_id = ? COLLATE NOCASE AND page_start = ?",
+                (normalized_id, page_start),
+            ).fetchone()
+            previous_ids = str(previous["match_ids_json"]) if previous else ""
+            page_json = json.dumps(page, ensure_ascii=False)
+            connection.execute(
+                "INSERT INTO player_match_pages("
+                "riot_id, page_start, puuid, updated_at, has_more, match_ids_json"
+                ") VALUES(?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(riot_id, page_start) DO UPDATE SET "
+                "puuid = excluded.puuid, updated_at = excluded.updated_at, "
+                "has_more = excluded.has_more, match_ids_json = excluded.match_ids_json",
+                (
+                    normalized_id,
+                    page_start,
+                    normalized_puuid,
+                    stamp,
+                    int(bool(has_more)),
+                    page_json,
+                ),
+            )
+            # A new match shifts every later offset. Keep deeper cached pages
+            # only while the preceding page's exact IDs are unchanged.
+            if previous is None or previous_ids != page_json or not has_more:
+                connection.execute(
+                    "DELETE FROM player_match_pages "
+                    "WHERE riot_id = ? COLLATE NOCASE AND page_start > ?",
+                    (normalized_id, page_start),
+                )
+
+    def load_player_match_page(
+        self,
+        riot_id: str,
+        page_start: int,
+        max_age: timedelta | None = None,
+    ) -> tuple[str, list[str], bool, str] | None:
+        """Load a saved page; ``max_age=None`` deliberately accepts stale data."""
+        normalized_id = str(riot_id or "").strip()
+        if not normalized_id:
+            return None
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT puuid, updated_at, has_more, match_ids_json "
+                "FROM player_match_pages WHERE riot_id = ? COLLATE NOCASE "
+                "AND page_start = ?",
+                (normalized_id, max(int(page_start), 0)),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            updated_at = datetime.fromisoformat(str(row["updated_at"]))
+            match_ids = [
+                str(match_id) for match_id in json.loads(row["match_ids_json"])
+                if str(match_id).strip()
+            ][:10]
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return None
+        if max_age is not None and datetime.now() - updated_at > max_age:
+            return None
+        return (
+            str(row["puuid"]),
+            match_ids,
+            bool(row["has_more"]),
+            str(row["updated_at"]),
+        )
 
     def load_match(self, match_id: str) -> dict[str, Any] | None:
         with self._connect() as connection:

@@ -74,6 +74,25 @@ class RiotApiClient:
                 break
         return ids
 
+    def match_id_page(
+        self, puuid: str, start: int = 0, count: int = 10
+    ) -> list[str]:
+        """Fetch one solo-ranked Match-v5 ID page for an inspected player.
+
+        This deliberately stays separate from :meth:`match_ids`, whose larger
+        paging behavior is reserved for the owner's local history sync.  A
+        player-history tab must never turn into a 1,000-game fan-out, so both
+        the requested offset and the page size are normalized here and exactly
+        one Match-v5 IDs request is made.
+        """
+        page_start = max(0, int(start))
+        page_size = max(1, min(int(count), 10))
+        result = self._get(
+            "https://asia.api.riotgames.com/lol/match/v5/matches/by-puuid/"
+            f"{quote(puuid, safe='')}/ids?queue=420&start={page_start}&count={page_size}"
+        )
+        return [str(item) for item in list(result)[:page_size]]
+
     def match(self, match_id: str) -> dict[str, Any]:
         return self._get(
             f"https://asia.api.riotgames.com/lol/match/v5/matches/{quote(match_id, safe='')}"
@@ -114,6 +133,71 @@ class RiotApiClient:
         payload = {"solo_entry": solo_entry, "recent_match_count": len(ids)}
         storage.save_live_profile(f"{game_name}#{tag_line}", puuid, payload)
         return puuid, payload, len(fetched)
+
+    def sync_player_match_page(
+        self,
+        storage: Storage,
+        game_name: str,
+        tag_line: str,
+        start: int = 0,
+        count: int = 10,
+    ) -> tuple[str, list[str], int, bool]:
+        """Resolve an inspected player and cache one 10-game solo page.
+
+        ``has_more`` is intentionally conservative: Riot's IDs endpoint has no
+        next cursor, so a full page means another page *may* exist.  An exact
+        end boundary is confirmed by the following request returning fewer
+        than the requested number of IDs.  Already cached matches are returned
+        in page order without being downloaded again.
+        """
+        requested_size = max(1, min(int(count), 10))
+        account = self.resolve_account(game_name, tag_line)
+        puuid = str(account.get("puuid") or "").strip()
+        if not puuid:
+            raise RiotApiError("Riot API 응답에 계정 PUUID가 없습니다.")
+
+        resolved_game_name = str(account.get("gameName") or game_name).strip()
+        resolved_tag_line = str(account.get("tagLine") or tag_line).strip()
+        riot_id = f"{resolved_game_name}#{resolved_tag_line}"
+        storage.save_player_identity(riot_id, puuid)
+
+        ordered_ids = self.match_id_page(
+            puuid,
+            start=max(0, int(start)),
+            count=requested_size,
+        )
+        known = storage.known_match_ids()
+        fetched: list[dict[str, Any]] = []
+        for match_id in ordered_ids:
+            if match_id in known:
+                continue
+            fetched.append(self.match(match_id))
+            known.add(match_id)
+        saved = storage.save_matches(fetched) if fetched else 0
+        # Opening the same player again should extend the one-day local
+        # retention even when every detail payload was already cached.
+        storage.touch_match_cache(ordered_ids)
+        # A startup retention pass can race the initial known-ID snapshot.
+        # Touching first makes compare-and-delete skip live rows; if pruning
+        # already won, re-fetch only the vanished details before publishing a
+        # fresh page manifest.
+        vanished = [
+            match_id for match_id in ordered_ids
+            if storage.load_match(match_id) is None
+        ]
+        if vanished:
+            saved += storage.save_matches([
+                self.match(match_id) for match_id in vanished
+            ])
+        has_more = len(ordered_ids) == requested_size
+        storage.save_player_match_page(
+            riot_id,
+            puuid,
+            max(0, int(start)),
+            ordered_ids,
+            has_more,
+        )
+        return puuid, ordered_ids, saved, has_more
 
     def sync(
         self,

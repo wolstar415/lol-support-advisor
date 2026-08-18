@@ -50,6 +50,142 @@ class RiotApiTests(unittest.TestCase):
                 client.sync(storage, "Me", "KR1", count=1000)
             match_ids.assert_called_once_with("mine", count=100)
 
+    def test_player_match_page_caps_ids_and_details_at_ten(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            client = RiotApiClient("test-key")
+            ids = [f"KR_{index}" for index in range(20, 30)]
+
+            def match_payload(match_id: str) -> dict[str, object]:
+                return {
+                    "metadata": {"matchId": match_id},
+                    "info": {
+                        "queueId": 420,
+                        "gameCreation": 1,
+                        "participants": [],
+                    },
+                }
+
+            with (
+                patch.object(
+                    client,
+                    "resolve_account",
+                    return_value={
+                        "puuid": "other-puuid",
+                        "gameName": "Canonical",
+                        "tagLine": "KR1",
+                    },
+                ),
+                patch.object(client, "match_id_page", return_value=ids) as id_page,
+                patch.object(
+                    client, "match", side_effect=match_payload
+                ) as match_detail,
+            ):
+                result = client.sync_player_match_page(
+                    storage, "Other", "kr1", start=20, count=999
+                )
+
+            self.assertEqual(result, ("other-puuid", ids, 10, True))
+            id_page.assert_called_once_with("other-puuid", start=20, count=10)
+            self.assertEqual(match_detail.call_count, 10)
+            self.assertEqual(
+                storage.find_puuid_by_riot_id("Canonical#KR1"), "other-puuid"
+            )
+            manifest = storage.load_player_match_page("Canonical#KR1", 20)
+            self.assertIsNotNone(manifest)
+            self.assertEqual(manifest[0], "other-puuid")
+            self.assertEqual(manifest[1], ids)
+
+    def test_player_match_page_reuses_cached_details_and_reports_last_page(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            storage.save_matches(
+                [{
+                    "metadata": {"matchId": "KR_cached"},
+                    "info": {
+                        "queueId": 420,
+                        "gameCreation": 1,
+                        "participants": [],
+                    },
+                }]
+            )
+            client = RiotApiClient("test-key")
+            ids = ["KR_cached", "KR_new"]
+            new_match = {
+                "metadata": {"matchId": "KR_new"},
+                "info": {
+                    "queueId": 420,
+                    "gameCreation": 2,
+                    "participants": [],
+                },
+            }
+            with (
+                patch.object(
+                    client, "resolve_account", return_value={"puuid": "other"}
+                ),
+                patch.object(client, "match_id_page", return_value=ids),
+                patch.object(client, "match", return_value=new_match) as detail,
+            ):
+                result = client.sync_player_match_page(
+                    storage, "Other", "KR1", start=-5, count=10
+                )
+
+            self.assertEqual(result, ("other", ids, 1, False))
+            detail.assert_called_once_with("KR_new")
+            self.assertIsNotNone(storage.load_match("KR_cached"))
+            self.assertIsNotNone(storage.load_match("KR_new"))
+
+    def test_player_page_refetches_detail_deleted_during_retention_race(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            cached = {
+                "metadata": {"matchId": "KR_race"},
+                "info": {"queueId": 420, "gameCreation": 1, "participants": []},
+            }
+            storage.save_matches([cached])
+            original_touch = storage.touch_match_cache
+
+            def delete_before_touch(match_ids: list[str]) -> int:
+                with storage._connect() as connection:
+                    connection.execute(
+                        "DELETE FROM matches WHERE match_id = ?", ("KR_race",)
+                    )
+                return original_touch(match_ids)
+
+            client = RiotApiClient("test-key")
+            with (
+                patch.object(
+                    client, "resolve_account", return_value={"puuid": "other"},
+                ),
+                patch.object(client, "match_id_page", return_value=["KR_race"]),
+                patch.object(client, "match", return_value=cached) as detail,
+                patch.object(
+                    storage, "touch_match_cache", side_effect=delete_before_touch,
+                ),
+            ):
+                result = client.sync_player_match_page(
+                    storage, "Other", "KR1", start=0, count=10,
+                )
+
+            self.assertEqual(result, ("other", ["KR_race"], 1, False))
+            detail.assert_called_once_with("KR_race")
+            self.assertIsNotNone(storage.load_match("KR_race"))
+
+    def test_match_id_page_makes_one_request_with_safe_bounds(self) -> None:
+        client = RiotApiClient("test-key")
+        with patch.object(
+            client, "_get", return_value=[f"KR_{index}" for index in range(15)]
+        ) as get:
+            result = client.match_id_page("a/b", start=-3, count=1000)
+
+        self.assertEqual(len(result), 10)
+        get.assert_called_once()
+        url = get.call_args.args[0]
+        self.assertIn("/by-puuid/a%2Fb/ids?", url)
+        self.assertEqual(parse_qs(urlparse(url).query)["queue"], ["420"])
+        self.assertEqual(parse_qs(urlparse(url).query)["start"], ["0"])
+        self.assertEqual(parse_qs(urlparse(url).query)["count"], ["10"])
+
     def test_key_validation_requires_account_puuid(self) -> None:
         client = RiotApiClient("test-key")
         with patch.object(client, "resolve_account", return_value={"puuid": "mine"}):

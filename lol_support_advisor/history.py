@@ -4,6 +4,76 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 
+@dataclass(slots=True, frozen=True)
+class RankSnapshot:
+    """One observed solo-queue rank state.
+
+    Match-v5 does not carry LP.  These observations deliberately live outside
+    the raw match payload so callers can retain a before/after audit trail.
+    """
+
+    snapshot_id: int
+    puuid: str
+    observed_at: str
+    stage: str
+    session_key: str
+    tier: str
+    division: str
+    league_points: int
+    wins: int
+    losses: int
+    source: str = "RIOT_LEAGUE_V4"
+
+    @property
+    def games(self) -> int:
+        return self.wins + self.losses
+
+    @property
+    def rank_text(self) -> str:
+        tier = self.tier.strip().upper() or "UNRANKED"
+        division = self.division.strip().upper()
+        suffix = f" {division}" if division else ""
+        return f"{tier}{suffix} {self.league_points}LP"
+
+
+@dataclass(slots=True, frozen=True)
+class MatchLpChange:
+    """A conservative rank transition linked to exactly one solo match."""
+
+    match_id: str
+    puuid: str
+    before_snapshot_id: int
+    after_snapshot_id: int
+    before_tier: str
+    before_division: str
+    before_lp: int
+    after_tier: str
+    after_division: str
+    after_lp: int
+    lp_delta: int | None
+    confidence: str
+    resolved_at: str
+
+    @staticmethod
+    def _rank_text(tier: str, division: str, lp: int) -> str:
+        normalized_tier = tier.strip().upper() or "UNRANKED"
+        normalized_division = division.strip().upper()
+        suffix = f" {normalized_division}" if normalized_division else ""
+        return f"{normalized_tier}{suffix} {lp}LP"
+
+    @property
+    def before_rank_text(self) -> str:
+        return self._rank_text(
+            self.before_tier, self.before_division, self.before_lp,
+        )
+
+    @property
+    def after_rank_text(self) -> str:
+        return self._rank_text(
+            self.after_tier, self.after_division, self.after_lp,
+        )
+
+
 @dataclass(slots=True)
 class MatchHistoryEntry:
     match_id: str
@@ -36,6 +106,10 @@ class MatchHistoryEntry:
     predicted_win: bool | None = None
     prediction_confidence: str = ""
     prediction_correct: bool | None = None
+    lp_delta: int | None = None
+    lp_confidence: str = ""
+    lp_before_rank: str = ""
+    lp_after_rank: str = ""
 
 
 @dataclass(slots=True)
@@ -74,6 +148,10 @@ class HistoryOverview:
     total_vision: int = 0
     recent_20_games: int = 0
     recent_20_wins: int = 0
+    recent_20_lp_sum: int | None = None
+    recent_20_lp_known_games: int = 0
+    recent_20_lp_inferred_games: int = 0
+    recent_20_champions: list[ChampionHistoryStat] = field(default_factory=list)
     current_streak: int = 0
 
     @property
@@ -94,6 +172,63 @@ class HistoryOverview:
             self.recent_20_wins / self.recent_20_games * 100
             if self.recent_20_games else None
         )
+
+
+def refresh_recent_20_summary(overview: HistoryOverview) -> None:
+    """Recompute recent summary fields after optional LP data is attached."""
+    recent = overview.entries[:20]
+    overview.recent_20_games = len(recent)
+    overview.recent_20_wins = sum(int(entry.won) for entry in recent)
+    known_lp = [entry.lp_delta for entry in recent if entry.lp_delta is not None]
+    overview.recent_20_lp_known_games = len(known_lp)
+    overview.recent_20_lp_sum = sum(known_lp) if known_lp else None
+    overview.recent_20_lp_inferred_games = sum(
+        1 for entry in recent
+        if entry.lp_delta is not None and entry.lp_confidence == "INFERRED"
+    )
+
+    champion_totals: dict[str, ChampionHistoryStat] = {}
+    for entry in recent:
+        champion = champion_totals.setdefault(
+            entry.champion_id,
+            ChampionHistoryStat(champion_id=entry.champion_id, position="ALL"),
+        )
+        champion.games += 1
+        champion.wins += int(entry.won)
+        champion.kills += entry.kills
+        champion.deaths += entry.deaths
+        champion.assists += entry.assists
+        champion.vision_score += entry.vision_score
+    overview.recent_20_champions = sorted(
+        champion_totals.values(),
+        key=lambda stat: (stat.games, stat.wins, stat.kda or 0.0),
+        reverse=True,
+    )[:3]
+
+    overview.current_streak = 0
+    if overview.entries:
+        first_result = overview.entries[0].won
+        for entry in overview.entries:
+            if entry.won != first_result:
+                break
+            overview.current_streak += 1 if first_result else -1
+
+
+def attach_match_lp_changes(
+    overview: HistoryOverview,
+    changes: dict[str, MatchLpChange],
+) -> HistoryOverview:
+    """Attach one batch-loaded LP map without inventing zeroes for old games."""
+    for entry in overview.entries:
+        change = changes.get(entry.match_id)
+        if change is None:
+            continue
+        entry.lp_delta = change.lp_delta
+        entry.lp_confidence = change.confidence
+        entry.lp_before_rank = change.before_rank_text
+        entry.lp_after_rank = change.after_rank_text
+    refresh_recent_20_summary(overview)
+    return overview
 
 
 def _integer(payload: dict[str, Any], key: str) -> int:
@@ -236,18 +371,10 @@ def analyze_history(
         if overview.games >= limit:
             break
 
-    recent = overview.entries[:20]
-    overview.recent_20_games = len(recent)
-    overview.recent_20_wins = sum(int(entry.won) for entry in recent)
-    if overview.entries:
-        first_result = overview.entries[0].won
-        for entry in overview.entries:
-            if entry.won != first_result:
-                break
-            overview.current_streak += 1 if first_result else -1
     overview.champions = sorted(
         champion_totals.values(),
         key=lambda stat: (stat.games, stat.wins, stat.kda or 0.0),
         reverse=True,
     )
+    refresh_recent_20_summary(overview)
     return overview

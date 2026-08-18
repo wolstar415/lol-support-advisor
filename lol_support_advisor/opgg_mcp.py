@@ -14,6 +14,8 @@ from .models import (
 
 
 OPGG_MCP_ENDPOINT = "https://mcp-api.op.gg/mcp"
+OPGG_MCP_MATCH_LIMIT_MIN = 5
+OPGG_MCP_MATCH_LIMIT_MAX = 20
 _JSON_STRING = r'"(?:\\.|[^"\\])*"'
 
 
@@ -156,6 +158,18 @@ def parse_summoner_matches_text(text: str) -> list[OpggMcpRecentMatch]:
             op_score_rank=max(0, int(rank_value or 0)),
         ))
     return matches
+
+
+def completed_solo_ranked_matches(
+    matches: list[OpggMcpRecentMatch],
+) -> list[OpggMcpRecentMatch]:
+    """Keep completed solo-ranked rows while preserving OP.GG's newest-first order."""
+    return [
+        match
+        for match in matches
+        if str(match.game_type or "").upper() == "SOLORANKED"
+        and str(match.result or "").upper() in {"WIN", "LOSE"}
+    ]
 
 
 def mcp_champion_token(champion_id: str) -> str:
@@ -380,6 +394,12 @@ class OpggMcpClient:
         lang: str = "ko_KR",
         limit: int = 10,
     ) -> list[OpggMcpRecentMatch]:
+        """Return completed solo-ranked matches from OP.GG's bounded history.
+
+        The public ``tools/list`` schema exposes only ``limit`` (5..20); it
+        has no cursor, page, or offset. Deeper pagination belongs to the
+        separate Riot Match-v5 history path rather than this MCP call.
+        """
         self.connect()
         result = self._request("tools/call", {
             "name": "lol_list_summoner_matches",
@@ -388,7 +408,10 @@ class OpggMcpClient:
                 "tag_line": tag_line,
                 "region": region.upper(),
                 "lang": lang,
-                "limit": max(5, min(int(limit), 20)),
+                "limit": max(
+                    OPGG_MCP_MATCH_LIMIT_MIN,
+                    min(int(limit), OPGG_MCP_MATCH_LIMIT_MAX),
+                ),
                 "desired_output_fields": [
                     "data.game_history[].{created_at,game_type,id}",
                     "data.game_history[].participants[].summoner."
@@ -407,7 +430,9 @@ class OpggMcpClient:
             for item in result.get("content", [])
             if isinstance(item, dict) and item.get("type") == "text"
         ]
-        return parse_summoner_matches_text("\n".join(texts))
+        return completed_solo_ranked_matches(
+            parse_summoner_matches_text("\n".join(texts))
+        )
 
     def champion_synergies(
         self,

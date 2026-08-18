@@ -13,7 +13,8 @@ from unittest.mock import patch
 from lol_support_advisor.storage import Storage
 from lol_support_advisor.models import (
     BuildAsset, ChampionBuildGuide, GamePrediction, OpggSnapshot,
-    OpggSynergySnapshot, OpggSynergyStat, RuneBuild, SummonerSpellBuild,
+    OpggMcpSummonerProfile, OpggSynergySnapshot, OpggSynergyStat, RuneBuild,
+    SummonerSpellBuild,
 )
 
 
@@ -163,6 +164,100 @@ class StorageTests(unittest.TestCase):
             ])
             self.assertEqual(storage.match_revision(), (3, 4000))
 
+    def test_match_identity_updated_at_never_moves_backwards(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            older = datetime(2026, 7, 1, 12, 0, 0)
+            newer = datetime(2026, 8, 1, 12, 0, 0)
+            latest = datetime(2026, 8, 15, 12, 0, 0)
+
+            storage.save_matches([
+                match_payload(
+                    "KR_IDENTITY_NEWER", True, "Janna", "Leona",
+                    int(newer.timestamp() * 1000),
+                ),
+                match_payload(
+                    "KR_IDENTITY_OLDER", False, "Janna", "Leona",
+                    int(older.timestamp() * 1000),
+                ),
+            ], cached_at=newer)
+
+            def identity_updated_at() -> str:
+                with storage._connect() as connection:
+                    row = connection.execute(
+                        "SELECT updated_at FROM player_identities WHERE riot_id = ?",
+                        ("Me#KR1",),
+                    ).fetchone()
+                self.assertIsNotNone(row)
+                return str(row["updated_at"])
+
+            self.assertEqual(
+                identity_updated_at(), newer.isoformat(timespec="seconds")
+            )
+
+            storage.save_matches([
+                match_payload(
+                    "KR_IDENTITY_LATEST", True, "Janna", "Leona",
+                    int(latest.timestamp() * 1000),
+                ),
+            ], cached_at=latest)
+            self.assertEqual(
+                identity_updated_at(), latest.isoformat(timespec="seconds")
+            )
+
+    def test_player_match_pages_round_trip_and_respect_freshness(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            observed = datetime.now() - timedelta(hours=6)
+            storage.save_player_match_page(
+                "Other#KR1", "other-puuid", 0,
+                [f"KR_PAGE_{index}" for index in range(12)],
+                True, updated_at=observed,
+            )
+
+            cached = storage.load_player_match_page("other#kr1", 0)
+            self.assertIsNotNone(cached)
+            puuid, match_ids, has_more, updated_at = cached
+            self.assertEqual(puuid, "other-puuid")
+            self.assertEqual(match_ids, [f"KR_PAGE_{index}" for index in range(10)])
+            self.assertTrue(has_more)
+            self.assertEqual(updated_at, observed.isoformat(timespec="seconds"))
+            self.assertIsNotNone(
+                storage.load_player_match_page(
+                    "Other#KR1", 0, max_age=timedelta(hours=7),
+                )
+            )
+            self.assertIsNone(
+                storage.load_player_match_page(
+                    "Other#KR1", 0, max_age=timedelta(hours=5),
+                )
+            )
+
+    def test_changed_player_page_invalidates_every_deeper_offset(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            storage.save_player_match_page(
+                "Other#KR1", "other-puuid", 0,
+                [f"KR_A_{index}" for index in range(10)], True,
+            )
+            storage.save_player_match_page(
+                "Other#KR1", "other-puuid", 10,
+                [f"KR_B_{index}" for index in range(10)], True,
+            )
+            storage.save_player_match_page(
+                "Other#KR1", "other-puuid", 20,
+                [f"KR_C_{index}" for index in range(10)], False,
+            )
+
+            storage.save_player_match_page(
+                "Other#KR1", "other-puuid", 0,
+                ["KR_NEW", *[f"KR_A_{index}" for index in range(9)]], True,
+            )
+
+            self.assertIsNotNone(storage.load_player_match_page("Other#KR1", 0))
+            self.assertIsNone(storage.load_player_match_page("Other#KR1", 10))
+            self.assertIsNone(storage.load_player_match_page("Other#KR1", 20))
+
     def test_match_count_never_waits_for_full_payload_decode_lock(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir) / "advisor.db")
@@ -300,6 +395,391 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(loaded.win_probability, 56.4)
             self.assertTrue(loaded.actual_win)
             self.assertTrue(loaded.correct)
+
+    def test_game_prediction_keeps_first_visible_baseline_across_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "advisor.db"
+            first = GamePrediction(
+                prediction_key="same-game",
+                captured_at="2026-08-18T12:00:00",
+                active_riot_id="Me#KR1",
+                active_champion_id="Thresh",
+                ally_champion_ids=("Thresh",),
+                enemy_champion_ids=("Leona",),
+                ally_riot_ids=("Me#KR1",),
+                enemy_riot_ids=("Enemy#KR1",),
+                win_probability=54.0,
+                predicted_win=True,
+                confidence="보통",
+                evidence=("첫 기준",),
+                evidence_score=0.5,
+            )
+            changed = GamePrediction.from_dict({
+                **first.to_dict(),
+                "captured_at": "2026-08-18T12:01:00",
+                "win_probability": 46.0,
+                "predicted_win": False,
+                "evidence": ["재계산"],
+            })
+            storage = Storage(db_path)
+            storage.save_game_prediction(first)
+
+            stored = Storage(db_path).save_game_prediction(changed)
+            loaded = Storage(db_path).load_game_prediction_by_key("same-game")
+
+            self.assertEqual(stored.win_probability, 54.0)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.win_probability, 54.0)
+            self.assertTrue(loaded.predicted_win)
+            self.assertEqual(loaded.evidence, ("첫 기준",))
+
+    @staticmethod
+    def _lp_match(
+        match_id: str, start: datetime, won: bool = True,
+    ) -> dict:
+        match = match_payload(
+            match_id, won, "Janna", "Leona", int(start.timestamp() * 1000),
+        )
+        match["info"]["gameDuration"] = 1800
+        match["info"]["gameEndTimestamp"] = int(
+            (start + timedelta(minutes=30)).timestamp() * 1000
+        )
+        return match
+
+    def test_rank_snapshots_link_one_solo_match_and_survive_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            db_path = Path(temp_dir) / "advisor.db"
+            storage = Storage(db_path)
+            start = datetime(2026, 8, 18, 12, 0, 0)
+            before = storage.save_rank_snapshot(
+                "mine",
+                {
+                    "queueType": "RANKED_SOLO_5x5", "tier": "GOLD",
+                    "rank": "I", "leaguePoints": 40, "wins": 10,
+                    "losses": 10,
+                },
+                stage="PRE", session_key="game-1",
+                observed_at=start + timedelta(minutes=5),
+            )
+            storage.save_rank_snapshot(
+                "mine",
+                {
+                    "queueType": "RANKED_SOLO_5x5", "tier": "GOLD",
+                    "rank": "I", "leaguePoints": 63, "wins": 11,
+                    "losses": 10,
+                },
+                stage="POST", session_key="game-1",
+                observed_at=start + timedelta(minutes=31),
+            )
+            match = self._lp_match("KR_LP_1", start, True)
+
+            self.assertEqual(storage.resolve_match_lp_changes("mine", [match]), 1)
+            change = storage.load_match_lp_changes(["KR_LP_1"])["KR_LP_1"]
+            self.assertEqual(change.lp_delta, 23)
+            self.assertEqual(change.confidence, "EXACT")
+            self.assertEqual(change.before_rank_text, "GOLD I 40LP")
+            self.assertEqual(change.after_rank_text, "GOLD I 63LP")
+
+            restarted = Storage(db_path)
+            unchanged = restarted.save_rank_snapshot(
+                "mine",
+                {
+                    "queueType": "RANKED_SOLO_5x5", "tier": "GOLD",
+                    "rank": "I", "leaguePoints": 99, "wins": 11,
+                    "losses": 10,
+                },
+                stage="PRE", session_key="game-1",
+                observed_at=start + timedelta(minutes=32),
+            )
+            self.assertEqual(unchanged.snapshot_id, before.snapshot_id)
+            self.assertEqual(unchanged.league_points, 40)
+            self.assertEqual(restarted.resolve_match_lp_changes("mine", [match]), 0)
+            self.assertEqual(len(restarted.load_rank_snapshots("mine")), 2)
+
+    def test_rank_snapshot_post_retry_resolves_after_riot_counter_settles(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            start = datetime(2026, 8, 18, 13, 0, 0)
+            baseline = {
+                "queueType": "RANKED_SOLO_5x5", "tier": "GOLD",
+                "rank": "I", "leaguePoints": 63, "wins": 11,
+                "losses": 10,
+            }
+            storage.save_rank_snapshot(
+                "mine", baseline, stage="PRE", session_key="game-2",
+                observed_at=start + timedelta(minutes=2),
+            )
+            storage.save_rank_snapshot(
+                "mine", baseline, stage="POST", session_key="game-2",
+                observed_at=start + timedelta(minutes=31),
+            )
+            match = self._lp_match("KR_LP_2", start, False)
+            self.assertEqual(storage.resolve_match_lp_changes("mine", [match]), 0)
+
+            storage.save_rank_snapshot(
+                "mine",
+                {**baseline, "leaguePoints": 44, "losses": 11},
+                stage="POST", session_key="game-2",
+                observed_at=start + timedelta(minutes=33),
+            )
+            self.assertEqual(storage.resolve_match_lp_changes("mine", [match]), 1)
+            change = storage.load_match_lp_changes(["KR_LP_2"])["KR_LP_2"]
+            self.assertEqual((change.lp_delta, change.confidence), (-19, "EXACT"))
+
+    def test_rank_snapshot_limit_keeps_newest_observations_in_time_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            start = datetime(2026, 8, 18, 13, 0, 0)
+            for index in range(3):
+                storage.save_rank_snapshot(
+                    "mine",
+                    {"tier": "GOLD", "rank": "I", "leaguePoints": 40 + index,
+                     "wins": 10 + index, "losses": 10},
+                    stage="OBSERVED", session_key=f"observation-{index}",
+                    observed_at=start + timedelta(minutes=index),
+                )
+
+            snapshots = storage.load_rank_snapshots("mine", limit=2)
+
+            self.assertEqual(
+                [snapshot.session_key for snapshot in snapshots],
+                ["observation-1", "observation-2"],
+            )
+
+    def test_rank_transition_is_kept_without_inventing_promotion_lp(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            start = datetime(2026, 8, 18, 14, 0, 0)
+            storage.save_rank_snapshot(
+                "mine",
+                {"tier": "GOLD", "rank": "II", "leaguePoints": 90,
+                 "wins": 20, "losses": 20},
+                stage="PRE", session_key="promotion",
+                observed_at=start + timedelta(minutes=1),
+            )
+            storage.save_rank_snapshot(
+                "mine",
+                {"tier": "GOLD", "rank": "I", "leaguePoints": 12,
+                 "wins": 21, "losses": 20},
+                stage="POST", session_key="promotion",
+                observed_at=start + timedelta(minutes=31),
+            )
+            match = self._lp_match("KR_PROMOTION", start, True)
+
+            self.assertEqual(storage.resolve_match_lp_changes("mine", [match]), 1)
+            change = storage.load_match_lp_changes(["KR_PROMOTION"])["KR_PROMOTION"]
+            self.assertIsNone(change.lp_delta)
+            self.assertEqual(change.confidence, "TRANSITION")
+            self.assertEqual(change.before_rank_text, "GOLD II 90LP")
+            self.assertEqual(change.after_rank_text, "GOLD I 12LP")
+
+    def test_rank_snapshots_do_not_split_one_counter_change_across_two_matches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            start = datetime(2026, 8, 18, 15, 0, 0)
+            storage.save_rank_snapshot(
+                "mine", {"tier": "GOLD", "rank": "I", "leaguePoints": 20,
+                         "wins": 30, "losses": 30},
+                stage="PRE", session_key="ambiguous", observed_at=start,
+            )
+            storage.save_rank_snapshot(
+                "mine", {"tier": "GOLD", "rank": "I", "leaguePoints": 40,
+                         "wins": 31, "losses": 30},
+                stage="POST", session_key="ambiguous",
+                observed_at=start + timedelta(hours=2),
+            )
+            first = self._lp_match("KR_AMBIG_1", start + timedelta(minutes=1), True)
+            second = self._lp_match("KR_AMBIG_2", start + timedelta(hours=1), True)
+
+            self.assertEqual(
+                storage.resolve_match_lp_changes("mine", [first, second]), 0
+            )
+            self.assertEqual(
+                storage.load_match_lp_changes(["KR_AMBIG_1", "KR_AMBIG_2"]), {}
+            )
+
+    def test_prune_keeps_every_owner_match_and_invalidates_match_caches(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            now = datetime(2026, 8, 18, 12, 0, 0)
+            old_owner = match_payload(
+                "KR_OWNER_OLD", True, "Janna", "Leona",
+                int((now - timedelta(days=30)).timestamp() * 1000),
+            )
+            old_other = match_payload(
+                "KR_OTHER_OLD", True, "Janna", "Leona",
+                int((now - timedelta(days=30)).timestamp() * 1000),
+            )
+            recent_other = match_payload(
+                "KR_OTHER_RECENT", False, "Braum", "Nautilus",
+                int((now - timedelta(days=2)).timestamp() * 1000),
+            )
+            for prefix, match in (("old", old_other), ("recent", recent_other)):
+                for index, participant in enumerate(match["info"]["participants"]):
+                    participant["puuid"] = f"{prefix}-{index}"
+                    participant["riotIdGameName"] = f"{prefix}-{index}"
+            storage.save_matches(
+                [old_owner, old_other], cached_at=now - timedelta(days=30)
+            )
+            storage.save_matches(
+                [recent_other], cached_at=now - timedelta(days=2)
+            )
+
+            self.assertEqual(storage.match_revision()[0], 3)
+            self.assertEqual(len(storage._decoded_match_rows()), 3)
+            deleted = storage.prune_non_owner_data(
+                "mine", "Me#KR1", now=now, days=7,
+            )
+
+            self.assertEqual(deleted["matches"], 1)
+            self.assertEqual(
+                storage.known_match_ids(), {"KR_OWNER_OLD", "KR_OTHER_RECENT"}
+            )
+            self.assertEqual(storage.match_revision()[0], 2)
+            self.assertEqual(len(storage._decoded_match_rows()), 2)
+            self.assertEqual(
+                [
+                    (match.get("metadata") or {}).get("matchId")
+                    for match in storage.player_matches("mine")
+                ],
+                ["KR_OWNER_OLD"],
+            )
+            with storage._connect() as connection:
+                protected = connection.execute(
+                    "SELECT protected_owner_puuid FROM matches WHERE match_id = ?",
+                    ("KR_OWNER_OLD",),
+                ).fetchone()
+            self.assertEqual(str(protected["protected_owner_puuid"]), "mine")
+
+    def test_reused_old_match_respects_explicit_seven_day_retention(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            now = datetime(2026, 8, 18, 12, 0, 0)
+            old_other = match_payload(
+                "KR_REUSED_OLD", True, "Janna", "Leona",
+                int((now - timedelta(days=90)).timestamp() * 1000),
+            )
+            for index, participant in enumerate(old_other["info"]["participants"]):
+                participant["puuid"] = f"other-{index}"
+                participant["riotIdGameName"] = f"other-{index}"
+            storage.save_matches(
+                [old_other], cached_at=now - timedelta(days=30)
+            )
+            self.assertEqual(
+                storage.touch_match_cache(["KR_REUSED_OLD"], when=now), 1
+            )
+
+            deleted = storage.prune_non_owner_data(
+                "mine", "Me#KR1", now=now, days=7,
+            )
+
+            self.assertEqual(deleted["matches"], 0)
+            self.assertIn("KR_REUSED_OLD", storage.known_match_ids())
+
+    def test_non_owner_retention_defaults_to_one_day(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            now = datetime(2026, 8, 18, 12, 0, 0)
+            other = match_payload(
+                "KR_OTHER_25H", True, "Janna", "Leona",
+                int((now - timedelta(hours=25)).timestamp() * 1000),
+            )
+            for index, participant in enumerate(other["info"]["participants"]):
+                participant["puuid"] = f"other-{index}"
+                participant["riotIdGameName"] = f"other-{index}"
+            storage.save_matches([other], cached_at=now - timedelta(hours=25))
+
+            deleted = storage.prune_non_owner_data(
+                "mine", "Me#KR1", now=now,
+            )
+
+            self.assertEqual(deleted["matches"], 1)
+            self.assertNotIn("KR_OTHER_25H", storage.known_match_ids())
+
+    def test_prune_removes_only_stale_non_owner_profile_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            now = datetime(2026, 8, 18, 12, 0, 0)
+            old_stamp = (now - timedelta(days=30)).isoformat()
+            recent_stamp = (now - timedelta(days=2)).isoformat()
+            for riot_id, puuid in (
+                ("Me#KR1", "mine"),
+                ("Old#KR1", "old-player"),
+                ("Fresh#KR1", "fresh-player"),
+            ):
+                storage.save_live_profile(riot_id, puuid, {"solo_entry": {}})
+                storage.save_player_identity(riot_id, puuid)
+                storage.save_opgg_player_profile(OpggMcpSummonerProfile(
+                    riot_id=riot_id,
+                    game_name=riot_id.split("#", 1)[0],
+                    tag_line="KR1",
+                    fetched_at=old_stamp if riot_id != "Fresh#KR1" else recent_stamp,
+                ))
+            storage.save_player_match_page(
+                "Old#KR1", "old-player", 0, ["KR_OLD_PAGE"], False,
+                updated_at=now - timedelta(days=30),
+            )
+            storage.save_player_match_page(
+                "Fresh#KR1", "fresh-player", 0, ["KR_FRESH_PAGE"], False,
+                updated_at=now - timedelta(days=2),
+            )
+            with storage._connect() as connection:
+                connection.execute(
+                    "UPDATE live_profiles SET updated_at = ? "
+                    "WHERE riot_id IN ('Me#KR1', 'Old#KR1')",
+                    (old_stamp,),
+                )
+                connection.execute(
+                    "UPDATE live_profiles SET updated_at = ? WHERE riot_id = 'Fresh#KR1'",
+                    (recent_stamp,),
+                )
+                connection.execute(
+                    "UPDATE player_identities SET updated_at = ? "
+                    "WHERE riot_id IN ('Me#KR1', 'Old#KR1')",
+                    (old_stamp,),
+                )
+                connection.execute(
+                    "UPDATE player_identities SET updated_at = ? WHERE riot_id = 'Fresh#KR1'",
+                    (recent_stamp,),
+                )
+
+            deleted = storage.prune_non_owner_data(
+                "mine", "Me#KR1", now=now, days=7,
+            )
+
+            self.assertEqual(deleted["live_profiles"], 1)
+            self.assertEqual(deleted["opgg_player_profiles"], 1)
+            self.assertEqual(deleted["player_identities"], 1)
+            self.assertEqual(deleted["player_match_pages"], 1)
+            with storage._connect() as connection:
+                live_ids = {
+                    str(row["riot_id"])
+                    for row in connection.execute("SELECT riot_id FROM live_profiles")
+                }
+                opgg_ids = {
+                    str(row["riot_id"])
+                    for row in connection.execute("SELECT riot_id FROM opgg_player_profiles")
+                }
+                identity_ids = {
+                    str(row["riot_id"])
+                    for row in connection.execute("SELECT riot_id FROM player_identities")
+                }
+                page_ids = {
+                    str(row["riot_id"])
+                    for row in connection.execute("SELECT riot_id FROM player_match_pages")
+                }
+            self.assertEqual(live_ids, {"Me#KR1", "Fresh#KR1"})
+            self.assertEqual(opgg_ids, {"Me#KR1", "Fresh#KR1"})
+            self.assertEqual(identity_ids, {"Me#KR1", "Fresh#KR1"})
+            self.assertEqual(page_ids, {"Fresh#KR1"})
+
+    def test_prune_requires_both_owner_identifiers(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            with self.assertRaises(ValueError):
+                storage.prune_non_owner_data("", "Me#KR1")
+            with self.assertRaises(ValueError):
+                storage.prune_non_owner_data("mine", "")
 
     def test_jungle_tendency_uses_cached_solo_queue_challenge_fields(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

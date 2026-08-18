@@ -30,6 +30,10 @@ class LcuActionStateChanged(LcuActionError):
     """The champ-select phase or the local player's action changed mid-check."""
 
 
+class LcuActionManualOverride(LcuActionStateChanged):
+    """The user deliberately selected a different champion during automation."""
+
+
 @dataclass(frozen=True, slots=True)
 class LcuChampionActionResult:
     action_type: str
@@ -349,6 +353,8 @@ class LcuClient:
     def perform_champion_action(
         self, champion_key: int, action: str, *,
         expected_action_id: int | None = None,
+        expected_current_champion_ids: set[int] | None = None,
+        verify_bannable: bool = True,
         pre_commit_check: Callable[[], bool] | None = None,
     ) -> LcuChampionActionResult:
         with self._write_lock:
@@ -360,12 +366,16 @@ class LcuClient:
                 champion_key,
                 action,
                 expected_action_id=expected_action_id,
+                expected_current_champion_ids=expected_current_champion_ids,
+                verify_bannable=verify_bannable,
                 pre_commit_check=pre_commit_check,
             )
 
     def _perform_champion_action(
         self, champion_key: int, action: str, *,
         expected_action_id: int | None = None,
+        expected_current_champion_ids: set[int] | None = None,
+        verify_bannable: bool = True,
         pre_commit_check: Callable[[], bool] | None = None,
     ) -> LcuChampionActionResult:
         """Preflight and perform an explicit local HOVER, pick, or ban action."""
@@ -376,20 +386,25 @@ class LcuClient:
         if champion_key <= 0:
             raise LcuActionError("챔피언 ID가 올바르지 않습니다.")
         normalized = action.strip().lower()
-        if normalized not in {"hover", "pick", "ban"}:
+        if normalized not in {"hover", "pick", "ban_hover", "ban"}:
             raise LcuActionError("지원하지 않는 챔피언 선택 작업입니다.")
 
         phase = str(self.get("/lol-gameflow/v1/gameflow-phase"))
         if phase != "ChampSelect":
             raise LcuActionError("현재 챔피언 선택 화면이 아닙니다.")
         session = self.champ_select_session()
-        action_type = "ban" if normalized == "ban" else "pick"
+        action_type = "ban" if normalized in {"ban_hover", "ban"} else "pick"
         if action_type == "ban" and champ_select_timer_phase(session) != "BAN_PICK":
             raise LcuActionStateChanged(
                 "아직 실제 밴 단계가 아닙니다. 밴 단계 진입을 기다립니다."
             )
         local_action = find_local_champion_action(
-            session, action_type, require_in_progress=True
+            session,
+            action_type,
+            # A recommendation may be placed on the local player's future
+            # pick action as an unconfirmed intent.  Locking a pick or touching
+            # a ban still requires the actual local turn.
+            require_in_progress=normalized != "hover",
         )
         action_id = int(local_action["id"])
         if (
@@ -397,7 +412,15 @@ class LcuClient:
             and action_id != int(expected_action_id)
         ):
             raise LcuActionStateChanged(
-                "내 밴 작업이 변경되어 새 작업을 다시 확인합니다."
+                "내 챔피언 선택 작업이 변경되어 다시 확인합니다."
+            )
+        current_champion_id = int(local_action.get("championId") or 0)
+        if (
+            expected_current_champion_ids is not None
+            and current_champion_id not in expected_current_champion_ids
+        ):
+            raise LcuActionManualOverride(
+                "사용자가 다른 챔피언을 선택해 자동 작업을 취소합니다."
             )
 
         banned_ids = session_banned_champion_ids(session)
@@ -410,13 +433,14 @@ class LcuClient:
         if action_type == "pick":
             if champion_key not in self._owned_champion_ids():
                 raise LcuActionError("보유하지 않은 챔피언이라 선택할 수 없습니다.")
-            pickable = self._id_set(
-                self.get("/lol-champ-select/v1/pickable-champion-ids"),
-                "현재 선택 가능한 챔피언 목록을 확인하지 못했습니다.",
-            )
-            if champion_key not in pickable:
-                raise LcuActionError("현재 이 챔피언을 선택할 수 없습니다.")
-        else:
+            if normalized == "pick":
+                pickable = self._id_set(
+                    self.get("/lol-champ-select/v1/pickable-champion-ids"),
+                    "현재 선택 가능한 챔피언 목록을 확인하지 못했습니다.",
+                )
+                if champion_key not in pickable:
+                    raise LcuActionError("현재 이 챔피언을 선택할 수 없습니다.")
+        elif verify_bannable:
             bannable = self._id_set(
                 self.get("/lol-champ-select/v1/bannable-champion-ids"),
                 "현재 밴 가능한 챔피언 목록을 확인하지 못했습니다.",
@@ -432,6 +456,23 @@ class LcuClient:
             raise LcuActionStateChanged(
                 "예약된 챔피언 작업이 취소되었습니다."
             )
+        if expected_current_champion_ids is not None:
+            fresh_session = self.champ_select_session()
+            fresh_action = find_local_champion_action(
+                fresh_session, action_type,
+                require_in_progress=normalized != "hover",
+            )
+            if int(fresh_action.get("id") or 0) != action_id:
+                raise LcuActionStateChanged(
+                    "내 챔피언 선택 작업이 변경되어 다시 확인합니다."
+                )
+            if (
+                int(fresh_action.get("championId") or 0)
+                not in expected_current_champion_ids
+            ):
+                raise LcuActionManualOverride(
+                    "사용자가 다른 챔피언을 선택해 자동 작업을 취소합니다."
+                )
         completed = normalized in {"pick", "ban"}
         self.patch(
             f"/lol-champ-select/v1/session/actions/{action_id}",

@@ -328,6 +328,22 @@ class LcuActionTests(unittest.TestCase):
             {"championId": 40, "completed": False},
         )])
 
+    def test_hover_can_select_on_the_local_future_action_before_my_turn(self) -> None:
+        session = self.session(local_in_progress=False)
+        client = self.client(
+            session,
+            **{"/lol-champ-select/v1/pickable-champion-ids": []},
+        )
+
+        result = client.perform_champion_action(40, "hover")
+
+        self.assertFalse(result.completed)
+        self.assertEqual(result.action_id, 777)
+        self.assertEqual(client.writes, [(
+            "PATCH", "/lol-champ-select/v1/session/actions/777",
+            {"championId": 40, "completed": False},
+        )])
+
     def test_pick_is_blocked_before_patch_when_champion_is_not_owned(self) -> None:
         client = self.client(
             self.session(),
@@ -361,6 +377,63 @@ class LcuActionTests(unittest.TestCase):
             "PATCH", "/lol-champ-select/v1/session/actions/777",
             {"championId": 99, "completed": True},
         ))
+
+    def test_auto_ban_can_stage_without_bannable_endpoint_gate(self) -> None:
+        session = self.session(local_type="ban")
+        client = self.client(
+            session,
+            **{"/lol-champ-select/v1/bannable-champion-ids": []},
+        )
+
+        result = client.perform_champion_action(
+            99,
+            "ban_hover",
+            expected_action_id=777,
+            expected_current_champion_ids={0, 99},
+            verify_bannable=False,
+        )
+
+        self.assertFalse(result.completed)
+        self.assertEqual(client.writes, [(
+            "PATCH", "/lol-champ-select/v1/session/actions/777",
+            {"championId": 99, "completed": False},
+        )])
+
+    def test_auto_ban_can_commit_without_bannable_endpoint_gate(self) -> None:
+        session = self.session(local_type="ban", local_champion=99)
+        client = self.client(
+            session,
+            **{"/lol-champ-select/v1/bannable-champion-ids": []},
+        )
+
+        result = client.perform_champion_action(
+            99,
+            "ban",
+            expected_action_id=777,
+            expected_current_champion_ids={0, 99},
+            verify_bannable=False,
+        )
+
+        self.assertTrue(result.completed)
+        self.assertEqual(client.writes[-1], (
+            "PATCH", "/lol-champ-select/v1/session/actions/777",
+            {"championId": 99, "completed": True},
+        ))
+
+    def test_auto_ban_never_overwrites_a_manual_ban_choice(self) -> None:
+        session = self.session(local_type="ban", local_champion=40)
+        client = self.client(session)
+
+        with self.assertRaisesRegex(LcuActionStateChanged, "사용자가 다른"):
+            client.perform_champion_action(
+                99,
+                "ban",
+                expected_action_id=777,
+                expected_current_champion_ids={0, 99},
+                verify_bannable=False,
+            )
+
+        self.assertEqual(client.writes, [])
 
     def test_ban_is_blocked_during_planning_even_if_action_is_in_progress(self) -> None:
         session = self.session(local_type="ban")

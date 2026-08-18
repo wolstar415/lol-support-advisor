@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
+import tempfile
 import threading
 import time
 import unittest
@@ -10,7 +12,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from lol_support_advisor.ui import (
-    AdvisorApp, adc_flow_hint, allied_adc_member, candidate_score,
+    AdvisorApp, adc_flow_hint, allied_adc_member, auto_hover_recommendation,
+    candidate_score,
     behavior_strength_signals, behavior_weakness_signals,
     build_guide_has_statistics, build_loadout_stat_text,
     cache_manager_champion_ids,
@@ -20,14 +23,19 @@ from lol_support_advisor.ui import (
     live_active_context_signature, live_roster_signature,
     lux_auto_ban_deadline_after_timer_sample,
     lux_auto_ban_monitor_due,
+    projected_lux_auto_ban_remaining_ms,
     estimate_live_game_prediction,
     matchup_final_item_builds, matchup_item_groups, matchup_rune_index,
     lane_matchup_from_snapshot, lane_matchup_label, lane_matchup_snapshot_fresh,
     matchup_counter_for_candidate,
     opgg_recent_form, participant_performance_ranks, representative_build_item,
     recent_match_ids_from_payload, streak_badge_text, support_archetype,
-    recommendation_draft_context_signature,
-    team_objective_counts,
+    recommendation_action_available, recommendation_draft_context_signature,
+    exact_lp_badge_text, recent_exact_lp_summary, recent_prediction_accuracy,
+    team_objective_counts, duo_group_visuals,
+)
+from lol_support_advisor.history import (
+    HistoryOverview, MatchHistoryEntry, MatchLpChange,
 )
 from lol_support_advisor.icons import ItemIconCache
 from lol_support_advisor.models import (
@@ -37,7 +45,7 @@ from lol_support_advisor.models import (
     LiveGameSnapshot, LivePlayer,
     OpggCounter, OpggMcpChampionStat, OpggMcpRecentMatch,
     OpggMcpSummonerProfile, OpggSnapshot, OpggSynergyStat,
-    PersonalStat, PlayerBehaviorStat, PlayerProfileStat, RuneBuild,
+    PersonalStat, PlayerBehaviorStat, PlayerProfileStat, Recommendation, RuneBuild,
     SummonerSpellBuild,
 )
 
@@ -91,10 +99,96 @@ class DuoEvidenceTests(unittest.TestCase):
 
         def picker(minimum: int, maximum: int) -> int:
             observed.append((minimum, maximum))
-            return 11_000
+            return 16_500
 
-        self.assertEqual(choose_lux_auto_ban_target_ms(picker), 11_000)
-        self.assertEqual(observed, [(10_000, 12_000)])
+        self.assertEqual(choose_lux_auto_ban_target_ms(picker), 16_500)
+        self.assertEqual(observed, [(15_000, 18_000)])
+
+    def test_stale_recommendation_actions_use_live_preflight_instead_of_locking(self) -> None:
+        self.assertTrue(recommendation_action_available(
+            "hover", enabled=True, stale=True, demo=False,
+        ))
+        self.assertTrue(recommendation_action_available(
+            "pick", enabled=True, stale=True, demo=False,
+        ))
+        self.assertTrue(recommendation_action_available(
+            "ban", enabled=True, stale=True, demo=False,
+        ))
+
+    def test_auto_hover_uses_highest_ranked_available_recommendation(self) -> None:
+        recommendations = [
+            Recommendation(1, "Lux", "럭스", "포킹", "A", "", "", "", ""),
+            Recommendation(2, "Thresh", "쓰레쉬", "유틸", "A", "", "", "", ""),
+            Recommendation(3, "Leona", "레오나", "탱커", "B", "", "", "", ""),
+        ]
+        draft = DraftSnapshot(enemy_bans=["Lux"])
+        self.assertEqual(
+            auto_hover_recommendation(recommendations, draft).champion_id,
+            "Thresh",
+        )
+
+    def test_pending_auto_hover_waits_for_safe_phase_then_uses_manual_guard(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._recommendation_generation = 7
+        app._pending_auto_hover = (7, "Thresh", "SUPPORT")
+        app.game_phase = "ChampSelect"
+        app.draft = DraftSnapshot(my_role="SUPPORT")
+        app._champ_select_inner_phase = "BAN_PICK"
+        app._local_pick_action_in_progress = False
+        app.registry = SimpleNamespace(by_id={"Thresh": (412, "쓰레쉬")})
+        calls: list[tuple[object, ...]] = []
+        app._execute_champion_action = lambda *args, **kwargs: calls.append(
+            (*args, kwargs)
+        )
+
+        app._try_pending_auto_hover()
+        self.assertEqual(calls, [])
+        self.assertIsNotNone(app._pending_auto_hover)
+
+        app._local_pick_action_in_progress = True
+        app._try_pending_auto_hover()
+        self.assertIsNone(app._pending_auto_hover)
+        self.assertEqual(calls[0][0:2], ("Thresh", "hover"))
+        self.assertTrue(calls[0][2]["quiet"])
+        self.assertEqual(
+            calls[0][2]["expected_current_champion_ids"], {0, 412}
+        )
+
+    def test_pending_auto_hover_never_replaces_existing_player_intent(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._recommendation_generation = 3
+        app._pending_auto_hover = (3, "Thresh", "SUPPORT")
+        app.game_phase = "ChampSelect"
+        app.draft = DraftSnapshot(
+            my_role="SUPPORT",
+            my_hover=DraftMember(
+                "Malphite", "말파이트", "SUPPORT", "HOVER", 4,
+            ),
+        )
+        app._champ_select_inner_phase = "PLANNING"
+        app._local_pick_action_in_progress = False
+        app.registry = SimpleNamespace(by_id={"Thresh": (412, "쓰레쉬")})
+        calls: list[object] = []
+        app._execute_champion_action = lambda *args, **kwargs: calls.append(args)
+
+        app._try_pending_auto_hover()
+
+        self.assertEqual(calls, [])
+        self.assertIsNone(app._pending_auto_hover)
+
+    def test_lux_audit_persists_token_free_event(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            app = AdvisorApp.__new__(AdvisorApp)
+            app._lux_auto_ban_audit_path = Path(temp_dir) / "audit.jsonl"
+            app._lux_auto_ban_audit_lock = threading.Lock()
+            app._audit_lux_auto_ban(
+                "commit_success", action_id=9, remaining_ms=16_500,
+            )
+            payload = json.loads(
+                app._lux_auto_ban_audit_path.read_text(encoding="utf-8")
+            )
+            self.assertEqual(payload["event"], "commit_success")
+            self.assertEqual(payload["action_id"], 9)
 
     def test_lux_monitor_stale_timer_uses_guarded_local_deadline(self) -> None:
         self.assertFalse(lux_auto_ban_monitor_due(12_000, 11_000, 10.0, 10.34))
@@ -119,12 +213,15 @@ class DuoEvidenceTests(unittest.TestCase):
             def perform_champion_action(
                 champion_key: int, action: str, *,
                 expected_action_id: int | None = None,
+                expected_current_champion_ids: object | None = None,
+                verify_bannable: bool = True,
                 pre_commit_check: object | None = None,
             ) -> None:
                 if callable(pre_commit_check) and not pre_commit_check():
                     raise LcuActionStateChanged("cancelled")
                 calls.append((champion_key, action, expected_action_id))
-                performed.set()
+                if action == "ban":
+                    performed.set()
 
         app = AdvisorApp.__new__(AdvisorApp)
         app.lux_auto_ban_enabled = True
@@ -162,7 +259,9 @@ class DuoEvidenceTests(unittest.TestCase):
         while app._lux_auto_ban_monitoring and time.monotonic() < deadline:
             time.sleep(0.005)
 
-        self.assertEqual(calls, [(99, "ban", 77)])
+        self.assertEqual(calls, [
+            (99, "ban_hover", 77), (99, "ban", 77),
+        ])
         self.assertFalse(app._lux_auto_ban_monitoring)
         self.assertEqual(app._lux_auto_ban_completed_action_id, 77)
         self.assertGreaterEqual(len(blocked_ui_callbacks), 2)
@@ -192,12 +291,15 @@ class DuoEvidenceTests(unittest.TestCase):
             def perform_champion_action(
                 champion_key: int, action: str, *,
                 expected_action_id: int | None = None,
+                expected_current_champion_ids: object | None = None,
+                verify_bannable: bool = True,
                 pre_commit_check: object | None = None,
             ) -> None:
                 if callable(pre_commit_check) and not pre_commit_check():
                     raise LcuActionStateChanged("cancelled")
                 calls.append((champion_key, action, expected_action_id))
-                performed.set()
+                if action == "ban":
+                    performed.set()
 
         app = AdvisorApp.__new__(AdvisorApp)
         app.lux_auto_ban_enabled = True
@@ -223,7 +325,9 @@ class DuoEvidenceTests(unittest.TestCase):
         app.lux_auto_ban_enabled = False
         app._lux_auto_ban_watcher_wake.set()
 
-        self.assertEqual(calls, [(99, "ban", 91)])
+        self.assertEqual(calls, [
+            (99, "ban_hover", 91), (99, "ban", 91),
+        ])
         self.assertGreaterEqual(len(blocked_ui_callbacks), 2)
 
     def test_lux_monitor_releases_owner_after_unexpected_failure(self) -> None:
@@ -255,28 +359,47 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertFalse(app._lux_auto_ban_monitoring)
         self.assertIsNone(app._lux_auto_ban_action_id)
         self.assertIsNone(app._lux_auto_ban_completed_action_id)
-        self.assertGreaterEqual(len(statuses), 2)
+        self.assertGreaterEqual(len(statuses), 1)
 
     def test_lux_monitor_ignores_out_of_order_ui_status_callbacks(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)
         app._lux_auto_ban_lock = threading.RLock()
         app._lux_auto_ban_generation = 4
+        app._lux_auto_ban_action_id = 77
         app._lux_auto_ban_last_sampled_at = 0.0
+        app._lux_auto_ban_last_remaining_ms = None
         app._lux_auto_ban_status = "대기"
         callbacks: list[object] = []
         app._post_ui = lambda callback: callbacks.append(callback)
         app._render_automation_toggles = lambda: None
 
-        with patch(
-            "lol_support_advisor.ui.time.monotonic", side_effect=[10.0, 11.0],
-        ):
-            app._post_lux_auto_ban_status(4, "이전 상태")
-            app._post_lux_auto_ban_status(4, "최신 상태")
+        app._post_lux_auto_ban_status(4, "이전 상태")
+        app._post_lux_auto_ban_status(4, "최신 상태")
+        app._record_lux_auto_ban_timer_sample(4, 77, 9_000, 11.0)
+        app._record_lux_auto_ban_timer_sample(4, 77, 10_000, 10.0)
 
         callbacks[1]()
         callbacks[0]()
         self.assertEqual(app._lux_auto_ban_status, "최신 상태")
         self.assertEqual(app._lux_auto_ban_last_sampled_at, 11.0)
+        self.assertEqual(app._lux_auto_ban_last_remaining_ms, 9_000)
+
+    def test_lux_display_projects_latest_timer_sample_without_driving_action(self) -> None:
+        self.assertEqual(
+            projected_lux_auto_ban_remaining_ms(12_000, 100.0, 100.25),
+            11_750,
+        )
+        self.assertEqual(
+            projected_lux_auto_ban_remaining_ms(12_000, 100.0, 101.0),
+            11_000,
+        )
+        self.assertEqual(
+            projected_lux_auto_ban_remaining_ms(500, 100.0, 101.0),
+            0,
+        )
+        self.assertIsNone(
+            projected_lux_auto_ban_remaining_ms(None, 100.0, 101.0)
+        )
 
     def test_lux_monitor_cancels_before_write_when_toggle_turns_off(self) -> None:
         calls: list[object] = []
@@ -288,8 +411,10 @@ class DuoEvidenceTests(unittest.TestCase):
                 return {}
 
             @staticmethod
-            def perform_champion_action(*_args: object, **_kwargs: object) -> None:
-                calls.append("write")
+            def perform_champion_action(
+                _champion_key: int, action: str, **_kwargs: object,
+            ) -> None:
+                calls.append(action)
 
         app = AdvisorApp.__new__(AdvisorApp)
         app.lux_auto_ban_enabled = True
@@ -310,6 +435,13 @@ class DuoEvidenceTests(unittest.TestCase):
                 "phase": "BAN_PICK",
                 "adjustedTimeLeftInPhase": 30_000,
             },
+            "localPlayerCellId": 4,
+            "actions": [[{
+                "id": 88, "actorCellId": 4, "type": "ban",
+                "isInProgress": True, "completed": False,
+                "championId": 0,
+            }]],
+            "bans": {"myTeamBans": [], "theirTeamBans": []},
         }
 
         self.assertTrue(app._ensure_lux_auto_ban_monitor(88, session))
@@ -317,7 +449,7 @@ class DuoEvidenceTests(unittest.TestCase):
         app._reset_lux_auto_ban_schedule()
         time.sleep(0.2)
 
-        self.assertNotIn("write", calls)
+        self.assertNotIn("ban", calls)
         self.assertFalse(app._lux_auto_ban_monitoring)
 
     def test_recommendation_context_ignores_ban_hover_but_not_locked_ban(self) -> None:
@@ -527,6 +659,235 @@ class DuoEvidenceTests(unittest.TestCase):
             calls, [("opgg_meta_all", 6), ("opgg_builds_all", 36)]
         )
 
+    def test_riot_history_cooldown_is_fixed_to_one_minute(self) -> None:
+        calls: list[tuple[datetime | None, int]] = []
+
+        class FakeStorage:
+            @staticmethod
+            def riot_sync_cooldown_remaining(
+                now: datetime | None, minutes: int,
+            ) -> timedelta:
+                calls.append((now, minutes))
+                return timedelta(minutes=minutes)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.storage = FakeStorage()
+        now = datetime(2026, 8, 18, 12, 0, 0)
+
+        self.assertEqual(
+            app._riot_history_cooldown_remaining(now), timedelta(minutes=1)
+        )
+        self.assertEqual(calls, [(now, 1)])
+
+    def test_startup_history_sync_bypasses_the_one_minute_cache(self) -> None:
+        class FakeButton:
+            def configure(self, **_values: object) -> None:
+                pass
+
+        class FakeStorage:
+            @staticmethod
+            def get_setting(key: str) -> str:
+                return {
+                    "riot_game_name": "Me",
+                    "riot_tag_line": "KR1",
+                    "riot_api_key": "key",
+                }.get(key, "")
+
+            @staticmethod
+            def riot_api_key_needs_refresh() -> bool:
+                return False
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.storage = FakeStorage()
+        app._riot_syncing = False
+        app.game_phase = "Lobby"
+        app._riot_history_cooldown_remaining = lambda: timedelta(seconds=45)
+        app.riot_button = FakeButton()
+        jobs: list[object] = []
+        app._background = lambda work, _success, _error: jobs.append(work)
+
+        app._sync_riot(automatic=True, startup=True)
+
+        self.assertTrue(app._riot_syncing)
+        self.assertEqual(len(jobs), 1)
+
+    def test_pre_game_rank_snapshot_uses_cached_solo_entry(self) -> None:
+        class FakeStorage:
+            def __init__(self) -> None:
+                self.settings = {
+                    "riot_game_name": "Me", "riot_tag_line": "KR1",
+                    "riot_puuid": "mine",
+                }
+                self.saved: list[tuple[str, dict, str, str]] = []
+
+            def get_setting(self, key: str, default: str = "") -> str:
+                return self.settings.get(key, default)
+
+            def set_setting(self, key: str, value: str) -> None:
+                self.settings[key] = value
+
+            @staticmethod
+            def load_live_profile_any_age(_riot_id: str) -> tuple[str, dict, str]:
+                return "mine", {"solo_entry": {
+                    "queueType": "RANKED_SOLO_5x5", "tier": "GOLD",
+                    "rank": "I", "leaguePoints": 40, "wins": 10,
+                    "losses": 10,
+                }}, "2026-08-18T12:00:00"
+
+            def save_rank_snapshot(
+                self, puuid: str, entry: dict, *, stage: str,
+                session_key: str,
+            ) -> object:
+                self.saved.append((puuid, entry, stage, session_key))
+                return SimpleNamespace(snapshot_id=1, session_key=session_key)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app.storage = FakeStorage()
+        app.draft = DraftSnapshot(snapshot_id="DRAFT-1")
+
+        self.assertTrue(app._capture_pre_game_rank_snapshot(force_new=True))
+
+        self.assertEqual(app.storage.saved[0][0:3], (
+            "mine", app.storage.saved[0][1], "PRE",
+        ))
+        session_key = app.storage.settings["rank_snapshot_active_session"]
+        self.assertTrue(session_key.startswith("solo-"))
+        self.assertEqual(app.storage.settings["rank_snapshot_active_puuid"], "mine")
+
+    def test_post_sync_resolves_and_clears_rank_session(self) -> None:
+        class FakeStorage:
+            def __init__(self) -> None:
+                self.settings = {
+                    "riot_game_name": "Me", "riot_tag_line": "KR1",
+                    "rank_snapshot_active_session": "solo-session",
+                    "rank_snapshot_active_puuid": "mine",
+                }
+                self.saved_stage = ""
+
+            def get_setting(self, key: str, default: str = "") -> str:
+                return self.settings.get(key, default)
+
+            def set_setting(self, key: str, value: str) -> None:
+                self.settings[key] = value
+
+            @staticmethod
+            def load_live_profile_any_age(_riot_id: str) -> tuple[str, dict, str]:
+                return "mine", {"solo_entry": {
+                    "queueType": "RANKED_SOLO_5x5", "tier": "GOLD",
+                    "rank": "I", "leaguePoints": 63, "wins": 11,
+                    "losses": 10,
+                }}, "2026-08-18T13:00:00"
+
+            def save_rank_snapshot(
+                self, _puuid: str, _entry: dict, *, stage: str,
+                session_key: str,
+            ) -> object:
+                self.saved_stage = stage
+                return SimpleNamespace(snapshot_id=2, session_key=session_key)
+
+            @staticmethod
+            def player_matches(_puuid: str, limit: int) -> list[dict]:
+                return [{"metadata": {"matchId": "KR_1"}}]
+
+            @staticmethod
+            def resolve_match_lp_changes(_puuid: str, _matches: object) -> int:
+                return 1
+
+            @staticmethod
+            def load_rank_snapshots(_puuid: str) -> list[object]:
+                return [
+                    SimpleNamespace(snapshot_id=1, session_key="solo-session"),
+                    SimpleNamespace(snapshot_id=2, session_key="solo-session"),
+                ]
+
+            @staticmethod
+            def load_match_lp_changes(_match_ids: object) -> dict:
+                return {}
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.storage = FakeStorage()
+
+        self.assertEqual(app._finalize_pending_rank_snapshot("mine"), 1)
+        self.assertEqual(app.storage.saved_stage, "POST")
+        self.assertEqual(app.storage.settings["rank_snapshot_active_session"], "")
+        self.assertEqual(app.storage.settings["rank_snapshot_active_puuid"], "")
+
+    def test_history_load_batch_attaches_exact_lp(self) -> None:
+        entry = MatchHistoryEntry(
+            match_id="KR_1", game_creation=1, duration_seconds=1800,
+            queue_id=420, champion_id="Janna", position="SUPPORT", won=True,
+            kills=1, deaths=2, assists=10, kda=5.5, cs=30,
+            cs_per_minute=1.0, vision_score=50, damage_to_champions=5000,
+            damage_taken=4000, gold_earned=8000, kill_participation=60.0,
+            items=(), ally_champions=(), enemy_champions=(),
+        )
+        overview = HistoryOverview(entries=[entry], games=1, wins=1)
+        change = MatchLpChange(
+            match_id="KR_1", puuid="mine", before_snapshot_id=1,
+            after_snapshot_id=2, before_tier="GOLD", before_division="I",
+            before_lp=40, after_tier="GOLD", after_division="I",
+            after_lp=63, lp_delta=23, confidence="EXACT",
+            resolved_at="2026-08-18T13:00:00",
+        )
+
+        class FakeLabel:
+            def configure(self, **_values: object) -> None:
+                pass
+
+        class FakeStorage:
+            loaded_ids: list[str] = []
+
+            @staticmethod
+            def get_setting(key: str, default: str = "") -> str:
+                return {
+                    "riot_game_name": "Me", "riot_tag_line": "KR1",
+                    "riot_puuid": "mine",
+                }.get(key, default)
+
+            @staticmethod
+            def find_puuid_by_riot_id(_riot_id: str) -> str:
+                return "mine"
+
+            @staticmethod
+            def match_revision() -> tuple[int, int]:
+                return 1, 1
+
+            @staticmethod
+            def player_matches(_puuid: str, limit: int) -> list[dict]:
+                return []
+
+            @staticmethod
+            def resolve_game_predictions(_matches: object) -> int:
+                return 0
+
+            @classmethod
+            def load_match_lp_changes(cls, match_ids: object) -> dict:
+                cls.loaded_ids = list(match_ids)
+                return {"KR_1": change}
+
+            @staticmethod
+            def load_game_predictions(_match_ids: object) -> dict:
+                return {}
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.storage = FakeStorage()
+        app._history_loading = False
+        app._history_reload_requested = False
+        app._history_revision = None
+        app._history_visible_count = 10
+        app.history_overview = None
+        app.history_status_label = FakeLabel()
+        app._render_history = lambda: None
+        app._background = lambda work, success, _error: success(work())
+
+        with patch("lol_support_advisor.ui.analyze_history", return_value=overview):
+            app._ensure_history_loaded(force=True)
+
+        self.assertEqual(app.storage.loaded_ids, ["KR_1"])
+        self.assertEqual(app.history_overview.entries[0].lp_delta, 23)
+        self.assertEqual(app.history_overview.recent_20_lp_sum, 23)
+
     def test_rune_style_wheel_only_scrolls_page(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)
         routed_events: list[object] = []
@@ -584,6 +945,178 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(len(prediction.ally_champion_ids), 5)
         self.assertTrue(prediction.prediction_key)
 
+    def test_live_prediction_uses_both_teams_previous_game_condition(self) -> None:
+        ally = LivePlayer(
+            "Thresh", "쓰레쉬", "Me", "KR1", "ORDER", "SUPPORT",
+            is_active_player=True,
+        )
+        enemy = LivePlayer(
+            "Leona", "레오나", "Enemy", "KR1", "CHAOS", "SUPPORT",
+        )
+        snapshot = LiveGameSnapshot(
+            players=[ally, enemy], active_team="ORDER", active_riot_id=ally.riot_id,
+        )
+        common = dict(
+            tier="GOLD", rank="II", season_wins=50, season_losses=50,
+            champion_games=20, champion_wins=10, recent_games=10,
+            recent_wins=5, status="OK",
+        )
+        profiles = {
+            ally.riot_id: PlayerProfileStat(
+                **common,
+                last_game_champion_id="Thresh", last_game_kills=8,
+                last_game_deaths=2, last_game_assists=15,
+                last_game_won=True, last_op_score_rank=1,
+            ),
+            enemy.riot_id: PlayerProfileStat(
+                **common,
+                last_game_champion_id="Leona", last_game_kills=0,
+                last_game_deaths=11, last_game_assists=2,
+                last_game_won=False, last_op_score_rank=10,
+            ),
+        }
+
+        prediction = estimate_live_game_prediction(snapshot, profiles, {}, {})
+
+        self.assertGreater(prediction.win_probability, 50.0)
+        self.assertTrue(any(
+            "직전판 컨디션" in evidence for evidence in prediction.evidence
+        ))
+
+    def test_live_prediction_damps_recent_form_by_paired_position_coverage(self) -> None:
+        positions = ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "SUPPORT")
+
+        def prediction_for(pair_count: int) -> GamePrediction:
+            players: list[LivePlayer] = []
+            profiles: dict[str, PlayerProfileStat] = {}
+            for index, position in enumerate(positions[:pair_count]):
+                ally = LivePlayer(
+                    "Janna", "잔나", f"Ally{index}", "KR1", "ORDER", position,
+                    is_active_player=index == 0,
+                )
+                enemy = LivePlayer(
+                    "Leona", "레오나", f"Enemy{index}", "KR1", "CHAOS", position,
+                )
+                players.extend((ally, enemy))
+                common = dict(
+                    tier="GOLD", rank="II", season_wins=50, season_losses=50,
+                    champion_games=20, champion_wins=10, status="OK",
+                )
+                profiles[ally.riot_id] = PlayerProfileStat(
+                    **common, recent_games=10, recent_wins=10,
+                )
+                profiles[enemy.riot_id] = PlayerProfileStat(
+                    **common, recent_games=10, recent_wins=0,
+                )
+            return estimate_live_game_prediction(
+                LiveGameSnapshot(players=players, active_team="ORDER"),
+                profiles, {}, {},
+            )
+
+        one_pair = prediction_for(1)
+        five_pairs = prediction_for(5)
+
+        self.assertGreater(five_pairs.win_probability, one_pair.win_probability)
+        self.assertLessEqual(one_pair.win_probability - 50.0, 0.7)
+        self.assertEqual(five_pairs.win_probability, 53.0)
+
+    def test_live_prediction_recent_family_is_symmetric_and_capped(self) -> None:
+        positions = ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "SUPPORT")
+        players: list[LivePlayer] = []
+        profiles: dict[str, PlayerProfileStat] = {}
+        swapped: dict[str, PlayerProfileStat] = {}
+        for index, position in enumerate(positions):
+            ally = LivePlayer(
+                "Janna", "잔나", f"Ally{index}", "KR1", "ORDER", position,
+                is_active_player=index == 0,
+            )
+            enemy = LivePlayer(
+                "Leona", "레오나", f"Enemy{index}", "KR1", "CHAOS", position,
+            )
+            players.extend((ally, enemy))
+            common = dict(
+                tier="GOLD", rank="II", season_wins=50, season_losses=50,
+                champion_games=20, champion_wins=10, status="OK",
+            )
+            strong = PlayerProfileStat(
+                **common, recent_games=10, recent_wins=10,
+                recent_kills=100, recent_deaths=1, recent_assists=100,
+                overall_streak=10, last_game_champion_id="Janna",
+                last_game_kills=20, last_game_deaths=0, last_game_assists=20,
+                last_game_won=True, last_op_score_rank=1,
+            )
+            weak = PlayerProfileStat(
+                **common, recent_games=10, recent_wins=0,
+                recent_kills=0, recent_deaths=100, recent_assists=0,
+                overall_streak=-10, last_game_champion_id="Leona",
+                last_game_kills=0, last_game_deaths=20, last_game_assists=0,
+                last_game_won=False, last_op_score_rank=10,
+            )
+            profiles[ally.riot_id], profiles[enemy.riot_id] = strong, weak
+            swapped[ally.riot_id], swapped[enemy.riot_id] = weak, strong
+        snapshot = LiveGameSnapshot(players=players, active_team="ORDER")
+
+        favorable = estimate_live_game_prediction(snapshot, profiles, {}, {})
+        unfavorable = estimate_live_game_prediction(snapshot, swapped, {}, {})
+
+        self.assertLessEqual(favorable.win_probability, 53.5)
+        self.assertAlmostEqual(
+            favorable.win_probability + unfavorable.win_probability,
+            100.0,
+        )
+
+    def test_live_prediction_ignores_unpaired_recent_form(self) -> None:
+        ally = LivePlayer(
+            "Janna", "잔나", "Ally", "KR1", "ORDER", "SUPPORT",
+            is_active_player=True,
+        )
+        enemy = LivePlayer(
+            "Leona", "레오나", "Enemy", "KR1", "CHAOS", "SUPPORT",
+        )
+        common = dict(
+            tier="GOLD", rank="II", season_wins=50, season_losses=50,
+            champion_games=20, champion_wins=10, status="OK",
+        )
+        profiles = {
+            ally.riot_id: PlayerProfileStat(
+                **common, recent_games=10, recent_wins=10,
+                recent_kills=100, recent_deaths=1, recent_assists=100,
+                overall_streak=10,
+            ),
+            enemy.riot_id: PlayerProfileStat(**common),
+        }
+
+        prediction = estimate_live_game_prediction(
+            LiveGameSnapshot(players=[ally, enemy], active_team="ORDER"),
+            profiles, {}, {},
+        )
+
+        self.assertEqual(prediction.win_probability, 50.0)
+        self.assertFalse(any(
+            "최근 폼" in evidence for evidence in prediction.evidence
+        ))
+
+    def test_recent_prediction_accuracy_ignores_matches_older_than_twenty(self) -> None:
+        entries = [
+            SimpleNamespace(prediction_correct=index % 2 == 0)
+            for index in range(20)
+        ] + [SimpleNamespace(prediction_correct=True) for _ in range(5)]
+
+        self.assertEqual(recent_prediction_accuracy(entries), (10, 20, 50.0))
+
+    def test_lp_text_shows_only_exact_observations(self) -> None:
+        exact = SimpleNamespace(lp_delta=23, lp_confidence="EXACT")
+        transition = SimpleNamespace(lp_delta=None, lp_confidence="TRANSITION")
+        inferred = SimpleNamespace(lp_delta=18, lp_confidence="INFERRED")
+
+        self.assertEqual(exact_lp_badge_text(exact), "+23 LP")
+        self.assertEqual(exact_lp_badge_text(transition), "")
+        self.assertEqual(exact_lp_badge_text(inferred), "")
+        self.assertEqual(
+            recent_exact_lp_summary([exact, transition, inferred]),
+            (23, 1, 3),
+        )
+
     def test_recent_match_id_page_uses_daily_cache_but_keeps_stale_fallback(self) -> None:
         now = datetime(2026, 8, 18, 12, 0, 0)
         payload = {
@@ -621,6 +1154,8 @@ class DuoEvidenceTests(unittest.TestCase):
         profile = OpggMcpSummonerProfile(
             riot_id="Player#KR1", game_name="Player", tag_line="KR1",
             recent_matches=[
+                replace(match("WIN", 89, 20, 0, 20, 10.0, 1), game_type="ARAM"),
+                replace(match("WIN", 89, 10, 0, 10, 9.0, 1), result="REMAKE"),
                 match("WIN", 40, 1, 2, 13, 7.8, 2),
                 match("WIN", 89, 2, 3, 10, 6.2, 4),
                 match("LOSE", 89, 0, 5, 4, 3.0, 9),
@@ -635,9 +1170,43 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(form["overall_streak"], 2)
         self.assertEqual(form["champion_streak"], 3)
         self.assertEqual((form["recent_kills"], form["recent_deaths"]), (6, 19))
+        self.assertEqual(form["last_game_champion_key"], 40)
+        self.assertEqual(
+            (
+                form["last_game_kills"], form["last_game_deaths"],
+                form["last_game_assists"], form["last_game_won"],
+                form["last_op_score_rank"],
+            ),
+            (1, 2, 13, True, 2),
+        )
         self.assertEqual(streak_badge_text(3), "3연승 중")
         self.assertEqual(streak_badge_text(-10, "잔나 "), "잔나 10+연패 중")
         self.assertEqual(streak_badge_text(1), "")
+
+    def test_opgg_recent_form_uses_newest_completed_solo_match(self) -> None:
+        older = OpggMcpRecentMatch(
+            match_id="older", created_at="2026-08-18T01:00:00",
+            game_type="SOLORANKED", champion_key=40, champion_name="잔나",
+            position="SUPPORT", result="WIN", kills=2, deaths=1, assists=10,
+            op_score=8.0, op_score_rank=2,
+        )
+        newest = OpggMcpRecentMatch(
+            match_id="newest", created_at="2026-08-18T02:00:00",
+            game_type="SOLORANKED", champion_key=89, champion_name="레오나",
+            position="SUPPORT", result="LOSE", kills=0, deaths=7, assists=5,
+            op_score=3.5, op_score_rank=9,
+        )
+        profile = OpggMcpSummonerProfile(
+            riot_id="Player#KR1", game_name="Player", tag_line="KR1",
+            recent_matches=[older, newest], recent_matches_status="OK",
+            status="OK",
+        )
+
+        form = opgg_recent_form(profile, 40)
+
+        self.assertEqual(form["last_game_champion_key"], 89)
+        self.assertEqual(form["last_game_won"], False)
+        self.assertEqual(form["last_op_score_rank"], 9)
 
     def test_behavior_signals_separate_strengths_and_actionable_weaknesses(self) -> None:
         stat = PlayerBehaviorStat(
@@ -681,13 +1250,23 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(set(ranks.values()), set(range(1, 11)))
 
     def test_opgg_profile_overlays_other_player_champion_record(self) -> None:
-        app = SimpleNamespace(registry=SimpleNamespace(by_id={"Janna": (40, "잔나")}))
+        app = SimpleNamespace(registry=SimpleNamespace(
+            by_id={"Janna": (40, "잔나")},
+            by_key={89: ("Leona", "레오나")},
+        ))
         player = LivePlayer("Janna", "잔나", "Player", "KR1", "ORDER")
         opgg = OpggMcpSummonerProfile(
             riot_id="Player#KR1", game_name="Player", tag_line="KR1",
             tier="EMERALD", division="II", league_points=64,
             season_wins=31, season_losses=22, fetched_at="2026-08-18T01:00:00",
             champion_stats=[OpggMcpChampionStat(40, "잔나", 12, 8, 4)],
+            recent_matches=[OpggMcpRecentMatch(
+                match_id="KR_LAST", created_at="2026-08-18T00:50:00",
+                game_type="SOLORANKED", champion_key=89,
+                champion_name="레오나", position="SUPPORT", result="LOSE",
+                kills=1, deaths=7, assists=8, op_score=4.2, op_score_rank=8,
+            )],
+            recent_matches_status="OK",
             status="OK",
         )
         merged = AdvisorApp._profile_with_opgg(
@@ -698,6 +1277,15 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual((merged.tier, merged.rank, merged.league_points), (
             "EMERALD", "II", 64,
         ))
+        self.assertEqual(merged.last_game_champion_id, "Leona")
+        self.assertEqual(
+            (
+                merged.last_game_kills, merged.last_game_deaths,
+                merged.last_game_assists, merged.last_game_won,
+                merged.last_op_score_rank,
+            ),
+            (1, 7, 8, False, 8),
+        )
 
     def test_missing_opgg_top_champion_is_not_reported_as_zero_percent(self) -> None:
         app = SimpleNamespace(registry=SimpleNamespace(by_id={"Thresh": (412, "쓰레쉬")}))
@@ -812,6 +1400,89 @@ class DuoEvidenceTests(unittest.TestCase):
         allies, enemies = AdvisorApp._live_team_groups(players, "ORDER")
         self.assertEqual([player.riot_id for player in allies], ["Ally#KR1"])
         self.assertEqual([player.riot_id for player in enemies], ["Enemy#KR2"])
+
+    def test_duo_groups_share_pair_color_and_separate_other_pairs(self) -> None:
+        players = [
+            LivePlayer("Garen", "가렌", "AllyTop", "KR1", "ORDER"),
+            LivePlayer("LeeSin", "리 신", "AllyJgl", "KR1", "ORDER"),
+            LivePlayer("Ahri", "아리", "AllyMid", "KR1", "ORDER"),
+            LivePlayer("Jinx", "징크스", "AllyAdc", "KR1", "ORDER"),
+            LivePlayer("Leona", "레오나", "EnemyTop", "KR1", "CHAOS"),
+            LivePlayer("Viego", "비에고", "EnemyJgl", "KR1", "CHAOS"),
+        ]
+        pairs = {
+            "allytop#kr1": [("ALLYJGL#KR1", "매우 유력", "직전 2경기 동팀")],
+            "AllyJgl#KR1": [("AllyTop#KR1", "매우 유력", "직전 2경기 동팀")],
+            "AllyMid#KR1": [("AllyAdc#KR1", "매우 유력", "3회 동팀")],
+            "AllyAdc#KR1": [("AllyMid#KR1", "매우 유력", "3회 동팀")],
+            "EnemyTop#KR1": [("EnemyJgl#KR1", "유력", "2회 동팀")],
+            "EnemyJgl#KR1": [("EnemyTop#KR1", "유력", "2회 동팀")],
+        }
+        visuals = duo_group_visuals(players, pairs)
+
+        self.assertEqual(visuals["AllyTop#KR1"][:2], visuals["AllyJgl#KR1"][:2])
+        self.assertEqual(visuals["AllyMid#KR1"][:2], visuals["AllyAdc#KR1"][:2])
+        self.assertEqual(visuals["EnemyTop#KR1"][:2], visuals["EnemyJgl#KR1"][:2])
+        colors = {
+            visuals["AllyTop#KR1"][1],
+            visuals["AllyMid#KR1"][1],
+            visuals["EnemyTop#KR1"][1],
+        }
+        self.assertEqual(len(colors), 3)
+        self.assertEqual(visuals["AllyTop#KR1"][2], "AllyJgl#KR1")
+        self.assertEqual(visuals["AllyJgl#KR1"][2], "AllyTop#KR1")
+
+    def test_duo_group_assignment_is_deterministic_and_prefers_strong_edge(self) -> None:
+        players = [
+            LivePlayer("Garen", "가렌", "A", "KR1", "ORDER"),
+            LivePlayer("LeeSin", "리 신", "B", "KR1", "ORDER"),
+            LivePlayer("Ahri", "아리", "C", "KR1", "ORDER"),
+            LivePlayer("Leona", "레오나", "Enemy", "KR1", "CHAOS"),
+        ]
+        pairs = {
+            "A#KR1": [
+                ("B#KR1", "가능", "1회 동팀"),
+                ("C#KR1", "매우 유력", "직전 2경기 동팀"),
+                ("Enemy#KR1", "매우 유력", "상대팀이라 무시"),
+            ],
+            "C#KR1": [("A#KR1", "매우 유력", "직전 2경기 동팀")],
+            "B#KR1": [("A#KR1", "가능", "1회 동팀")],
+        }
+        reversed_pairs = dict(reversed(list(pairs.items())))
+        first = duo_group_visuals(players, pairs)
+        second = duo_group_visuals(players, reversed_pairs)
+        reversed_roster = duo_group_visuals(list(reversed(players)), pairs)
+
+        self.assertEqual(first, second)
+        self.assertEqual(first, reversed_roster)
+        self.assertEqual(first["A#KR1"][2], "C#KR1")
+        self.assertEqual(first["C#KR1"][2], "A#KR1")
+        self.assertNotIn("B#KR1", first)
+        self.assertNotIn("Enemy#KR1", first)
+
+    def test_card_signature_tracks_derived_duo_group_color(self) -> None:
+        players = [
+            LivePlayer("Garen", "가렌", "C", "KR1", "ORDER", "TOP"),
+            LivePlayer("LeeSin", "리 신", "D", "KR1", "ORDER", "JUNGLE"),
+            LivePlayer("Ahri", "아리", "A", "KR1", "ORDER", "MIDDLE"),
+            LivePlayer("Jinx", "징크스", "B", "KR1", "ORDER", "BOTTOM"),
+        ]
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.live_game = LiveGameSnapshot(players=players, active_team="ORDER")
+        app.player_profiles = {
+            player.riot_id: PlayerProfileStat(status="LOADING") for player in players
+        }
+        app.lane_matchups = {}
+        app.duo_pairs = {
+            "A#KR1": [("B#KR1", "유력", "2회 동팀")],
+            "B#KR1": [("A#KR1", "유력", "2회 동팀")],
+        }
+        first = app._single_play_card_signature(players[2])
+        app.duo_pairs.update({
+            "C#KR1": [("D#KR1", "매우 유력", "직전 2경기 동팀")],
+            "D#KR1": [("C#KR1", "매우 유력", "직전 2경기 동팀")],
+        })
+        self.assertNotEqual(first, app._single_play_card_signature(players[2]))
 
     def test_play_cards_do_not_rebuild_when_only_game_time_changes(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)
@@ -1075,6 +1746,146 @@ class DuoEvidenceTests(unittest.TestCase):
             app.play_prediction_frame.pack_values.get("before"),
             app.play_insight_body,
         )
+
+    def test_saved_accuracy_baseline_does_not_freeze_live_candidate(self) -> None:
+        class FakeLabel:
+            def __init__(self) -> None:
+                self.values: dict[str, object] = {}
+
+            def configure(self, **values: object) -> None:
+                self.values.update(values)
+
+        players = [
+            LivePlayer(
+                "Janna" if index < 5 else "Leona",
+                "잔나" if index < 5 else "레오나",
+                f"Player{index}", "KR1",
+                "ORDER" if index < 5 else "CHAOS",
+                ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "SUPPORT")[index % 5],
+                is_active_player=index == 0,
+            )
+            for index in range(10)
+        ]
+        baseline = GamePrediction(
+            prediction_key="same-game", captured_at="2026-08-18T01:00:00",
+            active_riot_id=players[0].riot_id, active_champion_id="Janna",
+            ally_champion_ids=("Janna",) * 5,
+            enemy_champion_ids=("Leona",) * 5,
+            ally_riot_ids=tuple(player.riot_id for player in players[:5]),
+            enemy_riot_ids=tuple(player.riot_id for player in players[5:]),
+            win_probability=48.0, predicted_win=False, confidence="보통",
+            evidence=("저장 기준",), evidence_score=0.6,
+        )
+        candidate = replace(
+            baseline, captured_at="2026-08-18T01:00:10",
+            win_probability=57.0, predicted_win=True,
+            evidence=("최신 후보",),
+        )
+        value, detail = FakeLabel(), FakeLabel()
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app.root = SimpleNamespace(after_cancel=lambda _callback_id: None)
+        app.storage = SimpleNamespace(
+            load_game_prediction_by_key=lambda _key: baseline,
+        )
+        app.play_metrics = {"prediction": (value, detail)}
+        app.live_game = LiveGameSnapshot(players=players, active_team="ORDER")
+        app.player_profiles = {}
+        app.lane_matchups = {}
+        app.duo_pairs = {}
+        app._live_signature = "LIVE"
+        app._prediction_baseline_key = ""
+        app._prediction_baseline = None
+        app._prediction_settle_after_id = None
+        app._prediction_save_after_id = None
+        app._prediction_saved_signature = ""
+
+        with patch(
+            "lol_support_advisor.ui.estimate_live_game_prediction",
+            return_value=candidate,
+        ):
+            app._update_live_prediction()
+
+        self.assertIs(app._prediction_baseline, baseline)
+        self.assertIs(app._live_prediction, candidate)
+        self.assertIn("57.0%", str(value.values.get("text")))
+
+    def test_prediction_baseline_waits_until_loaders_settle(self) -> None:
+        class FakeLabel:
+            def configure(self, **_values: object) -> None:
+                pass
+
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.pending: dict[str, tuple[int, object]] = {}
+                self.serial = 0
+
+            def after(self, delay: int, callback: object) -> str:
+                self.serial += 1
+                callback_id = f"after-{self.serial}"
+                self.pending[callback_id] = (delay, callback)
+                return callback_id
+
+            def after_cancel(self, callback_id: str) -> None:
+                self.pending.pop(callback_id, None)
+
+        players = [
+            LivePlayer(
+                "Janna", "잔나", f"Player{index}", "KR1",
+                "ORDER" if index < 5 else "CHAOS",
+                ("TOP", "JUNGLE", "MIDDLE", "BOTTOM", "SUPPORT")[index % 5],
+                is_active_player=index == 0,
+            )
+            for index in range(10)
+        ]
+        candidate = GamePrediction(
+            prediction_key="settling-game", captured_at="2026-08-18T01:00:00",
+            active_riot_id=players[0].riot_id, active_champion_id="Janna",
+            ally_champion_ids=("Janna",) * 5,
+            enemy_champion_ids=("Janna",) * 5,
+            ally_riot_ids=tuple(player.riot_id for player in players[:5]),
+            enemy_riot_ids=tuple(player.riot_id for player in players[5:]),
+            win_probability=52.0, predicted_win=True, confidence="보통",
+            evidence=("수집 중",), evidence_score=0.5,
+        )
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app.root = FakeRoot()
+        app.storage = SimpleNamespace(load_game_prediction_by_key=lambda _key: None)
+        app.play_metrics = {"prediction": (FakeLabel(), FakeLabel())}
+        app.live_game = LiveGameSnapshot(players=players, active_team="ORDER")
+        app.player_profiles = {}
+        app.lane_matchups = {}
+        app.duo_pairs = {}
+        app._live_signature = "LIVE"
+        app._lane_matchup_refreshing = set()
+        app._profiles_loading = True
+        app._opgg_profiles_loading = False
+        app._duo_checking = False
+        app._prediction_baseline_key = ""
+        app._prediction_baseline = None
+        app._prediction_settle_after_id = None
+        app._prediction_save_after_id = None
+        app._prediction_save_queued = None
+        app._prediction_saved_signature = ""
+
+        with patch(
+            "lol_support_advisor.ui.estimate_live_game_prediction",
+            return_value=candidate,
+        ):
+            app._update_live_prediction()
+            self.assertTrue(any(
+                delay >= 11_000 for delay, _callback in app.root.pending.values()
+            ))
+            self.assertIsNone(app._prediction_save_after_id)
+
+            app._profiles_loading = False
+            app._update_live_prediction()
+
+        self.assertTrue(any(
+            delay == 550 for delay, _callback in app.root.pending.values()
+        ))
+        self.assertIsNotNone(app._prediction_save_after_id)
 
     def test_draft_pick_context_is_read_from_storage_only_once(self) -> None:
         reads: list[str] = []
