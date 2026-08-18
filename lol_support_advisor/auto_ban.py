@@ -6,6 +6,8 @@ from collections.abc import Callable
 
 AUTO_BAN_TARGET_MIN_MS = 15_000
 AUTO_BAN_TARGET_MAX_MS = 18_000
+AUTO_BAN_STAGE_LEAD_MIN_MS = 900
+AUTO_BAN_STAGE_LEAD_MAX_MS = 1_400
 AUTO_BAN_STALE_TIMER_GRACE_SECONDS = 0.35
 
 
@@ -15,6 +17,14 @@ def choose_auto_ban_target_ms(
     """Choose a safe, non-identical point before the ban timer expires."""
     picker = randint or random.randint
     return int(picker(AUTO_BAN_TARGET_MIN_MS, AUTO_BAN_TARGET_MAX_MS))
+
+
+def choose_auto_ban_stage_lead_ms(
+    randint: Callable[[int, int], int] | None = None,
+) -> int:
+    """Choose a short pause between showing the champion and banning it."""
+    picker = randint or random.randint
+    return int(picker(AUTO_BAN_STAGE_LEAD_MIN_MS, AUTO_BAN_STAGE_LEAD_MAX_MS))
 
 
 def auto_ban_monitor_due(
@@ -30,6 +40,23 @@ def auto_ban_monitor_due(
         remaining_ms <= max(0, int(target_ms))
         or now_monotonic
         >= deadline + AUTO_BAN_STALE_TIMER_GRACE_SECONDS
+    )
+
+
+def auto_ban_stage_due(
+    remaining_ms: int | None,
+    target_ms: int,
+    stage_lead_ms: int,
+    deadline: float,
+    now_monotonic: float,
+) -> bool:
+    """Return true only shortly before the final ban commit is due."""
+    lead_ms = max(0, int(stage_lead_ms))
+    return auto_ban_monitor_due(
+        remaining_ms,
+        max(0, int(target_ms)) + lead_ms,
+        float(deadline) - lead_ms / 1000.0,
+        now_monotonic,
     )
 
 

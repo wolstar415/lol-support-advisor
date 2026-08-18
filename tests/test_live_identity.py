@@ -4,8 +4,8 @@ from dataclasses import replace
 import unittest
 
 from lol_support_advisor.live_identity import (
-    live_identity_count, merge_live_roster_identities,
-    update_live_identity_payload,
+    gameflow_puuid_by_champion, gameflow_summoner_id_by_champion,
+    live_identity_count, merge_live_roster_identities, update_live_identity_payload,
 )
 from lol_support_advisor.models import LiveGameSnapshot, LivePlayer
 
@@ -108,6 +108,43 @@ class LiveIdentityTests(unittest.TestCase):
             ],
         )
         self.assertIs(update_live_identity_payload(hidden, second, now=102.0), second)
+
+    def test_gameflow_session_keeps_private_player_puuids_by_champion(self) -> None:
+        session = {"gameData": {"playerChampionSelections": [
+            {"championId": 24, "puuid": "top-puuid"},
+            {"championId": 412, "puuid": "support-puuid"},
+            {"championId": 0, "puuid": "ignored"},
+        ]}}
+        self.assertEqual(gameflow_puuid_by_champion(session), {
+            24: "top-puuid", 412: "support-puuid",
+        })
+
+    def test_ambiguous_duplicate_champion_is_not_used_as_identity_join(self) -> None:
+        session = {"gameData": {"playerChampionSelections": [
+            {"championId": 24, "puuid": "first"},
+            {"championId": 24, "puuid": "second"},
+        ]}}
+        self.assertEqual(gameflow_puuid_by_champion(session), {})
+
+    def test_gameflow_teams_keep_local_summoner_ids_in_privacy_mode(self) -> None:
+        session = {"gameData": {
+            "teamOne": [
+                {"championId": 24, "summonerId": 1234567, "summonerName": ""},
+            ],
+            "teamTwo": [
+                {"championId": 412, "summonerId": "7654321", "summonerName": ""},
+            ],
+        }}
+        self.assertEqual(gameflow_summoner_id_by_champion(session), {
+            24: "1234567", 412: "7654321",
+        })
+
+    def test_ambiguous_summoner_id_join_is_discarded(self) -> None:
+        session = {"gameData": {
+            "teamOne": [{"championId": 24, "summonerId": "first"}],
+            "teamTwo": [{"championId": 24, "summonerId": "second"}],
+        }}
+        self.assertEqual(gameflow_summoner_id_by_champion(session), {})
 
 
 if __name__ == "__main__":

@@ -4,6 +4,14 @@ from dataclasses import dataclass, field
 from typing import Any, Iterable
 
 
+PERFORMANCE_BADGE_CODES = (
+    "CC", "VISION", "TANKING", "DAMAGE", "TEAMPLAY",
+    "PERFECT_KDA", "KILL_CARRY", "ASSIST_MASTER", "PROTECTOR",
+    "OBJECTIVE", "SIEGE", "WARD_CLEAR", "SURVIVOR", "KILLING_SPREE",
+    "FIRST_BLOOD", "OBJECTIVE_STEAL", "FARM",
+)
+
+
 @dataclass(slots=True, frozen=True)
 class RankSnapshot:
     """One observed solo-queue rank state.
@@ -102,6 +110,21 @@ class MatchHistoryEntry:
     secondary_rune_style_id: int = 0
     ally_players: tuple[tuple[str, str], ...] = ()
     enemy_players: tuple[tuple[str, str], ...] = ()
+    damage_self_mitigated: int = 0
+    time_ccing_others: int = 0
+    wards_placed: int = 0
+    control_wards_placed: int = 0
+    wards_killed: int = 0
+    healing_on_teammates: int = 0
+    shielding_on_teammates: int = 0
+    damage_to_objectives: int = 0
+    damage_to_turrets: int = 0
+    turret_kills: int = 0
+    objectives_stolen: int = 0
+    largest_killing_spree: int = 0
+    largest_multi_kill: int = 0
+    first_blood_participation: bool = False
+    performance_badges: tuple[str, ...] = ()
     predicted_win_rate: float | None = None
     predicted_win: bool | None = None
     prediction_confidence: str = ""
@@ -281,6 +304,140 @@ def _rune_loadout(payload: dict[str, Any]) -> tuple[int, int]:
     return primary, secondary_style
 
 
+def _team_rank(
+    mine: dict[str, Any], allies: list[dict[str, Any]], key: str,
+) -> int:
+    value = _integer(mine, key)
+    return 1 + sum(_integer(row, key) > value for row in allies if row is not mine)
+
+
+def _team_combined_rank(
+    mine: dict[str, Any], allies: list[dict[str, Any]], keys: tuple[str, ...],
+) -> int:
+    value = sum(_integer(mine, key) for key in keys)
+    return 1 + sum(
+        sum(_integer(row, key) for key in keys) > value
+        for row in allies if row is not mine
+    )
+
+
+def _performance_badges(
+    mine: dict[str, Any], allies: list[dict[str, Any]], duration: int,
+    position: str, kill_participation: float | None,
+) -> tuple[str, ...]:
+    """Return conservative, explainable match-card achievement codes.
+
+    These are not opaque ratings. A badge needs both an absolute per-minute
+    floor and a top-two team rank so short games and inflated single metrics do
+    not award everything at once.
+    """
+    minutes = max(duration / 60.0, 1.0)
+    cc_time = _integer(mine, "timeCCingOthers")
+    vision = _integer(mine, "visionScore")
+    wards = _integer(mine, "wardsPlaced")
+    mitigated = _integer(mine, "damageSelfMitigated")
+    damage_taken = _integer(mine, "totalDamageTaken")
+    damage = _integer(mine, "totalDamageDealtToChampions")
+    kills = _integer(mine, "kills")
+    deaths = _integer(mine, "deaths")
+    assists = _integer(mine, "assists")
+    takedowns = kills + assists
+    wards_killed = _integer(mine, "wardsKilled")
+    teammate_healing = _integer(mine, "totalHealsOnTeammates")
+    teammate_shielding = _integer(mine, "totalDamageShieldedOnTeammates")
+    protection = teammate_healing + teammate_shielding
+    objective_damage = _integer(mine, "damageDealtToObjectives")
+    turret_damage = _integer(mine, "damageDealtToTurrets")
+    turret_kills = _integer(mine, "turretKills")
+    objectives_stolen = _integer(mine, "objectivesStolen")
+    largest_spree = _integer(mine, "largestKillingSpree")
+    largest_multi = _integer(mine, "largestMultiKill")
+    first_blood = bool(mine.get("firstBloodKill") or mine.get("firstBloodAssist"))
+    cs = _integer(mine, "totalMinionsKilled") + _integer(
+        mine, "neutralMinionsKilled"
+    )
+    badges: list[str] = []
+
+    # Put genuinely rare achievements first so a steal or flawless KDA is not
+    # hidden behind three common contribution badges.
+    if objectives_stolen >= 1:
+        badges.append("OBJECTIVE_STEAL")
+    if deaths == 0 and takedowns >= 8:
+        badges.append("PERFECT_KDA")
+    if (
+        cc_time >= max(8, int(minutes * 0.35))
+        and _team_rank(mine, allies, "timeCCingOthers") <= 2
+    ):
+        badges.append("CC")
+    vision_floor = 1.35 if position == "SUPPORT" else 0.65
+    if (
+        vision / minutes >= vision_floor
+        and wards >= max(4, int(minutes * 0.35))
+        and _team_rank(mine, allies, "visionScore") <= 2
+    ):
+        badges.append("VISION")
+    if (
+        damage_taken / minutes >= 350
+        and mitigated / minutes >= 250
+        and _team_rank(mine, allies, "damageSelfMitigated") <= 2
+    ):
+        badges.append("TANKING")
+    if (
+        damage / minutes >= 550
+        and _team_rank(mine, allies, "totalDamageDealtToChampions") <= 2
+    ):
+        badges.append("DAMAGE")
+    if (
+        protection >= max(1500, int(minutes * 75))
+        and _team_combined_rank(
+            mine, allies,
+            ("totalHealsOnTeammates", "totalDamageShieldedOnTeammates"),
+        ) <= 2
+    ):
+        badges.append("PROTECTOR")
+    if kill_participation is not None and kill_participation >= 70:
+        badges.append("TEAMPLAY")
+    if (
+        objective_damage >= max(3000, int(minutes * 200))
+        and _team_rank(mine, allies, "damageDealtToObjectives") <= 2
+    ):
+        badges.append("OBJECTIVE")
+    if (
+        turret_kills >= 2
+        or (
+            turret_damage >= max(2000, int(minutes * 100))
+            and _team_rank(mine, allies, "damageDealtToTurrets") <= 2
+        )
+    ):
+        badges.append("SIEGE")
+    if (
+        wards_killed >= max(4, int(minutes * 0.2))
+        and _team_rank(mine, allies, "wardsKilled") <= 2
+    ):
+        badges.append("WARD_CLEAR")
+    if kills >= 8 and _team_rank(mine, allies, "kills") <= 2:
+        badges.append("KILL_CARRY")
+    if assists >= 15 and _team_rank(mine, allies, "assists") <= 2:
+        badges.append("ASSIST_MASTER")
+    if minutes >= 18 and deaths <= 2 and takedowns >= 8:
+        badges.append("SURVIVOR")
+    if largest_spree >= 5 or largest_multi >= 2:
+        badges.append("KILLING_SPREE")
+    if first_blood:
+        badges.append("FIRST_BLOOD")
+    farm_floor = {
+        "TOP": 6.5, "MIDDLE": 7.0, "BOTTOM": 7.0, "JUNGLE": 5.5,
+    }.get(position)
+    if (
+        farm_floor is not None and cs / minutes >= farm_floor
+        and _team_combined_rank(
+            mine, allies, ("totalMinionsKilled", "neutralMinionsKilled")
+        ) <= 2
+    ):
+        badges.append("FARM")
+    return tuple(badges[:3])
+
+
 def analyze_history(
     matches: Iterable[dict[str, Any]], puuid: str, limit: int = 1000
 ) -> HistoryOverview:
@@ -310,6 +467,9 @@ def analyze_history(
         )
         won = bool(mine.get("win"))
         primary_rune_id, secondary_rune_style_id = _rune_loadout(mine)
+        performance_badges = _performance_badges(
+            mine, allies, duration, position, participation,
+        )
         entry = MatchHistoryEntry(
             match_id=str((match.get("metadata") or {}).get("matchId") or info.get("gameId") or ""),
             game_creation=_integer(info, "gameCreation"),
@@ -350,6 +510,25 @@ def analyze_history(
                 (str(row.get("championName") or "Unknown"), _riot_id(row))
                 for row in enemies
             ),
+            damage_self_mitigated=_integer(mine, "damageSelfMitigated"),
+            time_ccing_others=_integer(mine, "timeCCingOthers"),
+            wards_placed=_integer(mine, "wardsPlaced"),
+            control_wards_placed=_integer(mine, "detectorWardsPlaced"),
+            wards_killed=_integer(mine, "wardsKilled"),
+            healing_on_teammates=_integer(mine, "totalHealsOnTeammates"),
+            shielding_on_teammates=_integer(
+                mine, "totalDamageShieldedOnTeammates"
+            ),
+            damage_to_objectives=_integer(mine, "damageDealtToObjectives"),
+            damage_to_turrets=_integer(mine, "damageDealtToTurrets"),
+            turret_kills=_integer(mine, "turretKills"),
+            objectives_stolen=_integer(mine, "objectivesStolen"),
+            largest_killing_spree=_integer(mine, "largestKillingSpree"),
+            largest_multi_kill=_integer(mine, "largestMultiKill"),
+            first_blood_participation=bool(
+                mine.get("firstBloodKill") or mine.get("firstBloodAssist")
+            ),
+            performance_badges=performance_badges,
         )
         overview.entries.append(entry)
         overview.games += 1

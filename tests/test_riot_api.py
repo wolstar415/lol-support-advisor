@@ -37,6 +37,15 @@ class RiotApiTests(unittest.TestCase):
             self.assertEqual(client.league_entries_by_puuid("a/b", platform="kr"), [])
         self.assertIn("/entries/by-puuid/a%2Fb", get.call_args.args[0])
 
+    def test_account_identity_can_be_resolved_from_game_session_puuid(self) -> None:
+        client = RiotApiClient("test-key")
+        with patch.object(
+            client, "_get", return_value={"gameName": "Player", "tagLine": "KR1"}
+        ) as get:
+            account = client.resolve_account_by_puuid("a/b")
+        self.assertEqual(account["gameName"], "Player")
+        self.assertIn("/accounts/by-puuid/a%2Fb", get.call_args.args[0])
+
     def test_completed_full_history_uses_one_page_for_incremental_sync(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir) / "advisor.db")
@@ -49,6 +58,28 @@ class RiotApiTests(unittest.TestCase):
             ):
                 client.sync(storage, "Me", "KR1", count=1000)
             match_ids.assert_called_once_with("mine", count=100)
+
+    def test_sync_records_newest_match_marker_after_id_lookup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            client = RiotApiClient("test-key")
+            payload = {
+                "metadata": {"matchId": "KR_NEW", "participants": ["mine"]},
+                "info": {
+                    "queueId": 420, "gameCreation": 10,
+                    "participants": [{"puuid": "mine"}],
+                },
+            }
+            with (
+                patch.object(client, "resolve_account", return_value={"puuid": "mine"}),
+                patch.object(client, "league_entries_by_puuid", return_value=[]),
+                patch.object(client, "match_ids", return_value=["KR_NEW"]),
+                patch.object(client, "match", return_value=payload),
+            ):
+                client.sync(storage, "Me", "KR1", count=1000)
+
+            self.assertEqual(storage.get_setting("riot_latest_match_id"), "KR_NEW")
+            self.assertIsNotNone(storage.load_match("KR_NEW"))
 
     def test_player_match_page_caps_ids_and_details_at_ten(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

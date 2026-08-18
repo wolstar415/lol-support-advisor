@@ -11,6 +11,76 @@ LIVE_IDENTITY_CACHE_MAX_AGE_SECONDS = 6 * 60 * 60
 LIVE_IDENTITY_CACHE_VERSION = 1
 
 
+def gameflow_puuid_by_champion(session: dict[str, Any]) -> dict[int, str]:
+    """Extract per-game player UUIDs from an in-game LCU session.
+
+    Privacy mode can blank Riot IDs while ``playerChampionSelections`` still
+    carries UUID-shaped values. They are useful as local cache keys but are
+    not guaranteed to be valid Riot Account-v1 PUUIDs. Normal ranked draft
+    does not allow duplicate champions, so champion id is a stable join key
+    for the Live Client roster. Ambiguous/invalid rows are discarded.
+    """
+    game_data = session.get("gameData") if isinstance(session, dict) else None
+    rows = (
+        game_data.get("playerChampionSelections")
+        if isinstance(game_data, dict) else None
+    )
+    values: dict[int, str] = {}
+    duplicates: set[int] = set()
+    for row in rows if isinstance(rows, list) else []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            champion_id = int(row.get("championId") or 0)
+        except (TypeError, ValueError):
+            continue
+        puuid = str(row.get("puuid") or "").strip()
+        if champion_id <= 0 or not puuid:
+            continue
+        if champion_id in values and values[champion_id] != puuid:
+            duplicates.add(champion_id)
+        else:
+            values[champion_id] = puuid
+    for champion_id in duplicates:
+        values.pop(champion_id, None)
+    return values
+
+
+def gameflow_summoner_id_by_champion(session: dict[str, Any]) -> dict[int, str]:
+    """Extract local summoner ids from both in-game teams.
+
+    In privacy mode ``playerChampionSelections[].puuid`` is a short-lived
+    36-character privacy identifier, not the Riot Account-v1 PUUID.  The team
+    rows still contain a local ``summonerId`` which the League Client can
+    resolve through ``/lol-summoner/v1/summoners/{id}`` without an external
+    Riot API key.
+    """
+    game_data = session.get("gameData") if isinstance(session, dict) else None
+    if not isinstance(game_data, dict):
+        return {}
+    values: dict[int, str] = {}
+    duplicates: set[int] = set()
+    for team_key in ("teamOne", "teamTwo"):
+        rows = game_data.get(team_key)
+        for row in rows if isinstance(rows, list) else []:
+            if not isinstance(row, dict):
+                continue
+            try:
+                champion_id = int(row.get("championId") or 0)
+            except (TypeError, ValueError):
+                continue
+            summoner_id = str(row.get("summonerId") or "").strip()
+            if champion_id <= 0 or not summoner_id:
+                continue
+            if champion_id in values and values[champion_id] != summoner_id:
+                duplicates.add(champion_id)
+            else:
+                values[champion_id] = summoner_id
+    for champion_id in duplicates:
+        values.pop(champion_id, None)
+    return values
+
+
 def live_identity_available(player: LivePlayer) -> bool:
     """Return whether a player has a complete Riot ID worth retaining."""
     game_name = player.riot_game_name.strip()

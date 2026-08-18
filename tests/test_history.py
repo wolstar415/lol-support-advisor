@@ -3,7 +3,8 @@ from __future__ import annotations
 import unittest
 
 from lol_support_advisor.history import (
-    MatchLpChange, analyze_history, attach_match_lp_changes,
+    PERFORMANCE_BADGE_CODES, MatchLpChange, analyze_history,
+    attach_match_lp_changes,
 )
 
 
@@ -50,6 +51,10 @@ def history_match(
 
 
 class HistoryAnalysisTests(unittest.TestCase):
+    def test_performance_badge_catalog_has_seventeen_unique_types(self) -> None:
+        self.assertEqual(len(PERFORMANCE_BADGE_CODES), 17)
+        self.assertEqual(len(set(PERFORMANCE_BADGE_CODES)), 17)
+
     def test_history_summary_and_entries(self) -> None:
         overview = analyze_history([
             history_match("KR_3", "Janna", True, 3000),
@@ -74,6 +79,47 @@ class HistoryAnalysisTests(unittest.TestCase):
         self.assertEqual(overview.games, 0)
         self.assertIsNone(overview.win_rate)
         self.assertEqual(overview.current_streak, 0)
+
+    def test_match_performance_badges_use_explainable_team_metrics(self) -> None:
+        match = history_match("KR_BADGES", "Rakan", False, 5000)
+        mine = match["info"]["participants"][0]
+        mine.update({
+            "timeCCingOthers": 30,
+            "wardsPlaced": 12,
+            "detectorWardsPlaced": 4,
+            "damageSelfMitigated": 10_000,
+            "totalDamageTaken": 11_000,
+        })
+
+        entry = analyze_history([match], "mine").entries[0]
+
+        self.assertEqual(entry.performance_badges, ("CC", "VISION", "TANKING"))
+        self.assertEqual(entry.time_ccing_others, 30)
+        self.assertEqual(entry.wards_placed, 12)
+        self.assertEqual(entry.control_wards_placed, 4)
+        self.assertEqual(entry.damage_self_mitigated, 10_000)
+
+    def test_rare_and_protection_badges_take_priority(self) -> None:
+        match = history_match("KR_RARE_BADGES", "Rakan", True, 6000)
+        mine = match["info"]["participants"][0]
+        mine.update({
+            "kills": 3,
+            "deaths": 0,
+            "assists": 12,
+            "objectivesStolen": 1,
+            "totalHealsOnTeammates": 2_000,
+            "totalDamageShieldedOnTeammates": 1_500,
+        })
+
+        entry = analyze_history([match], "mine").entries[0]
+
+        self.assertEqual(
+            entry.performance_badges,
+            ("OBJECTIVE_STEAL", "PERFECT_KDA", "PROTECTOR"),
+        )
+        self.assertEqual(entry.objectives_stolen, 1)
+        self.assertEqual(entry.healing_on_teammates, 2_000)
+        self.assertEqual(entry.shielding_on_teammates, 1_500)
 
     def test_champion_performance_is_split_by_position(self) -> None:
         overview = analyze_history([

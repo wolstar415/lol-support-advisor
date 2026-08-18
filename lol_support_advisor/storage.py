@@ -1891,7 +1891,20 @@ class Storage:
             row = connection.execute(
                 "SELECT puuid FROM player_identities WHERE riot_id = ? COLLATE NOCASE", (riot_id,)
             ).fetchone()
-        return str(row["puuid"]) if row else ""
+            return str(row["puuid"]) if row else ""
+
+    def find_riot_id_by_puuid(self, puuid: str) -> str:
+        """Return the newest locally observed Riot ID for a PUUID."""
+        normalized = str(puuid or "").strip()
+        if not normalized:
+            return ""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT riot_id FROM player_identities WHERE puuid = ? "
+                "ORDER BY updated_at DESC LIMIT 1",
+                (normalized,),
+            ).fetchone()
+            return str(row["riot_id"]) if row else ""
 
     def recent_riot_ids(self, my_puuid: str, limit: int = 9) -> list[tuple[str, str]]:
         result: list[tuple[str, str]] = []

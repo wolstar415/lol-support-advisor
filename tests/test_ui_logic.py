@@ -12,18 +12,20 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from lol_support_advisor.ui import (
-    AdvisorApp, adc_flow_hint, allied_adc_member, auto_hover_recommendation,
+    AdvisorApp, adc_flow_hint, allied_adc_member,
     candidate_score,
     behavior_strength_signals, behavior_weakness_signals,
     build_guide_has_statistics, build_loadout_stat_text,
     cache_manager_champion_ids,
     choose_auto_accept_delay_seconds,
+    choose_lux_auto_ban_stage_lead_ms,
     choose_lux_auto_ban_target_ms,
     final_item_builds, matchup_build_reason,
     game_prediction_display_signature, local_draft_selection,
     live_active_context_signature, live_roster_signature,
     lux_auto_ban_deadline_after_timer_sample,
     lux_auto_ban_monitor_due,
+    lux_auto_ban_stage_due,
     projected_lux_auto_ban_remaining_ms,
     estimate_live_game_prediction,
     matchup_final_item_builds, matchup_item_groups, matchup_rune_index,
@@ -52,12 +54,105 @@ from lol_support_advisor.models import (
     LiveGameSnapshot, LivePlayer,
     OpggCounter, OpggMcpChampionStat, OpggMcpRecentMatch,
     OpggMcpSummonerProfile, OpggSnapshot, OpggSynergyStat,
-    PersonalStat, PlayerBehaviorStat, PlayerProfileStat, Recommendation, RuneBuild,
+    PersonalStat, PlayerBehaviorStat, PlayerProfileStat, RuneBuild,
     SummonerSpellBuild,
 )
 
 
 class DuoEvidenceTests(unittest.TestCase):
+    def test_gameflow_prewarm_does_not_wait_for_live_playerlist(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._live_identity_lock = threading.RLock()
+        app._live_identity_generation = 3
+        saved: list[tuple[str, str]] = []
+        app.storage = SimpleNamespace(
+            find_riot_id_by_puuid=lambda _puuid: "",
+            save_player_identity=lambda riot_id, puuid: saved.append((riot_id, puuid)),
+        )
+        session = {"gameData": {
+            "playerChampionSelections": [
+                {"championId": 24, "puuid": "private-top"},
+                {"championId": 412, "puuid": "private-support"},
+            ],
+            "teamOne": [{"championId": 24, "summonerId": "101"}],
+            "teamTwo": [{"championId": 412, "summonerId": "202"}],
+        }}
+        accounts = {
+            "101": {"gameName": "TopPlayer", "tagLine": "KR1", "puuid": "private-top"},
+            "202": {"gameName": "SupportPlayer", "tagLine": "KR2", "puuid": "private-support"},
+        }
+
+        class FakeLcu:
+            def get(self, path: str) -> dict[str, object]:
+                if path == "/lol-gameflow/v1/session":
+                    return session
+                return accounts[path.rsplit("/", 1)[-1]]
+
+        app.lcu = FakeLcu()
+        app._audit_live_identity = lambda *_args, **_kwargs: None
+
+        self.assertEqual(app._prewarm_gameflow_identities(3), (2, 2))
+        self.assertEqual(set(saved), {
+            ("TopPlayer#KR1", "private-top"),
+            ("SupportPlayer#KR2", "private-support"),
+        })
+
+    def test_private_live_roster_uses_local_summoner_lookup(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._live_identity_lock = threading.RLock()
+        app._live_identity_generation = 7
+        app.registry = SimpleNamespace(by_id={
+            "Ornn": (24, "오른"), "Thresh": (412, "쓰레쉬"),
+        })
+        saved: list[tuple[str, str]] = []
+        app.storage = SimpleNamespace(
+            find_riot_id_by_puuid=lambda _puuid: "",
+            save_player_identity=lambda riot_id, puuid: saved.append((riot_id, puuid)),
+            get_setting=lambda key: {
+                "riot_puuid": "",
+                "riot_game_name": "TopPlayer",
+                "riot_tag_line": "KR1",
+            }.get(key, ""),
+        )
+        session = {"gameData": {
+            "playerChampionSelections": [
+                {"championId": 24, "puuid": "private-top"},
+                {"championId": 412, "puuid": "private-support"},
+            ],
+            "teamOne": [{"championId": 24, "summonerId": "101"}],
+            "teamTwo": [{"championId": 412, "summonerId": "202"}],
+        }}
+        accounts = {
+            "101": {"gameName": "TopPlayer", "tagLine": "KR1", "puuid": "private-top"},
+            "202": {"gameName": "SupportPlayer", "tagLine": "KR2", "puuid": "private-support"},
+        }
+
+        class FakeLcu:
+            def get(self, path: str) -> dict[str, object]:
+                if path == "/lol-gameflow/v1/session":
+                    return session
+                return accounts[path.rsplit("/", 1)[-1]]
+
+        app.lcu = FakeLcu()
+        app._post_ui = lambda callback: callback()
+        app._audit_live_identity = lambda *_args, **_kwargs: None
+        snapshot = LiveGameSnapshot(players=[
+            LivePlayer("Ornn", "오른", "비공개 ORDER TOP 1", "", "ORDER", "TOP", 8),
+            LivePlayer("Thresh", "쓰레쉬", "비공개 CHAOS UTILITY 2", "", "CHAOS", "UTILITY", 8),
+        ])
+
+        restored = app._resolve_private_live_identities(snapshot, 7)
+
+        self.assertEqual(
+            [row.riot_id for row in restored.players],
+            ["TopPlayer#KR1", "SupportPlayer#KR2"],
+        )
+        self.assertTrue(restored.players[0].is_active_player)
+        self.assertEqual(set(saved), {
+            ("TopPlayer#KR1", "private-top"),
+            ("SupportPlayer#KR2", "private-support"),
+        })
+
     def test_auto_accept_uses_a_small_human_delay(self) -> None:
         seen: list[tuple[float, float]] = []
 
@@ -126,7 +221,6 @@ class DuoEvidenceTests(unittest.TestCase):
         )
         app._manual_enemy_support = "Vi"
         app._support_filter = "ALL"
-        app._pending_auto_hover = (1, "Vi", "바이")
         app._recommendation_generation = 3
         app.recommendations = [object()]
         app.recommendation_snapshot_id = "OLD"
@@ -256,6 +350,27 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(choose_lux_auto_ban_target_ms(picker), 16_500)
         self.assertEqual(observed, [(15_000, 18_000)])
 
+    def test_auto_ban_only_hovers_shortly_before_commit(self) -> None:
+        observed: list[tuple[int, int]] = []
+
+        def picker(minimum: int, maximum: int) -> int:
+            observed.append((minimum, maximum))
+            return 1_150
+
+        lead_ms = choose_lux_auto_ban_stage_lead_ms(picker)
+
+        self.assertEqual(lead_ms, 1_150)
+        self.assertEqual(observed, [(900, 1_400)])
+        self.assertFalse(lux_auto_ban_stage_due(
+            17_651, 16_500, lead_ms, 10.0, 8.0,
+        ))
+        self.assertTrue(lux_auto_ban_stage_due(
+            17_650, 16_500, lead_ms, 10.0, 8.0,
+        ))
+        self.assertFalse(lux_auto_ban_monitor_due(
+            17_650, 16_500, 10.0, 8.0,
+        ))
+
     def test_stale_recommendation_actions_use_live_preflight_instead_of_locking(self) -> None:
         self.assertTrue(recommendation_action_available(
             "hover", enabled=True, stale=True, demo=False,
@@ -266,67 +381,6 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertTrue(recommendation_action_available(
             "ban", enabled=True, stale=True, demo=False,
         ))
-
-    def test_auto_hover_uses_highest_ranked_available_recommendation(self) -> None:
-        recommendations = [
-            Recommendation(1, "Lux", "럭스", "포킹", "A", "", "", "", ""),
-            Recommendation(2, "Thresh", "쓰레쉬", "유틸", "A", "", "", "", ""),
-            Recommendation(3, "Leona", "레오나", "탱커", "B", "", "", "", ""),
-        ]
-        draft = DraftSnapshot(enemy_bans=["Lux"])
-        self.assertEqual(
-            auto_hover_recommendation(recommendations, draft).champion_id,
-            "Thresh",
-        )
-
-    def test_pending_auto_hover_waits_for_safe_phase_then_uses_manual_guard(self) -> None:
-        app = AdvisorApp.__new__(AdvisorApp)
-        app._recommendation_generation = 7
-        app._pending_auto_hover = (7, "Thresh", "SUPPORT")
-        app.game_phase = "ChampSelect"
-        app.draft = DraftSnapshot(my_role="SUPPORT")
-        app._champ_select_inner_phase = "BAN_PICK"
-        app._local_pick_action_in_progress = False
-        app.registry = SimpleNamespace(by_id={"Thresh": (412, "쓰레쉬")})
-        calls: list[tuple[object, ...]] = []
-        app._execute_champion_action = lambda *args, **kwargs: calls.append(
-            (*args, kwargs)
-        )
-
-        app._try_pending_auto_hover()
-        self.assertEqual(calls, [])
-        self.assertIsNotNone(app._pending_auto_hover)
-
-        app._local_pick_action_in_progress = True
-        app._try_pending_auto_hover()
-        self.assertIsNone(app._pending_auto_hover)
-        self.assertEqual(calls[0][0:2], ("Thresh", "hover"))
-        self.assertTrue(calls[0][2]["quiet"])
-        self.assertEqual(
-            calls[0][2]["expected_current_champion_ids"], {0, 412}
-        )
-
-    def test_pending_auto_hover_never_replaces_existing_player_intent(self) -> None:
-        app = AdvisorApp.__new__(AdvisorApp)
-        app._recommendation_generation = 3
-        app._pending_auto_hover = (3, "Thresh", "SUPPORT")
-        app.game_phase = "ChampSelect"
-        app.draft = DraftSnapshot(
-            my_role="SUPPORT",
-            my_hover=DraftMember(
-                "Malphite", "말파이트", "SUPPORT", "HOVER", 4,
-            ),
-        )
-        app._champ_select_inner_phase = "PLANNING"
-        app._local_pick_action_in_progress = False
-        app.registry = SimpleNamespace(by_id={"Thresh": (412, "쓰레쉬")})
-        calls: list[object] = []
-        app._execute_champion_action = lambda *args, **kwargs: calls.append(args)
-
-        app._try_pending_auto_hover()
-
-        self.assertEqual(calls, [])
-        self.assertIsNone(app._pending_auto_hover)
 
     def test_lux_audit_persists_token_free_event(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -632,6 +686,34 @@ class DuoEvidenceTests(unittest.TestCase):
             recommendation_draft_context_signature(draft), baseline,
         )
 
+    def test_recommendation_context_ignores_my_pick_but_tracks_enemy_support(self) -> None:
+        mine = DraftMember(
+            "Camille", "카밀", "SUPPORT", "HOVER",
+            cell_id=4, pick_order=5,
+        )
+        draft = DraftSnapshot(
+            my_role="SUPPORT", my_pick_order=5, local_player_cell_id=4,
+            my_hover=mine, ally_team_order=[mine],
+            selected_enemy_support_id="Leona",
+            selected_enemy_support_source="MANUAL",
+        )
+        baseline = recommendation_draft_context_signature(draft)
+
+        locked = DraftMember(
+            "TahmKench", "탐 켄치", "SUPPORT", "LOCKED",
+            cell_id=4, pick_order=5,
+        )
+        draft.my_hover = None
+        draft.ally_team_order = [locked]
+        self.assertEqual(
+            recommendation_draft_context_signature(draft), baseline,
+        )
+
+        draft.selected_enemy_support_id = "TahmKench"
+        self.assertNotEqual(
+            recommendation_draft_context_signature(draft), baseline,
+        )
+
     def test_local_draft_selection_keeps_completed_local_pick_visible(self) -> None:
         locked = DraftMember(
             "Malphite", "말파이트", "SUPPORT", "LOCKED", cell_id=4,
@@ -648,6 +730,46 @@ class DuoEvidenceTests(unittest.TestCase):
         )
         draft.my_hover = hover
         self.assertIs(local_draft_selection(draft), hover)
+
+    def test_apply_build_selection_follows_local_draft_hover(self) -> None:
+        hover = DraftMember(
+            "Malphite", "말파이트", "SUPPORT", "HOVER", cell_id=4,
+        )
+        draft = DraftSnapshot(
+            my_role="SUPPORT", local_player_cell_id=4, my_hover=hover,
+        )
+        guide = ChampionBuildGuide("Malphite", "말파이트", "SUPPORT")
+        saved: list[tuple[str, str]] = []
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app.draft = draft
+        app.ui_language = "ko"
+        app.registry = SimpleNamespace(
+            normalize_id=lambda value: value,
+            by_id={"Thresh": (412, "쓰레쉬"), "Malphite": (54, "말파이트")},
+        )
+        app.storage = SimpleNamespace(
+            set_setting=lambda key, value: saved.append((key, value)),
+            load_build_guide=lambda champion, role: (
+                guide if (champion, role) == ("Malphite", "SUPPORT") else None
+            ),
+        )
+        app._build_selected_champion_id = "Thresh"
+        app.build_guide = None
+        app._build_rune_index = 1
+        app._build_spell_index = 1
+        app._build_rune_manual = True
+        app._build_render_signature = "old"
+        app._prefetch_build_assets = lambda _guide: None
+
+        changed = app._sync_build_selection_from_draft(draft)
+
+        self.assertTrue(changed)
+        self.assertEqual(app._build_selected_champion_id, "Malphite")
+        self.assertIs(app.build_guide, guide)
+        self.assertEqual((app._build_rune_index, app._build_spell_index), (0, 0))
+        self.assertFalse(app._build_rune_manual)
+        self.assertIn(("build_selected_champion", "Malphite"), saved)
 
     def test_prediction_display_signature_ignores_capture_time_only(self) -> None:
         first = GamePrediction(
@@ -700,9 +822,17 @@ class DuoEvidenceTests(unittest.TestCase):
         current.refresh_snapshot_id()
         app.draft = current
         app.exchange_status = FakeLabel()
+        app._text = lambda key, **_kwargs: key
         app.recommendations = []
         app.recommendation_snapshot_id = ""
+        app.recommendation_enemy_support_id = ""
         app._recommendation_apply_error = ""
+        app._recommendation_generation = 4
+        app.game_phase = "ChampSelect"
+        scheduled: list[tuple[object, ...]] = []
+        app.root = SimpleNamespace(
+            after=lambda *args: scheduled.append(args),
+        )
         app._selection_panel_signatures = {}
         app._render_recommendations = lambda: None
         app._render_prompt_summary = lambda: None
@@ -744,7 +874,46 @@ class DuoEvidenceTests(unittest.TestCase):
             app.recommendation_context_signature,
             recommendation_draft_context_signature(requested),
         )
+        self.assertEqual(app.recommendation_enemy_support_id, "")
         self.assertNotEqual(app.recommendation_snapshot_id, current.snapshot_id)
+        self.assertEqual(scheduled, [])
+
+    def test_post_game_sync_waits_for_match_payload_commit(self) -> None:
+        class FakeLabel:
+            def configure(self, **_kwargs: object) -> None:
+                pass
+
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.pending: list[tuple[int, object]] = []
+
+            def after(self, delay: int, callback: object) -> str:
+                self.pending.append((delay, callback))
+                return f"after-{len(self.pending)}"
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app.storage = SimpleNamespace(
+            get_setting=lambda key: "KR_NEW" if key == "riot_latest_match_id" else "",
+        )
+        app._post_game_sync_generation = 4
+        app._post_game_sync_after_id = None
+        app._post_game_sync_baseline_match_id = "KR_OLD"
+        app._riot_syncing = True
+        app._history_revision = (1, 1)
+        app.exchange_status = FakeLabel()
+        app._text = lambda key, **_kwargs: key
+        loaded: list[bool] = []
+        app._ensure_history_loaded = lambda force=False: loaded.append(force)
+
+        app._check_post_game_sync_attempt(4, 0)
+
+        self.assertEqual(loaded, [])
+        self.assertEqual(app.root.pending[0][0], 700)
+        app._riot_syncing = False
+        app.root.pending[0][1]()
+        self.assertEqual(loaded, [True])
+        self.assertIsNone(app._history_revision)
 
     def test_cache_manager_catalog_prevents_stale_wrong_role_cards(self) -> None:
         self.assertEqual(
@@ -1457,6 +1626,26 @@ class DuoEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(merged.champion_data_source, "OPGG_NOT_LISTED")
         self.assertIsNone(merged.champion_win_rate)
+
+    def test_unranked_opgg_overlay_keeps_completed_relationship_state(self) -> None:
+        app = SimpleNamespace(registry=SimpleNamespace(
+            by_id={"LeeSin": (64, "리 신")}, by_key={},
+        ))
+        player = LivePlayer("LeeSin", "리 신", "Player", "KR1", "CHAOS")
+        base = PlayerProfileStat(
+            status="LOCAL_ONLY", puuid="lee-puuid",
+            together_games=0, against_games=0,
+        )
+        unranked = OpggMcpSummonerProfile(
+            riot_id="Player#KR1", game_name="Player", tag_line="KR1",
+            tier="UNRANKED", season_wins=0, season_losses=0,
+            recent_matches_status="EMPTY", status="OK",
+        )
+
+        merged = AdvisorApp._profile_with_opgg(app, base, unranked, player)
+
+        self.assertEqual(merged.status, "LOCAL_ONLY")
+        self.assertNotEqual(merged.status, "PARTIAL")
 
     def test_cached_rank_profile_is_available_before_detail_scan(self) -> None:
         profile = AdvisorApp._make_cached_player_profile(

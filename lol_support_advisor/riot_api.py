@@ -52,6 +52,16 @@ class RiotApiClient:
             f"{encoded_name}/{encoded_tag}"
         )
 
+    def resolve_account_by_puuid(self, puuid: str) -> dict[str, Any]:
+        """Resolve a Riot ID from a PUUID exposed by the local game session."""
+        normalized = str(puuid or "").strip()
+        if not normalized:
+            raise RiotApiError("Riot 계정 PUUID가 비어 있습니다.")
+        return self._get(
+            "https://asia.api.riotgames.com/riot/account/v1/accounts/by-puuid/"
+            f"{quote(normalized, safe='')}"
+        )
+
     def validate_key_for_account(self, game_name: str, tag_line: str) -> str:
         account = self.resolve_account(game_name, tag_line)
         puuid = str(account.get("puuid") or "").strip()
@@ -216,6 +226,12 @@ class RiotApiClient:
         )
         full_history_cached = storage.get_setting("riot_full_history_puuid") == puuid
         ids = self.match_ids(puuid, count=100 if full_history_cached else count)
+        # Keep a tiny owner-only marker so the UI can distinguish "the Riot
+        # request completed" from "the just-finished match has actually been
+        # published". Match-v5 can lag behind the client by tens of seconds;
+        # without this marker a successful zero-result request ended the only
+        # post-game refresh attempt.
+        storage.set_setting("riot_latest_match_id", ids[0] if ids else "")
         known = storage.known_match_ids()
         missing = [match_id for match_id in ids if match_id not in known]
         fetched: list[dict[str, Any]] = []

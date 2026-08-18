@@ -1011,6 +1011,7 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(storage.relationship_record("mine", "enemy"), (0, 0, 3, 2))
             self.assertEqual(storage.player_champion_record("enemy", "Leona"), (3, 1))
             self.assertEqual(storage.find_puuid_by_riot_id("Enemy#KR2"), "enemy")
+            self.assertEqual(storage.find_riot_id_by_puuid("enemy"), "Enemy#KR2")
             self.assertEqual(storage.pair_same_team_games("mine", "ally"), 3)
             self.assertIn(("Enemy", "KR2"), storage.recent_riot_ids("mine"))
             self.assertEqual(storage.count_player_matches("mine"), 3)
