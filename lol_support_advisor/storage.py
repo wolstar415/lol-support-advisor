@@ -814,8 +814,8 @@ class Storage:
             prediction.match_id = match_id
             prediction.actual_win = bool(active.get("win"))
             with self._connect() as connection:
-                connection.execute(
-                    "UPDATE game_predictions SET match_id = ?, updated_at = ?, "
+                cursor = connection.execute(
+                    "UPDATE OR IGNORE game_predictions SET match_id = ?, updated_at = ?, "
                     "payload_json = ? WHERE prediction_key = ? AND match_id IS NULL",
                     (
                         match_id, datetime.now().isoformat(timespec="seconds"),
@@ -823,8 +823,23 @@ class Storage:
                         prediction.prediction_key,
                     ),
                 )
+                if cursor.rowcount == 0:
+                    # A roster can be sampled under more than one prediction
+                    # key while the loading screen settles.  If an earlier
+                    # baseline already owns this real match, preserve it and
+                    # discard only the still-pending duplicate.  Without this
+                    # guard SQLite's UNIQUE(match_id) aborted the entire match
+                    # history load.
+                    connection.execute(
+                        "DELETE FROM game_predictions "
+                        "WHERE prediction_key = ? AND match_id IS NULL "
+                        "AND EXISTS(SELECT 1 FROM game_predictions "
+                        "WHERE match_id = ?)",
+                        (prediction.prediction_key, match_id),
+                    )
             used_predictions.add(prediction.prediction_key)
-            resolved += 1
+            if cursor.rowcount > 0:
+                resolved += 1
         return resolved
 
     @staticmethod

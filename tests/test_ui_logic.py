@@ -12,7 +12,8 @@ from datetime import datetime, timedelta
 from types import SimpleNamespace
 
 from lol_support_advisor.ui import (
-    AdvisorApp, adc_flow_hint, allied_adc_member,
+    AdvisorApp, LOCAL_RECOMMENDATION_FALLBACKS, RECOMMENDATION_ACTION_SPECS,
+    adc_flow_hint, allied_adc_member,
     candidate_score,
     behavior_strength_signals, behavior_weakness_signals,
     build_guide_has_statistics, build_loadout_stat_text,
@@ -22,6 +23,7 @@ from lol_support_advisor.ui import (
     choose_lux_auto_ban_target_ms,
     final_item_builds, matchup_build_reason,
     game_prediction_display_signature, local_draft_selection,
+    local_recommendations_from_candidates,
     live_active_context_signature, live_roster_signature,
     lux_auto_ban_deadline_after_timer_sample,
     lux_auto_ban_monitor_due,
@@ -32,6 +34,7 @@ from lol_support_advisor.ui import (
     lane_matchup_from_snapshot, lane_matchup_label, lane_matchup_snapshot_fresh,
     matchup_counter_for_candidate,
     opgg_recent_form, participant_performance_ranks, representative_build_item,
+    riot_local_recent_form,
     recent_match_ids_from_payload, streak_badge_text, support_archetype,
     opgg_account_unavailable_error, riot_authentication_error,
     unavailable_player_profile,
@@ -54,12 +57,77 @@ from lol_support_advisor.models import (
     LiveGameSnapshot, LivePlayer,
     OpggCounter, OpggMcpChampionStat, OpggMcpRecentMatch,
     OpggMcpSummonerProfile, OpggSnapshot, OpggSynergyStat,
-    PersonalStat, PlayerBehaviorStat, PlayerProfileStat, RuneBuild,
+    PersonalStat, PlayerBehaviorStat, PlayerProfileStat, Recommendation, RuneBuild,
     SummonerSpellBuild,
 )
 
 
 class DuoEvidenceTests(unittest.TestCase):
+    def test_local_blind_recommendations_exist_before_codex(self) -> None:
+        counters = [
+            OpggCounter("Braum", "브라움", 51.0, 3_000),
+            OpggCounter("Janna", "잔나", 53.0, 4_000),
+            OpggCounter("Nami", "나미", 52.0, 2_000),
+            OpggCounter("Lux", "럭스", 55.0, 8_000),
+        ]
+
+        recommendations = local_recommendations_from_candidates(
+            counters, unavailable={"Lux"}, role_name="서포터", language="ko",
+        )
+
+        self.assertEqual(
+            [item.champion_id for item in recommendations],
+            ["Janna", "Nami", "Braum"],
+        )
+        self.assertEqual([item.rank for item in recommendations], [1, 2, 3])
+        self.assertTrue(all("미확정" in item.reason for item in recommendations))
+
+    def test_recommendation_cards_do_not_offer_ban_confirmation(self) -> None:
+        self.assertEqual(
+            [action for _label, action, _accent in RECOMMENDATION_ACTION_SPECS],
+            ["hover", "pick"],
+        )
+        self.assertNotIn("ban", {
+            action for _label, action, _accent in RECOMMENDATION_ACTION_SPECS
+        })
+        self.assertIn("SUPPORT", LOCAL_RECOMMENDATION_FALLBACKS)
+
+    def test_local_matchup_recommendation_mentions_selected_enemy(self) -> None:
+        recommendations = local_recommendations_from_candidates(
+            [OpggCounter("Janna", "잔나", 53.6, 8_420)],
+            enemy_name="레오나",
+            role_name="서포터",
+            language="ko",
+        )
+
+        self.assertEqual(len(recommendations), 1)
+        self.assertIn("레오나", recommendations[0].reason)
+
+    def test_codex_answer_is_not_replaced_by_local_refresh(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.recommendation_source = "CODEX"
+        app.recommendations = [
+            Recommendation(
+                rank=1,
+                champion_id="Braum",
+                champion_name_ko="브라움",
+                style="보호",
+                blind_safety="높음",
+                reason="Codex 결과",
+                team_synergy="",
+                lane_plan="",
+                watch_for="",
+            )
+        ]
+        app._local_recommendation_candidates = lambda: self.fail(
+            "Codex 결과가 고정된 동안 로컬 후보를 다시 계산하면 안 됩니다."
+        )
+
+        app._refresh_local_recommendations()
+
+        self.assertEqual(app.recommendation_source, "CODEX")
+        self.assertEqual(app.recommendations[0].champion_id, "Braum")
+
     def test_gameflow_prewarm_does_not_wait_for_live_playerlist(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)
         app._live_identity_lock = threading.RLock()
@@ -1037,6 +1105,48 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertTrue(app._riot_syncing)
         self.assertEqual(len(jobs), 1)
 
+    def test_manual_history_sync_is_allowed_during_game(self) -> None:
+        class FakeButton:
+            def __init__(self) -> None:
+                self.values: dict[str, object] = {}
+
+            def configure(self, **values: object) -> None:
+                self.values.update(values)
+
+        class FakeStorage:
+            @staticmethod
+            def get_setting(key: str) -> str:
+                return {
+                    "riot_game_name": "Me",
+                    "riot_tag_line": "KR1",
+                    "riot_api_key": "key",
+                }.get(key, "")
+
+            @staticmethod
+            def riot_api_key_needs_refresh() -> bool:
+                return False
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.storage = FakeStorage()
+        app._riot_syncing = False
+        app.game_phase = "InProgress"
+        app._riot_history_cooldown_remaining = lambda: timedelta(0)
+        app.riot_button = FakeButton()
+        app._text = lambda key, **values: (
+            f"{key}:{values}" if values else key
+        )
+        jobs: list[object] = []
+        app._background = lambda work, _success, _error: jobs.append(work)
+
+        app._sync_riot()
+
+        self.assertTrue(app._riot_syncing)
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(
+            app.riot_button.values["text"],
+            "history.sync.in_game_progress",
+        )
+
     def test_pre_game_rank_snapshot_uses_cached_solo_entry(self) -> None:
         class FakeStorage:
             def __init__(self) -> None:
@@ -1213,6 +1323,64 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(app.storage.loaded_ids, ["KR_1"])
         self.assertEqual(app.history_overview.entries[0].lp_delta, 23)
         self.assertEqual(app.history_overview.recent_20_lp_sum, 23)
+
+    def test_history_still_loads_when_prediction_enrichment_fails(self) -> None:
+        overview = HistoryOverview(games=5, wins=3)
+
+        class FakeLabel:
+            def configure(self, **_values: object) -> None:
+                pass
+
+        class FakeStorage:
+            @staticmethod
+            def get_setting(key: str, default: str = "") -> str:
+                return {
+                    "riot_game_name": "Me", "riot_tag_line": "KR1",
+                    "riot_puuid": "mine",
+                }.get(key, default)
+
+            @staticmethod
+            def find_puuid_by_riot_id(_riot_id: str) -> str:
+                return "mine"
+
+            @staticmethod
+            def match_revision() -> tuple[int, int]:
+                return 5, 5
+
+            @staticmethod
+            def player_matches(_puuid: str, limit: int) -> list[dict]:
+                return [{"metadata": {"matchId": "KR_1"}}]
+
+            @staticmethod
+            def load_match_lp_changes(_match_ids: object) -> dict:
+                return {}
+
+            @staticmethod
+            def resolve_game_predictions(_matches: object) -> int:
+                raise RuntimeError(
+                    "UNIQUE constraint failed: game_predictions.match_id"
+                )
+
+            @staticmethod
+            def load_game_predictions(_match_ids: object) -> dict:
+                raise AssertionError("resolver failure should skip prediction loading")
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.storage = FakeStorage()
+        app._history_loading = False
+        app._history_reload_requested = False
+        app._history_revision = None
+        app._history_visible_count = 10
+        app.history_overview = None
+        app.history_status_label = FakeLabel()
+        app._render_history = lambda: None
+        app._background = lambda work, success, _error: success(work())
+
+        with patch("lol_support_advisor.ui.analyze_history", return_value=overview):
+            app._ensure_history_loaded(force=True)
+
+        self.assertIs(app.history_overview, overview)
+        self.assertEqual(app.history_overview.games, 5)
 
     def test_rune_style_wheel_only_scrolls_page(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)
@@ -1534,6 +1702,32 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(form["last_game_won"], False)
         self.assertEqual(form["last_op_score_rank"], 9)
 
+    def test_riot_local_recent_form_counts_only_latest_consecutive_results(self) -> None:
+        def match(created: int, champion: str, won: bool, queue_id: int = 420) -> dict:
+            return {
+                "info": {
+                    "gameCreation": created,
+                    "queueId": queue_id,
+                    "participants": [{
+                        "puuid": "mine", "championName": champion,
+                        "teamPosition": "UTILITY", "win": won,
+                        "kills": 1, "deaths": 3, "assists": 8,
+                    }],
+                }
+            }
+
+        form = riot_local_recent_form([
+            match(5, "Thresh", False),
+            match(4, "Rakan", False),
+            match(3, "Thresh", True),
+            match(6, "Thresh", False, queue_id=450),
+        ], "mine", "Thresh")
+
+        self.assertEqual(form["overall_streak"], -2)
+        self.assertEqual(form["champion_streak"], -1)
+        self.assertEqual((form["recent_games"], form["recent_wins"]), (3, 1))
+        self.assertEqual(form["last_game_champion_id"], "Thresh")
+
     def test_behavior_signals_separate_strengths_and_actionable_weaknesses(self) -> None:
         stat = PlayerBehaviorStat(
             games=12, first_blood_rate=33.0, early_advantage_rate=58.0,
@@ -1612,6 +1806,39 @@ class DuoEvidenceTests(unittest.TestCase):
             ),
             (1, 7, 8, False, 8),
         )
+
+    def test_active_player_keeps_newer_local_streak_over_stale_opgg(self) -> None:
+        app = SimpleNamespace(registry=SimpleNamespace(
+            by_id={"Thresh": (412, "쓰레쉬")}, by_key={},
+        ))
+        player = LivePlayer(
+            "Thresh", "쓰레쉬", "Me", "KR1", "ORDER",
+            is_active_player=True,
+        )
+        base = PlayerProfileStat(
+            status="OK", recent_games=10, recent_wins=4,
+            overall_streak=-2, champion_streak=-1,
+            recent_form_source="RIOT_LOCAL",
+        )
+        stale_matches = [
+            OpggMcpRecentMatch(
+                match_id=f"old-{index}", created_at=f"2026-08-17T0{index}:00:00",
+                game_type="SOLORANKED", champion_key=201,
+                champion_name="브라움", position="SUPPORT", result="LOSE",
+            )
+            for index in range(5)
+        ]
+        opgg = OpggMcpSummonerProfile(
+            riot_id="Me#KR1", game_name="Me", tag_line="KR1",
+            tier="GOLD", division="I", recent_matches=stale_matches,
+            recent_matches_status="OK", status="OK",
+        )
+
+        merged = AdvisorApp._profile_with_opgg(app, base, opgg, player)
+
+        self.assertEqual(merged.overall_streak, -2)
+        self.assertEqual(merged.champion_streak, -1)
+        self.assertEqual(merged.recent_form_source, "RIOT_LOCAL")
 
     def test_missing_opgg_top_champion_is_not_reported_as_zero_percent(self) -> None:
         app = SimpleNamespace(registry=SimpleNamespace(by_id={"Thresh": (412, "쓰레쉬")}))
@@ -1871,6 +2098,92 @@ class DuoEvidenceTests(unittest.TestCase):
             season_wins=10, season_losses=5, status="OK"
         )
         self.assertNotEqual(first, app._play_card_state_signature())
+
+    def test_previous_play_board_is_frozen_cleared_and_restored_read_only(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        player = LivePlayer(
+            champion_id="Rakan", champion_name_ko="라칸",
+            riot_game_name="Player", riot_tag_line="KR1",
+            team="ORDER", position="UTILITY", is_active_player=True,
+        )
+        app.live_game = LiveGameSnapshot(
+            players=[player], active_riot_id=player.riot_id,
+            active_team="ORDER", game_time=1_234.0, game_mode="CLASSIC",
+        )
+        original_riot_id = player.riot_id
+        app.player_profiles = {
+            original_riot_id: PlayerProfileStat(
+                season_wins=10, season_losses=8, status="OK",
+            )
+        }
+        app.opgg_player_profiles = {}
+        app.duo_pairs = {original_riot_id: [("Friend#KR1", "유력", "직전판 동팀")]}
+        app.lane_matchups = {}
+        app.jungle_tendencies = {}
+        app._live_prediction = None
+        app._lane_opponent_personal_stat = None
+        app._lane_opponent_behavior = None
+        app._my_personal_stat = None
+        app._my_behavior = None
+        app._opgg_profile_failures = 0
+        app._previous_play_state = None
+        app._showing_previous_play = False
+        app._play_roster_signature = "LIVE"
+        app._play_card_signatures = {"A:0": "old"}
+        app._play_summary_signature = "summary"
+        app._play_prediction_signature = ("prediction",)
+        app._play_insight_signature = "insight"
+        app._play_insight_section_signatures = {"lane": "old"}
+        app._play_duo_legend_signature = "duo"
+        app._profiles_loading = True
+        app._opgg_profiles_loading = True
+        app._duo_checking = True
+        app._duo_checked_signature = "LIVE"
+        app._live_signature = "LIVE"
+        app._live_active_signature = "ACTIVE"
+        app._jungle_tendency_context = None
+        app._lane_opponent_analysis_context = None
+        app._my_account_analysis_context = None
+        app.game_phase = "None"
+
+        app._capture_previous_play_state()
+        frozen = app._previous_play_state
+        self.assertIsNotNone(frozen)
+        app.live_game.players[0].riot_game_name = "Changed"
+        self.assertEqual(frozen["live_game"].players[0].riot_game_name, "Player")
+
+        app._clear_current_play_state()
+        self.assertEqual(app.live_game.players, [])
+        self.assertIs(app._previous_play_state, frozen)
+
+        rendered: list[bool] = []
+        app._render_play = lambda: rendered.append(True)
+        app._show_previous_play()
+
+        self.assertTrue(app._showing_previous_play)
+        self.assertEqual(app.live_game.players[0].riot_game_name, "Player")
+        self.assertEqual(app.player_profiles[original_riot_id].season_wins, 10)
+        self.assertTrue(app._live_signature.startswith("PREVIOUS:"))
+        self.assertEqual(rendered, [True])
+
+    def test_previous_play_view_never_starts_analysis_workers(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app._showing_previous_play = True
+        app.live_game = LiveGameSnapshot(players=[LivePlayer(
+            champion_id="Rakan", champion_name_ko="라칸",
+            riot_game_name="Player", riot_tag_line="KR1",
+            team="ORDER", position="UTILITY",
+        )])
+        app._jungle_tendency_loading = False
+        app._lane_opponent_analysis_loading = False
+        app._my_account_analysis_loading = False
+
+        # Each method returns at the read-only guard before touching storage or
+        # scheduling a background task.
+        app._ensure_jungle_tendencies()
+        app._ensure_lane_opponent_analysis()
+        app._ensure_my_account_analysis()
 
     def test_play_card_signature_changes_only_with_lane_matchup_data(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)

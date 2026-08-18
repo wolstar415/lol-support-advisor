@@ -146,6 +146,19 @@ LIVE_IDENTITY_CACHE_SETTING = "live_roster_identity_cache_v1"
 LIVE_IDENTITY_CAPTURE_FAST_SECONDS = 12.0
 LIVE_IDENTITY_CAPTURE_MAX_SECONDS = 300.0
 
+RECOMMENDATION_ACTION_SPECS = (
+    ("롤에 선택", "hover", "blue"),
+    ("픽 확정", "pick", "green"),
+)
+
+LOCAL_RECOMMENDATION_FALLBACKS = {
+    "TOP": ("Malphite", "Ornn", "Shen"),
+    "JUNGLE": ("Amumu", "Nocturne", "Warwick"),
+    "MIDDLE": ("Ahri", "Orianna", "Annie"),
+    "BOTTOM": ("Jinx", "Ashe", "MissFortune"),
+    "SUPPORT": ("Nautilus", "Braum", "Janna"),
+}
+
 
 # Backward-compatible names remain importable for existing integrations and
 # tests while the implementation is now champion-agnostic.
@@ -530,6 +543,77 @@ def opgg_recent_form(
             match.result.upper() == "WIN" for match in champion_recent
         ),
         "champion_streak": _result_streak(completed, champion_key),
+    }
+
+
+def riot_local_recent_form(
+    matches: list[dict], puuid: str, champion_id: str,
+) -> dict[str, int | str | bool | None]:
+    """Calculate the active player's streak from cached Riot Solo Queue games.
+
+    Riot match payloads are authoritative for the local account and can be
+    newer than the OP.GG profile cache.  Only the latest ten completed Solo
+    Queue games are considered, newest first.
+    """
+    samples: list[dict] = []
+    for match in sorted(
+        matches,
+        key=lambda item: int((item.get("info") or {}).get("gameCreation") or 0),
+        reverse=True,
+    ):
+        info = match.get("info") or {}
+        if int(info.get("queueId") or 0) != 420:
+            continue
+        participant = next(
+            (
+                item for item in (info.get("participants") or [])
+                if str(item.get("puuid") or "") == puuid
+            ),
+            None,
+        )
+        if not participant:
+            continue
+        samples.append(participant)
+        if len(samples) >= 10:
+            break
+
+    def streak(rows: list[dict]) -> int:
+        if not rows:
+            return 0
+        first = bool(rows[0].get("win"))
+        count = 0
+        for row in rows:
+            if bool(row.get("win")) != first:
+                break
+            count += 1
+        return count if first else -count
+
+    champion_samples = [
+        item for item in samples
+        if str(item.get("championName") or "") == champion_id
+    ]
+    last = samples[0] if samples else {}
+    return {
+        "recent_games": len(samples),
+        "recent_wins": sum(bool(item.get("win")) for item in samples),
+        "recent_kills": sum(int(item.get("kills") or 0) for item in samples),
+        "recent_deaths": sum(int(item.get("deaths") or 0) for item in samples),
+        "recent_assists": sum(int(item.get("assists") or 0) for item in samples),
+        "overall_streak": streak(samples),
+        "champion_recent_games": len(champion_samples),
+        "champion_recent_wins": sum(
+            bool(item.get("win")) for item in champion_samples
+        ),
+        "champion_streak": streak(champion_samples),
+        "last_game_champion_id": str(last.get("championName") or ""),
+        "last_game_position": str(
+            last.get("teamPosition") or last.get("individualPosition")
+            or "UNKNOWN"
+        ),
+        "last_game_kills": int(last.get("kills") or 0),
+        "last_game_deaths": int(last.get("deaths") or 0),
+        "last_game_assists": int(last.get("assists") or 0),
+        "last_game_won": bool(last.get("win")) if last else None,
     }
 
 
@@ -1711,6 +1795,106 @@ def candidate_score(
     return max(0.0, min(100.0, score)), confidence
 
 
+def local_recommendations_from_candidates(
+    counters: list[OpggCounter],
+    *,
+    unavailable: set[str] | None = None,
+    personal_stats: dict[str, PersonalStat | None] | None = None,
+    synergies: dict[str, OpggSynergyStat | None] | None = None,
+    enemy_name: str = "",
+    ally_adc_name: str = "",
+    role_name: str = "서포터",
+    language: str = "ko",
+) -> list[Recommendation]:
+    """Build an immediate local top three without waiting for Codex.
+
+    The rows are deliberately derived only from data already held in memory.
+    This keeps first-pick/blind recommendations instant and never starts an
+    external request from the renderer.
+    """
+    blocked = unavailable or set()
+    stats = personal_stats or {}
+    synergy_by_id = synergies or {}
+    unique: dict[str, OpggCounter] = {}
+    for counter in counters:
+        if counter.champion_id and counter.champion_id not in blocked:
+            unique.setdefault(counter.champion_id, counter)
+    ranked = sorted(
+        unique.values(),
+        key=lambda counter: candidate_score(
+            counter, stats.get(counter.champion_id),
+            synergy_by_id.get(counter.champion_id),
+        )[0],
+        reverse=True,
+    )[:3]
+    english = normalize_language(language) == "en"
+    result: list[Recommendation] = []
+    for rank, counter in enumerate(ranked, start=1):
+        synergy = synergy_by_id.get(counter.champion_id)
+        if counter.games >= 1_500 and counter.versus_win_rate >= 52.0:
+            safety = "High" if english else "높음"
+        elif counter.games >= 300 and counter.versus_win_rate >= 49.5:
+            safety = "Medium" if english else "보통"
+        else:
+            safety = "Low" if english else "낮음"
+        if english:
+            style = "Matchup-first" if enemy_name else "Blind first-pick"
+            reason = (
+                f"Local OP.GG data: {counter.versus_win_rate:.1f}% into {enemy_name}."
+                if enemy_name else
+                f"Immediate {role_name} meta candidate at {counter.versus_win_rate:.1f}%."
+            )
+            team = (
+                f"{ally_adc_name} pairing: {synergy.win_rate:.1f}% over {synergy.games:,} games."
+                if ally_adc_name and synergy and synergy.win_rate is not None else
+                "Flexible local-data candidate while the ally composition is incomplete."
+            )
+            lane = (
+                "Use the favorable matchup window, but confirm summoner spells before committing."
+                if enemy_name and counter.versus_win_rate >= 50.0 else
+                "Keep the lane plan flexible until the opposing lane is revealed."
+            )
+            watch = (
+                "Small sample: treat this as a quick reference."
+                if counter.games < 300 else
+                "Recheck bans, ally picks, and the final enemy lane before lock-in."
+            )
+        else:
+            style = "상성 우선" if enemy_name else "블라인드 선픽"
+            reason = (
+                f"로컬 OP.GG 기준 {enemy_name} 상대 승률 {counter.versus_win_rate:.1f}%."
+                if enemy_name else
+                f"적 {role_name} 미확정 상태의 즉시 메타 후보 · 승률 {counter.versus_win_rate:.1f}%."
+            )
+            team = (
+                f"{ally_adc_name} 조합 승률 {synergy.win_rate:.1f}% · {synergy.games:,}게임."
+                if ally_adc_name and synergy and synergy.win_rate is not None else
+                "아군 조합이 덜 공개된 상태에서도 쓰기 쉬운 로컬 데이터 후보."
+            )
+            lane = (
+                "상성 우위를 활용하되 상대 스펠과 정글 위치를 확인한 뒤 교전."
+                if enemy_name and counter.versus_win_rate >= 50.0 else
+                "상대 라인이 공개되기 전에는 무리한 선공보다 대응 여지를 남김."
+            )
+            watch = (
+                "표본이 작으므로 빠른 참고용으로만 사용."
+                if counter.games < 300 else
+                "확정 전 밴·아군 픽·최종 상대 라인을 다시 확인."
+            )
+        result.append(Recommendation(
+            rank=rank,
+            champion_id=counter.champion_id,
+            champion_name_ko=counter.champion_name_ko,
+            style=style,
+            blind_safety=safety,
+            reason=reason,
+            team_synergy=team,
+            lane_plan=lane,
+            watch_for=watch,
+        ))
+    return result
+
+
 class AdvisorApp:
     def __init__(
         self,
@@ -1820,6 +2004,11 @@ class AdvisorApp:
             self._demo_lane_matchups() if demo else {}
         )
         self._live_prediction: GamePrediction | None = None
+        # Keep the last completed live board in memory. It is intentionally
+        # session-only: reopening the app starts with a clean play tab, while a
+        # finished game can still be reviewed without new Riot/OP.GG requests.
+        self._previous_play_state: dict[str, object] | None = None
+        self._showing_previous_play = False
         self._prediction_saved_signature = ""
         self._prediction_save_pending_signature = ""
         self._prediction_save_after_id: str | None = None
@@ -1835,9 +2024,12 @@ class AdvisorApp:
             self._demo_jungle_tendencies() if demo else {}
         )
         self.recommendations: list[Recommendation] = []
+        self.recommendation_source = ""
         self.recommendation_snapshot_id = ""
         self.recommendation_context_signature = ""
         self.recommendation_enemy_support_id = ""
+        self._local_recommendation_signature = ""
+        self._local_fallback_candidates_by_role: dict[str, list[OpggCounter]] = {}
         self._recommendation_generation = 0
         self._champ_select_inner_phase = ""
         self._local_pick_action_in_progress = False
@@ -6169,7 +6361,7 @@ class AdvisorApp:
         self.codex_recommendations_outer = outer.master
         self.champion_action_status = tk.Label(
             outer,
-            text="추천 챔피언의 HOVER/픽/밴은 버튼을 누를 때마다 최신 롤 세션을 재확인합니다.",
+            text="추천 챔피언의 선택/픽은 버튼을 누를 때마다 최신 롤 세션을 재확인합니다.",
             bg=COLORS["panel"], fg=COLORS["muted"], anchor="w",
             font=("Malgun Gothic", 9, "bold"),
         )
@@ -6237,6 +6429,15 @@ class AdvisorApp:
             top, text="", bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 9)
         )
         self.live_profile_status.pack(side="right")
+        self.previous_play_button = self._button(
+            top,
+            "이전 게임 플레이탭 보기",
+            self._show_previous_play,
+            COLORS["blue"],
+        )
+        # Reveal this only when no current game exists and a frozen board does.
+        self.previous_play_button.pack(side="right", padx=(0, 10))
+        self.previous_play_button.pack_forget()
         self.live_duo_status = tk.Label(
             panel,
             text=self._tr("DUO: 현재 10명의 최근 100경기 교집합 확인 · 카드 수치는 로컬/Riot 결합"),
@@ -7057,8 +7258,8 @@ class AdvisorApp:
         self._render_synergy()
         self._render_opgg_meta()
         self._render_opgg()
-        self._render_prompt_summary()
         self._render_recommendations()
+        self._render_prompt_summary()
 
     def _selection_panel_needs_render(self, name: str, *values: object) -> bool:
         signature = repr((
@@ -9252,9 +9453,7 @@ class AdvisorApp:
             self.opgg_button.configure(state="disabled", text="메타 갱신 중...")
         else:
             self.opgg_button.configure(state="normal", text="통계 캐시 확인")
-        if self.game_phase == "InProgress":
-            self.riot_button.configure(state="disabled", text="게임 중 · 로컬 조회")
-        elif self._riot_syncing:
+        if self._riot_syncing:
             self.riot_button.configure(state="disabled")
         elif self._riot_history_cooldown_remaining().total_seconds() > 0:
             remaining = self._riot_history_cooldown_remaining()
@@ -9386,11 +9585,32 @@ class AdvisorApp:
         return [*members[:5], *([None] * max(0, 5 - len(members)))]
 
     def _render_draft_team_slots(self, frame: tk.Frame, ally: bool) -> None:
-        self._clear(frame)
-        for column in range(5):
-            frame.grid_columnconfigure(column, weight=1, uniform="draft_team_slots")
+        widgets = getattr(frame, "_advisor_draft_slot_widgets", None)
+        if not widgets:
+            widgets = []
+            self._clear(frame)
+            for column in range(5):
+                frame.grid_columnconfigure(column, weight=1, uniform="draft_team_slots")
+                outer = tk.Frame(frame, bg=COLORS["border"], padx=1, pady=1)
+                outer.grid(
+                    row=0, column=column, sticky="nsew",
+                    padx=(0 if column == 0 else 3, 3),
+                )
+                button = tk.Button(
+                    outer, image="", compound="left", justify="left", anchor="w",
+                    relief="flat", bd=0, padx=9, pady=7,
+                    bg=COLORS["panel_2"], fg=COLORS["muted"],
+                    disabledforeground=COLORS["muted"],
+                    activebackground=COLORS["surface_selected"],
+                    activeforeground=COLORS["text"],
+                    font=("Malgun Gothic", 8, "bold"),
+                )
+                button.pack(fill="both", expand=True)
+                widgets.append((outer, button))
+            setattr(frame, "_advisor_draft_slot_widgets", widgets)
         selected_id = self.draft.selected_enemy_support_id
         for index, member in enumerate(self._draft_team_slots(ally)):
+            outer, widget = widgets[index]
             is_me = bool(
                 ally and member
                 and self.draft.local_player_cell_id is not None
@@ -9430,37 +9650,46 @@ class AdvisorApp:
                 )
                 if member and member.champion_id else None
             )
-            command = None
-            if (
+            selectable = bool(
                 not ally and member and member.champion_id
                 and state in {"LOCKED", "HOVER"}
-            ):
+            )
+            if selectable and member:
                 command = lambda champion_id=member.champion_id: self._select_enemy_support(
                     champion_id
                 )
-            cls = tk.Button if command else tk.Label
-            kwargs = {
-                "command": command, "cursor": "hand2",
-                "activebackground": COLORS["surface_selected"],
-                "activeforeground": COLORS["text"],
-            } if command else {}
-            widget = cls(
-                outer,
+            else:
+                command = lambda: None
+            background = COLORS["surface_selected"] if selected else COLORS["panel_2"]
+            outer.configure(bg=border)
+            widget.configure(
                 text=self._text(
                     "draft.slot", order=order, turn=turn_text,
                     me=prefix, role=role, champion=name, status=status,
                 ),
-                image=icon or "", compound="left", justify="left", anchor="w",
-                bg=COLORS["surface_selected"] if selected else COLORS["panel_2"],
+                image=icon or "", bg=background,
                 fg=accent if state != "EMPTY" else COLORS["muted"],
-                relief="flat", bd=0, padx=9, pady=7,
-                font=("Malgun Gothic", 8, "bold"),
-                **kwargs,
+                disabledforeground=accent if state != "EMPTY" else COLORS["muted"],
+                command=command,
+                cursor="hand2" if selectable else "arrow",
+                state="normal" if selectable else "disabled",
             )
-            widget.pack(fill="both", expand=True)
+            setattr(widget, "_advisor_image", icon)
 
     def _render_draft_bans(self, frame: tk.Frame, ally: bool) -> None:
-        self._clear(frame)
+        widgets = getattr(frame, "_advisor_draft_ban_widgets", None)
+        if not widgets:
+            widgets = []
+            self._clear(frame)
+            for _index in range(5):
+                label = tk.Label(
+                    frame, image="", compound="left", bg=COLORS["chip"],
+                    fg=COLORS["muted"], padx=7, pady=5,
+                    font=("Malgun Gothic", 7, "bold"),
+                )
+                label.pack(side="left", padx=(0, 4), pady=1)
+                widgets.append(label)
+            setattr(frame, "_advisor_draft_ban_widgets", widgets)
         actions = list(
             self.draft.ally_ban_actions if ally else self.draft.enemy_ban_actions
         )
@@ -9492,13 +9721,14 @@ class AdvisorApp:
                 )
                 if champion_id else None
             )
-            tk.Label(
-                frame, text=self._text(
+            label = widgets[index]
+            label.configure(
+                text=self._text(
                     "draft.ban", order=index + 1, champion=name, status=status,
-                ), image=icon or "",
-                compound="left", bg=COLORS["chip"], fg=color,
-                padx=7, pady=5, font=("Malgun Gothic", 7, "bold"),
-            ).pack(side="left", padx=(0, 4), pady=1)
+                ),
+                image=icon or "", fg=color,
+            )
+            setattr(label, "_advisor_image", icon)
 
     def _render_draft(self) -> None:
         role_name = self._position_text(self.draft.my_role)
@@ -10359,7 +10589,10 @@ class AdvisorApp:
         copied = self._prompt_copied_snapshot_id == self.draft.snapshot_id
         # A received answer remains the active answer until the next Codex
         # response replaces it. Draft changes are context warnings only.
-        recommendation_ready = bool(self.recommendations)
+        recommendation_ready = bool(
+            self.recommendations
+            and getattr(self, "recommendation_source", "") == "CODEX"
+        )
         active_step = (
             0 if recommendation_ready else
             1 if not memory_registered else
@@ -10475,25 +10708,131 @@ class AdvisorApp:
     def _recommendations_stale(self) -> bool:
         if not self.recommendations:
             return False
+        if getattr(self, "recommendation_source", "") == "LOCAL":
+            return False
         stored_context = getattr(self, "recommendation_context_signature", "")
         if stored_context:
             return stored_context != recommendation_draft_context_signature(self.draft)
         return self.recommendation_snapshot_id != self.draft.snapshot_id
 
+    def _local_recommendation_candidates(self) -> list[OpggCounter]:
+        snapshot = self.opgg_snapshot or self.opgg_meta_snapshot
+        combined: dict[str, OpggCounter] = {}
+        if snapshot:
+            for counter in [*snapshot.counters, *snapshot.weak_picks]:
+                combined.setdefault(counter.champion_id, counter)
+        if combined:
+            return list(combined.values())
+
+        role = self.draft.my_role
+        cached = getattr(self, "_local_fallback_candidates_by_role", {}).get(role)
+        if cached is not None:
+            return list(cached)
+
+        catalog = self.storage.load_opgg_position_catalog(
+            role, max_age=None,
+        )
+        champion_ids = list(catalog[1][:10]) if catalog else list(
+            LOCAL_RECOMMENDATION_FALLBACKS.get(role, ())
+        )
+        candidates = [
+            OpggCounter(
+                champion_id=champion_id,
+                champion_name_ko=self.registry.ko_name(champion_id),
+                versus_win_rate=50.0,
+                games=0,
+                status="LOCAL_FALLBACK",
+                position_rank=index,
+            )
+            for index, champion_id in enumerate(champion_ids, start=1)
+            if self.registry.contains(champion_id)
+        ]
+        self._local_fallback_candidates_by_role[role] = list(candidates)
+        return candidates
+
+    def _refresh_local_recommendations(self) -> None:
+        """Keep an instant local top three until a Codex answer replaces it."""
+        if getattr(self, "recommendation_source", "") == "CODEX":
+            return
+        candidates = self._local_recommendation_candidates()
+        unavailable = set(self.draft.unavailable_champions())
+        adc = allied_adc_member(self.draft)
+        context = repr((
+            self.draft.my_role,
+            self.draft.selected_enemy_support_id,
+            adc.champion_id if adc else "",
+            tuple(sorted(unavailable)),
+            tuple(
+                (
+                    item.champion_id, item.versus_win_rate, item.games,
+                    item.overall_win_rate, item.position_rank,
+                )
+                for item in candidates
+            ),
+        ))
+        signature = sha256(context.encode("utf-8")).hexdigest()[:20]
+        if (
+            signature == getattr(self, "_local_recommendation_signature", "")
+            and getattr(self, "recommendation_source", "") == "LOCAL"
+        ):
+            return
+
+        candidate_ids = [item.champion_id for item in candidates]
+        personal_stats = self._personal_stats_for(candidate_ids)
+        synergies = {
+            champion_id: self._synergy_for(champion_id)
+            for champion_id in candidate_ids
+        }
+        recommendations = local_recommendations_from_candidates(
+            candidates,
+            unavailable=unavailable,
+            personal_stats=personal_stats,
+            synergies=synergies,
+            enemy_name=(
+                self._champion_text(
+                    self.draft.selected_enemy_support_id,
+                    self.draft.selected_enemy_support_name_ko,
+                )
+                if self.draft.selected_enemy_support_id else ""
+            ),
+            ally_adc_name=(
+                self._champion_text(adc.champion_id, adc.champion_name_ko)
+                if adc else ""
+            ),
+            role_name=self._position_text(self.draft.my_role),
+            language=self.ui_language,
+        )
+        self._local_recommendation_signature = signature
+        self.recommendation_source = "LOCAL"
+        self.recommendations = recommendations
+        self.recommendation_snapshot_id = self.draft.snapshot_id
+        self.recommendation_context_signature = recommendation_draft_context_signature(
+            self.draft
+        )
+        self.recommendation_enemy_support_id = (
+            self.draft.selected_enemy_support_id or ""
+        )
+        self._recommendation_generation = (
+            int(getattr(self, "_recommendation_generation", 0)) + 1
+        )
+
     def _render_recommendations(self) -> None:
+        self._refresh_local_recommendations()
         stale = self._recommendations_stale()
-        current_context = recommendation_draft_context_signature(self.draft)
+        current_target = self.draft.selected_enemy_support_id or ""
+        recommendation_ids = [item.champion_id for item in self.recommendations]
         if not self._selection_panel_needs_render(
-            "recommendations", self.recommendation_snapshot_id,
+            "recommendations", getattr(self, "recommendation_source", ""),
+            self.recommendation_snapshot_id,
             getattr(self, "recommendation_enemy_support_id", ""),
-            current_context, stale,
+            current_target,
             self.recommendations, allied_adc_member(self.draft),
             self.opgg_snapshot, self.opgg_meta_snapshot,
             self.opgg_synergy_snapshot,
-            tuple(sorted(
-                (champion_id, repr(stat))
-                for champion_id, stat in self._personal_stats_cache.items()
-            )),
+            tuple(
+                (champion_id, repr(self._personal_stats_cache.get(champion_id)))
+                for champion_id in recommendation_ids
+            ),
         ):
             return
         self._clear(self.cards_frame)
@@ -10509,10 +10848,16 @@ class AdvisorApp:
                 bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 10),
             ).pack(anchor="w", pady=12)
             return
+        source = getattr(self, "recommendation_source", "")
         answered_target = getattr(self, "recommendation_enemy_support_id", "")
-        current_target = self.draft.selected_enemy_support_id or ""
         target_changed = answered_target != current_target
-        if target_changed:
+        if source == "LOCAL":
+            status_text = self._text(
+                "recommendations.local_blind"
+                if not current_target else "recommendations.local_matchup"
+            )
+            status_color = COLORS["blue"]
+        elif target_changed:
             answered_name = (
                 self._champion_text(answered_target)
                 if answered_target else self._text("prompt.target.unknown")
@@ -10626,19 +10971,17 @@ class AdvisorApp:
             self._paragraph(inner, "주의", recommendation.watch_for, COLORS["orange"])
             action_row = tk.Frame(inner, bg=COLORS["panel_2"])
             action_row.pack(fill="x", pady=(10, 0))
-            action_specs = (
-                ("롤에 선택", "hover", COLORS["blue"]),
-                ("픽 확정", "pick", COLORS["green"]),
-                ("밴 확정", "ban", COLORS["red"]),
-            )
-            for action_column, (label, action, accent) in enumerate(action_specs):
+            for action_column, (label, action, accent_key) in enumerate(
+                RECOMMENDATION_ACTION_SPECS
+            ):
+                accent = COLORS[accent_key]
                 button = self._button(
                     action_row,
                     label,
                     lambda champion_id=recommendation.champion_id, selected_action=action:
                         self._execute_champion_action(champion_id, selected_action),
                     accent,
-                    filled=action in {"pick", "ban"},
+                    filled=action == "pick",
                 )
                 button.grid(
                     row=0, column=action_column, sticky="ew",
@@ -10884,12 +11227,17 @@ class AdvisorApp:
     def _render_play(self) -> None:
         if self._current_main_tab_index() != 1:
             return
+        self._render_previous_play_button()
         self._render_play_summary()
         self._render_play_prediction()
         self._render_duo_legend()
         if not self.live_game.players:
             self.live_game_label.configure(
-                text=self._tr("게임이 시작되면 자동으로 플레이 탭으로 이동합니다.")
+                text=self._tr(
+                    "현재 게임 없음 · 이전 게임 플레이탭을 다시 볼 수 있습니다."
+                    if getattr(self, "_previous_play_state", None)
+                    else "게임이 시작되면 자동으로 플레이 탭으로 이동합니다."
+                )
             )
             self.live_profile_status.configure(text="")
             self.live_duo_status.configure(
@@ -10996,13 +11344,139 @@ class AdvisorApp:
         minutes = int(self.live_game.game_time // 60)
         seconds = int(self.live_game.game_time % 60)
         self.live_game_label.configure(
-            text=f"{self.live_game.game_mode or '게임'} · {minutes:02d}:{seconds:02d} · "
-                 f"플레이어 {len(self.live_game.players)}명"
+            text=self._text(
+                "play.previous_game_clock"
+                if self._showing_previous_play else "play.game_clock",
+                mode=self.live_game.game_mode or self._tr("게임"),
+                minutes=minutes,
+                seconds=seconds,
+                count=len(self.live_game.players),
+            )
         )
+
+    def _render_previous_play_button(self) -> None:
+        button = getattr(self, "previous_play_button", None)
+        if not isinstance(button, tk.Button):
+            return
+        should_show = bool(
+            getattr(self, "_previous_play_state", None)
+            and not self.live_game.players
+            and not self._showing_previous_play
+        )
+        if should_show:
+            button.configure(
+                text=self._tr("이전 게임 플레이탭 보기"), state="normal",
+            )
+            if not button.winfo_manager():
+                button.pack(side="right", padx=(0, 10))
+        elif button.winfo_manager():
+            button.pack_forget()
+
+    def _capture_previous_play_state(self) -> None:
+        """Freeze the current play board before game-end state is cleared."""
+        if not getattr(self, "live_game", LiveGameSnapshot()).players:
+            return
+        self._previous_play_state = deepcopy({
+            "live_game": self.live_game,
+            "player_profiles": self.player_profiles,
+            "opgg_player_profiles": self.opgg_player_profiles,
+            "duo_pairs": self.duo_pairs,
+            "lane_matchups": self.lane_matchups,
+            "jungle_tendencies": self.jungle_tendencies,
+            "live_prediction": self._live_prediction,
+            "lane_opponent_personal_stat": self._lane_opponent_personal_stat,
+            "lane_opponent_behavior": self._lane_opponent_behavior,
+            "my_personal_stat": self._my_personal_stat,
+            "my_behavior": self._my_behavior,
+            "opgg_profile_failures": self._opgg_profile_failures,
+        })
+        self._showing_previous_play = False
+
+    def _invalidate_play_view(self) -> None:
+        """Invalidate display signatures without starting any data loaders."""
+        self._play_roster_signature = ""
+        self._play_card_signatures.clear()
+        self._play_summary_signature = ""
+        self._play_prediction_signature = ()
+        self._play_insight_signature = ""
+        self._play_insight_section_signatures.clear()
+        self._play_duo_legend_signature = ""
+
+    def _clear_current_play_state(self) -> None:
+        """Clear the active board while retaining the frozen previous board."""
+        self.live_game = LiveGameSnapshot()
+        self.player_profiles = {}
+        self.opgg_player_profiles = {}
+        self.duo_pairs = {}
+        self.lane_matchups = {}
+        self.jungle_tendencies = {}
+        self._live_prediction = None
+        self._jungle_tendency_context = None
+        self._lane_opponent_analysis_context = None
+        self._lane_opponent_personal_stat = None
+        self._lane_opponent_behavior = None
+        self._my_account_analysis_context = None
+        self._my_personal_stat = None
+        self._my_behavior = None
+        self._profiles_loading = False
+        self._opgg_profiles_loading = False
+        self._duo_checking = False
+        self._opgg_profile_failures = 0
+        self._duo_checked_signature = ""
+        self._live_signature = ""
+        self._live_active_signature = ""
+        self._showing_previous_play = False
+        self._invalidate_play_view()
+
+    def _show_previous_play(self) -> None:
+        """Restore the last board as a read-only view with no remote refresh."""
+        state = getattr(self, "_previous_play_state", None)
+        if not state or getattr(self, "game_phase", "None") in {
+            "GameStart", "Reconnect", "InProgress",
+        }:
+            return
+        restored = deepcopy(state)
+        live_game = restored.get("live_game")
+        if not isinstance(live_game, LiveGameSnapshot) or not live_game.players:
+            return
+        self.live_game = live_game
+        self.player_profiles = dict(restored.get("player_profiles") or {})
+        self.opgg_player_profiles = dict(restored.get("opgg_player_profiles") or {})
+        self.duo_pairs = dict(restored.get("duo_pairs") or {})
+        self.lane_matchups = dict(restored.get("lane_matchups") or {})
+        self.jungle_tendencies = dict(restored.get("jungle_tendencies") or {})
+        prediction = restored.get("live_prediction")
+        self._live_prediction = prediction if isinstance(prediction, GamePrediction) else None
+        self._lane_opponent_personal_stat = restored.get("lane_opponent_personal_stat")
+        self._lane_opponent_behavior = restored.get("lane_opponent_behavior")
+        self._my_personal_stat = restored.get("my_personal_stat")
+        self._my_behavior = restored.get("my_behavior")
+        self._opgg_profile_failures = int(restored.get("opgg_profile_failures") or 0)
+        self._profiles_loading = False
+        self._opgg_profiles_loading = False
+        self._duo_checking = False
+        self._jungle_tendency_loading = False
+        self._lane_opponent_analysis_loading = False
+        self._my_account_analysis_loading = False
+        # A distinct signature freezes this view against late callbacks from the
+        # just-finished game while preserving every captured display value.
+        previous_token = (
+            self.live_game.active_riot_id
+            or self.live_game.game_mode
+            or f"last-{int(self.live_game.game_time)}"
+        )
+        self._live_signature = f"PREVIOUS:{previous_token}"
+        self._live_active_signature = f"PREVIOUS:{previous_token}"
+        self._showing_previous_play = True
+        self._invalidate_play_view()
+        self._render_play()
 
     def _ensure_jungle_tendencies(self) -> None:
         """Load local jungle evidence without delaying the ten player cards."""
-        if self.demo or not self.live_game.players or self._jungle_tendency_loading:
+        if (
+            self.demo or getattr(self, "_showing_previous_play", False)
+            or not self.live_game.players or self._jungle_tendency_loading
+        ):
             return
         junglers = [
             player for player in self.live_game.players
@@ -11057,7 +11531,8 @@ class AdvisorApp:
     def _ensure_lane_opponent_analysis(self) -> None:
         """Compute the opposing lane player's exact local head-to-head sample."""
         if (
-            self.demo or not self.live_game.players
+            self.demo or getattr(self, "_showing_previous_play", False)
+            or not self.live_game.players
             or self._lane_opponent_analysis_loading
         ):
             return
@@ -11133,7 +11608,10 @@ class AdvisorApp:
 
     def _ensure_my_account_analysis(self) -> None:
         """Compute my current-pick coaching sample without blocking live cards."""
-        if self.demo or not self.live_game.players or self._my_account_analysis_loading:
+        if (
+            self.demo or getattr(self, "_showing_previous_play", False)
+            or not self.live_game.players or self._my_account_analysis_loading
+        ):
             return
         active = next(
             (player for player in self.live_game.players if player.is_active_player),
@@ -12572,6 +13050,26 @@ class AdvisorApp:
 
     def _update_live_prediction(self) -> None:
         value_label, detail_label = self.play_metrics["prediction"]
+        if getattr(self, "_showing_previous_play", False):
+            prediction = self._live_prediction
+            if prediction is None:
+                value_label.configure(text="--", fg=COLORS["gold"])
+                detail_label.configure(
+                    text=self._text("play.previous_prediction_unavailable")
+                )
+                return
+            if prediction.evidence_score < 0.15:
+                result_text = "표본 수집 중"
+                result_color = COLORS["orange"]
+            else:
+                result_text = "승리 예상" if prediction.predicted_win else "패배 예상"
+                result_color = COLORS["green"] if prediction.predicted_win else COLORS["red"]
+            value_label.configure(
+                text=f"{prediction.win_probability:.1f}% · {self._tr(result_text)}",
+                fg=result_color,
+            )
+            detail_label.configure(text=self._text("play.previous_prediction"))
+            return
         if not self.live_game.players:
             self._live_prediction = None
             value_label.configure(text="--", fg=COLORS["gold"])
@@ -13524,17 +14022,25 @@ class AdvisorApp:
 
         def work() -> HistoryOverview:
             matches = self.storage.player_matches(puuid, limit=1000)
-            self.storage.resolve_game_predictions(matches[:50])
             overview = analyze_history(matches, puuid)
-            attach_match_lp_changes(
-                overview,
-                self.storage.load_match_lp_changes(
+            # LP and prediction accuracy are optional enrichments. A damaged
+            # legacy row must never hide the underlying Riot match history.
+            try:
+                attach_match_lp_changes(
+                    overview,
+                    self.storage.load_match_lp_changes(
+                        entry.match_id for entry in overview.entries
+                    ),
+                )
+            except Exception:
+                pass
+            try:
+                self.storage.resolve_game_predictions(matches[:50])
+                predictions = self.storage.load_game_predictions(
                     entry.match_id for entry in overview.entries
-                ),
-            )
-            predictions = self.storage.load_game_predictions(
-                entry.match_id for entry in overview.entries
-            )
+                )
+            except Exception:
+                predictions = {}
             for entry in overview.entries:
                 prediction = predictions.get(entry.match_id)
                 if not prediction:
@@ -15206,6 +15712,7 @@ class AdvisorApp:
             int(getattr(self, "_recommendation_generation", 0)) + 1
         )
         self.recommendations = recommendations
+        self.recommendation_source = "CODEX"
         self.recommendation_snapshot_id = parsed_draft.snapshot_id
         self.recommendation_context_signature = (
             recommendation_draft_context_signature(parsed_draft)
@@ -16394,16 +16901,7 @@ class AdvisorApp:
             if on_complete:
                 on_complete(False)
             return
-        if self.game_phase == "InProgress":
-            if not automatic:
-                messagebox.showinfo(
-                    "게임 중 로컬 조회",
-                    "게임 중에는 외부 전적 요청을 하지 않습니다. 게임 종료 후 자동 갱신됩니다.",
-                    parent=self.root,
-                )
-            if on_complete:
-                on_complete(False)
-            return
+        started_in_game = self.game_phase == "InProgress"
         remaining = self._riot_history_cooldown_remaining()
         if (
             not game_finished
@@ -16456,7 +16954,10 @@ class AdvisorApp:
         self._riot_syncing = True
         self.riot_button.configure(
             state="disabled",
-            text="전적 저장 중...",
+            text=self._text(
+                "history.sync.in_game_progress"
+                if started_in_game else "history.sync.progress"
+            ),
         )
 
         def progress(done: int, total: int) -> None:
@@ -16483,7 +16984,13 @@ class AdvisorApp:
             self._riot_syncing = False
             self.riot_button.configure(text="전적 갱신", state="normal")
             self.exchange_status.configure(
-                text=f"내 전적 동기화 완료 · 신규 {saved} / 최근 {total}경기", fg=COLORS["green"]
+                text=self._text(
+                    "history.sync.in_game_complete"
+                    if started_in_game else "history.sync.complete",
+                    saved=saved,
+                    total=total,
+                ),
+                fg=COLORS["green"],
             )
             self._history_revision = None
             self._ensure_history_loaded(force=True)
@@ -16569,9 +17076,11 @@ class AdvisorApp:
         self._support_filter = "ALL"
         self._recommendation_generation += 1
         self.recommendations = []
+        self.recommendation_source = ""
         self.recommendation_snapshot_id = ""
         self.recommendation_context_signature = ""
         self.recommendation_enemy_support_id = ""
+        self._local_recommendation_signature = ""
         self._prompt_copied_snapshot_id = ""
         self._champ_select_inner_phase = ""
         self._local_pick_action_in_progress = False
@@ -16692,6 +17201,10 @@ class AdvisorApp:
             )
             if phase in active_game_phases and previous_phase not in active_game_phases:
                 self._cancel_post_game_sync()
+                # A restored previous board is presentation-only. Remove it
+                # before the new loading/game endpoints begin filling live data.
+                if self._showing_previous_play:
+                    self._clear_current_play_state()
                 # This is intentionally a local cache read and a tiny SQLite
                 # write. It must finish before we publish InProgress so the
                 # post-game Riot value cannot accidentally become the baseline.
@@ -16804,22 +17317,8 @@ class AdvisorApp:
                     previous_phase in active_game_phases
                     and phase not in active_game_phases
                 ):
-                    self.live_game = LiveGameSnapshot()
-                    self.player_profiles = {}
-                    self.duo_pairs = {}
-                    self.lane_matchups = {}
-                    self.jungle_tendencies = {}
-                    self._jungle_tendency_context = None
-                    self._lane_opponent_analysis_context = None
-                    self._lane_opponent_personal_stat = None
-                    self._lane_opponent_behavior = None
-                    self._my_account_analysis_context = None
-                    self._my_personal_stat = None
-                    self._my_behavior = None
-                    self._play_insight_signature = ""
-                    self._duo_checked_signature = ""
-                    self._live_signature = ""
-                    self._live_active_signature = ""
+                    self._capture_previous_play_state()
+                    self._clear_current_play_state()
                 if phase not in {"GameStart", "Reconnect"}:
                     self.draft.connection_state = "LOBBY"
             if phase in {"GameStart", "Reconnect", "InProgress"}:
@@ -17361,13 +17860,22 @@ class AdvisorApp:
         tier = base.tier
         rank = base.rank
         league_points = base.league_points
-        if opgg_profile.tier != "UNRANKED" or tier == "UNRANKED":
+        if (
+            not player.is_active_player
+            and opgg_profile.tier != "UNRANKED"
+        ) or tier == "UNRANKED":
             tier = opgg_profile.tier
             rank = opgg_profile.division
             league_points = opgg_profile.league_points
         season_wins = base.season_wins
         season_losses = base.season_losses
-        if opgg_profile.season_wins + opgg_profile.season_losses:
+        if (
+            opgg_profile.season_wins + opgg_profile.season_losses
+            and (
+                not player.is_active_player
+                or base.season_wins + base.season_losses == 0
+            )
+        ):
             season_wins = opgg_profile.season_wins
             season_losses = opgg_profile.season_losses
 
@@ -17379,7 +17887,11 @@ class AdvisorApp:
             "league_points": league_points,
             "season_wins": season_wins,
             "season_losses": season_losses,
-            "updated_at": opgg_profile.fetched_at or base.updated_at,
+            "updated_at": (
+                base.updated_at
+                if player.is_active_player and base.updated_at
+                else opgg_profile.fetched_at or base.updated_at
+            ),
             # OP.GG may legitimately report an unranked account.  That must
             # not turn a completed local relationship scan back into the
             # PARTIAL/loading state forever.
@@ -17389,7 +17901,10 @@ class AdvisorApp:
                 else "PARTIAL"
             ),
         }
-        if opgg_profile.recent_matches_status in {"OK", "EMPTY"}:
+        if (
+            opgg_profile.recent_matches_status in {"OK", "EMPTY"}
+            and not player.is_active_player
+        ):
             recent_form = opgg_recent_form(opgg_profile, champion_key)
             last_game_champion_key = int(
                 recent_form.pop("last_game_champion_key", 0) or 0
@@ -17806,6 +18321,15 @@ class AdvisorApp:
             if player.is_active_player or champion_data_source == "RIOT_LIVE"
             else {}
         )
+        local_recent = (
+            riot_local_recent_form(
+                self.storage.player_matches(puuid, limit=10),
+                puuid,
+                player.champion_id,
+            )
+            if player.is_active_player else {}
+        )
+        has_local_recent = bool(local_recent.get("recent_games"))
         relationship: dict = {}
         if my_puuid and my_puuid != puuid:
             relationship = self.storage.relationship_summary(my_puuid, puuid, limit=1000)
@@ -17822,6 +18346,20 @@ class AdvisorApp:
             champion_data_source=champion_data_source,
             champion_sample_target=sample_target,
             champion_source_detail=champion_source_detail,
+            recent_games=int(local_recent.get("recent_games", 0) or 0),
+            recent_wins=int(local_recent.get("recent_wins", 0) or 0),
+            recent_kills=int(local_recent.get("recent_kills", 0) or 0),
+            recent_deaths=int(local_recent.get("recent_deaths", 0) or 0),
+            recent_assists=int(local_recent.get("recent_assists", 0) or 0),
+            overall_streak=int(local_recent.get("overall_streak", 0) or 0),
+            champion_recent_games=int(
+                local_recent.get("champion_recent_games", 0) or 0
+            ),
+            champion_recent_wins=int(
+                local_recent.get("champion_recent_wins", 0) or 0
+            ),
+            champion_streak=int(local_recent.get("champion_streak", 0) or 0),
+            recent_form_source=("RIOT_LOCAL" if has_local_recent else ""),
             together_games=int(relationship.get("together_games", 0)),
             together_wins=int(relationship.get("together_wins", 0)),
             against_games=int(relationship.get("against_games", 0)),
@@ -17833,12 +18371,27 @@ class AdvisorApp:
             last_met_my_win=relationship.get("last_met_my_win"),
             last_met_my_champion_id=str(relationship.get("last_met_my_champion_id", "")),
             last_met_other_champion_id=str(relationship.get("last_met_other_champion_id", "")),
-            last_game_champion_id=str(last_game.get("champion_id", "")),
-            last_game_position=str(last_game.get("position", "UNKNOWN")),
-            last_game_kills=int(last_game.get("kills", 0)),
-            last_game_deaths=int(last_game.get("deaths", 0)),
-            last_game_assists=int(last_game.get("assists", 0)),
-            last_game_won=last_game.get("won"),
+            last_game_champion_id=str(
+                local_recent.get("last_game_champion_id")
+                or last_game.get("champion_id", "")
+            ),
+            last_game_position=str(
+                local_recent.get("last_game_position")
+                or last_game.get("position", "UNKNOWN")
+            ),
+            last_game_kills=int(
+                local_recent.get("last_game_kills", last_game.get("kills", 0)) or 0
+            ),
+            last_game_deaths=int(
+                local_recent.get("last_game_deaths", last_game.get("deaths", 0)) or 0
+            ),
+            last_game_assists=int(
+                local_recent.get("last_game_assists", last_game.get("assists", 0)) or 0
+            ),
+            last_game_won=(
+                local_recent.get("last_game_won")
+                if has_local_recent else last_game.get("won")
+            ),
             sample_scope=(
                 f"OP.GG 시즌 {champion_games}경기"
                 if champion_data_source == "OPGG"

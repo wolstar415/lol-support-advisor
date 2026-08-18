@@ -396,6 +396,48 @@ class StorageTests(unittest.TestCase):
             self.assertTrue(loaded.actual_win)
             self.assertTrue(loaded.correct)
 
+    def test_duplicate_prediction_for_resolved_match_is_discarded_safely(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            start = datetime(2026, 8, 18, 12, 0, 0)
+            match = match_payload(
+                "KR_DUPLICATE_PREDICTION", True, "Janna", "Leona",
+                int(start.timestamp() * 1000),
+            )
+            match["info"]["gameDuration"] = 1800
+            shared = dict(
+                active_riot_id="Me#KR1",
+                active_champion_id="Janna",
+                ally_champion_ids=("Janna", "Jinx"),
+                enemy_champion_ids=("Leona",),
+                ally_riot_ids=("Me#KR1", "Ally#KR3"),
+                enemy_riot_ids=("Enemy#KR2",),
+                win_probability=54.0,
+                predicted_win=True,
+                confidence="보통",
+                evidence=("로딩 중 로스터",),
+                evidence_score=0.5,
+            )
+            storage.save_game_prediction(GamePrediction(
+                prediction_key="loading-roster-a",
+                captured_at=(start + timedelta(seconds=30)).isoformat(),
+                **shared,
+            ))
+            storage.save_game_prediction(GamePrediction(
+                prediction_key="loading-roster-b",
+                captured_at=(start + timedelta(seconds=31)).isoformat(),
+                **shared,
+            ))
+
+            self.assertEqual(storage.resolve_game_predictions([match]), 1)
+            self.assertEqual(storage.resolve_game_predictions([match]), 0)
+            with storage._connect() as connection:
+                rows = connection.execute(
+                    "SELECT prediction_key, match_id FROM game_predictions"
+                ).fetchall()
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["match_id"], "KR_DUPLICATE_PREDICTION")
+
     def test_game_prediction_keeps_first_visible_baseline_across_restart(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "advisor.db"
