@@ -33,6 +33,10 @@ from .history import (
     attach_match_lp_changes, refresh_recent_20_summary,
 )
 from .icons import BuildAssetPreloader, ChampionIconCache, ItemIconCache, RemoteIconCache
+from .i18n import (
+    LANGUAGE_LABELS, RUNE_NAMES_EN, RUNE_STYLE_NAMES_EN,
+    SUMMONER_SPELL_NAMES_EN, localized_text, normalize_language, translate_text,
+)
 from .lcu import (
     LcuActionError, LcuActionManualOverride, LcuActionStateChanged,
     LcuClient, LcuUnavailable,
@@ -40,6 +44,10 @@ from .lcu import (
     find_local_champion_action, parse_lcu_session, session_banned_champion_ids,
 )
 from .live_client import LiveClient, LiveClientUnavailable
+from .live_identity import (
+    live_identity_available, live_identity_count, live_roster_fingerprint,
+    merge_live_roster_identities, update_live_identity_payload,
+)
 from .models import (
     BuildAsset, BuildItemGroup, ChampionBuildGuide, DraftBan, DraftMember, DraftSnapshot,
     GamePrediction, LiveGameSnapshot, JungleTendencyStat, LaneMatchupStat,
@@ -118,9 +126,14 @@ LUX_AUTO_BAN_STATUS_INTERVAL_SECONDS = 0.25
 LUX_AUTO_BAN_DISCOVERY_INTERVAL_SECONDS = 0.15
 LUX_AUTO_BAN_IDLE_INTERVAL_SECONDS = 0.60
 LUX_AUTO_BAN_DISPLAY_INTERVAL_MS = 160
+AUTO_ACCEPT_DELAY_MIN_SECONDS = 1.3
+AUTO_ACCEPT_DELAY_MAX_SECONDS = 2.2
 PREDICTION_SETTLE_TIMEOUT_SECONDS = 12.0
 PREDICTION_SAVE_DEBOUNCE_MS = 550
 BUILD_STATISTICS_SCHEMA_VERSION = 1
+LIVE_IDENTITY_CACHE_SETTING = "live_roster_identity_cache_v1"
+LIVE_IDENTITY_CAPTURE_FAST_SECONDS = 3.0
+LIVE_IDENTITY_CAPTURE_MAX_SECONDS = 300.0
 
 
 # Backward-compatible names remain importable for existing integrations and
@@ -129,6 +142,37 @@ choose_lux_auto_ban_target_ms = choose_auto_ban_target_ms
 lux_auto_ban_monitor_due = auto_ban_monitor_due
 lux_auto_ban_deadline_after_timer_sample = auto_ban_deadline_after_timer_sample
 projected_lux_auto_ban_remaining_ms = projected_auto_ban_remaining_ms
+
+
+def choose_auto_accept_delay_seconds(
+    picker: Callable[[float, float], float] = random.uniform,
+) -> float:
+    return float(picker(
+        AUTO_ACCEPT_DELAY_MIN_SECONDS, AUTO_ACCEPT_DELAY_MAX_SECONDS,
+    ))
+
+
+def opgg_account_unavailable_error(exc: Exception) -> bool:
+    """Distinguish a hidden/missing account from a transient MCP outage."""
+    message = str(exc).casefold()
+    return any(token in message for token in (
+        "비공개", "private", "찾지 못", "not found", "존재하지",
+    ))
+
+
+def unavailable_player_profile() -> PlayerProfileStat:
+    """A per-player terminal state that must not block the other nine cards."""
+    return PlayerProfileStat(
+        champion_data_source="PRIVATE_OR_UNAVAILABLE",
+        sample_scope="계정 비공개 또는 조회 불가",
+        status="PRIVATE_OR_UNAVAILABLE",
+    )
+
+
+def riot_authentication_error(exc: Exception) -> bool:
+    return isinstance(exc, RiotApiError) and any(
+        token in str(exc) for token in ("키가 만료", "키가 설정되지")
+    )
 
 
 def recent_prediction_accuracy(
@@ -1676,6 +1720,17 @@ class AdvisorApp:
         self.registry = registry
         self.demo = demo
         self.asset_dir = asset_dir or storage.db_path.parent
+        self.ui_language = normalize_language(
+            storage.get_setting("ui_language", "ko")
+        )
+        self._champion_name_translations = {
+            name_ko: champion_id
+            for champion_id, (_champion_key, name_ko) in registry.by_id.items()
+        }
+        self._language_mapped_widgets: set[tk.Misc] = set()
+        self._language_tracked_widgets: set[tk.Misc] = set()
+        self._language_map_after_id: str | None = None
+        self._language_refresh_after_id: str | None = None
         if demo:
             # These values live in the temporary demo database created by
             # main.py.  They are deliberately generic and can never leak the
@@ -1700,6 +1755,19 @@ class AdvisorApp:
         self._reload_data_preferences()
         self.lcu = LcuClient(storage.get_setting("lcu_lockfile_path"))
         self.live_client = LiveClient(registry)
+        try:
+            stored_live_identities = json.loads(
+                storage.get_setting(LIVE_IDENTITY_CACHE_SETTING, "") or "null"
+            )
+        except (TypeError, ValueError, json.JSONDecodeError):
+            stored_live_identities = None
+        self._live_identity_lock = threading.RLock()
+        self._live_identity_payload: dict[str, object] | None = (
+            stored_live_identities if isinstance(stored_live_identities, dict) else None
+        )
+        self._live_identity_generation = 0
+        self._live_identity_capture_lock = threading.Lock()
+        self._live_identity_capture_running = False
         self.opgg_client = OpggClient(registry)
         self.build_applicator = BuildApplicator(self.lcu, registry)
         self.icon_cache = ChampionIconCache(root, registry, self.asset_dir / "icons")
@@ -1775,6 +1843,12 @@ class AdvisorApp:
             self.codex_cli = None
             self._codex_cli_error = str(exc)
         self.auto_accept_enabled = storage.get_setting("auto_accept_enabled", "0") == "1"
+        self._auto_accept_lock = threading.RLock()
+        self._auto_accept_generation = 0
+        self._auto_accept_monitoring = False
+        self._auto_accept_cycle_seen = False
+        self._auto_accept_cancel = threading.Event()
+        self._auto_accept_deadline = 0.0
         # ``lux_auto_ban_enabled`` was the original public setting.  Read it
         # only as a migration fallback so existing users keep their choice,
         # while new versions expose a champion-agnostic auto-ban feature.
@@ -1795,6 +1869,9 @@ class AdvisorApp:
         )
         self.codex_recommendations_enabled = (
             storage.get_setting("codex_recommendations_enabled", "0") == "1"
+        )
+        self.stop_queue_after_dodge_enabled = (
+            storage.get_setting("stop_queue_after_dodge_enabled", "0") == "1"
         )
         self._auto_accept_status = "게임 수락 대기"
         self._lux_auto_ban_status = "내 밴 차례 대기"
@@ -1864,6 +1941,7 @@ class AdvisorApp:
         self._duo_checked_signature = ""
         self._lane_matchup_refreshing: set[str] = set()
         self._manual_enemy_support: str | None = None
+        self._support_catalog_ids: set[str] | None = None
         self._live_signature = ""
         self._live_active_signature = ""
         # The live endpoint is polled every few seconds, but the ten player cards
@@ -2036,7 +2114,7 @@ class AdvisorApp:
             self.root.after(250, self._poll_lcu)
 
     def _configure_root(self) -> None:
-        self.root.title("LOL Support Advisor")
+        self.root.title(self._tr("LOL Support Advisor"))
         self.root.configure(bg=COLORS["bg"])
         self.root.geometry("1460x920")
         self.root.minsize(1120, 760)
@@ -2048,6 +2126,7 @@ class AdvisorApp:
         self.root.option_add("*TCombobox*Listbox.foreground", COLORS["text"])
         self.root.option_add("*TCombobox*Listbox.selectBackground", COLORS["surface_selected"])
         self.root.option_add("*TCombobox*Listbox.selectForeground", COLORS["text"])
+        self.root.bind_all("<Map>", self._on_widget_mapped, add="+")
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
 
     def _on_close(self) -> None:
@@ -3080,7 +3159,7 @@ class AdvisorApp:
         marker.pack(side="left", padx=(0, 9))
         marker.pack_propagate(False)
         title_label = tk.Label(
-            heading, text=title, bg=COLORS["panel"], fg=COLORS["text"],
+            heading, text=self._tr(title), bg=COLORS["panel"], fg=COLORS["text"],
             font=("Malgun Gothic", 11, "bold"),
         )
         title_label.pack(side="left")
@@ -3184,7 +3263,7 @@ class AdvisorApp:
         text = tk.Frame(card, bg=COLORS["surface"])
         text.pack(side="left", fill="x", expand=True)
         tk.Label(
-            text, text=title, bg=COLORS["surface"], fg=COLORS["muted"],
+            text, text=self._tr(title), bg=COLORS["surface"], fg=COLORS["muted"],
             font=("Malgun Gothic", 8, "bold"),
         ).pack(anchor="w")
         value = tk.Label(
@@ -3206,7 +3285,7 @@ class AdvisorApp:
         base_bg = BUTTON_FILLS.get(color, COLORS["chip"]) if filled else COLORS["chip"]
         foreground = COLORS["text"] if filled else color
         button = tk.Button(
-            parent, text=text, command=command, bg=base_bg, fg=foreground,
+            parent, text=self._tr(text), command=command, bg=base_bg, fg=foreground,
             activebackground=COLORS["surface_hover"], activeforeground=COLORS["text"], relief="flat",
             bd=0, padx=14, pady=8, width=width, cursor="hand2",
             highlightthickness=1, highlightbackground=color if filled else COLORS["border"],
@@ -3276,10 +3355,107 @@ class AdvisorApp:
         self.storage.set_setting(
             "auto_accept_enabled", "1" if self.auto_accept_enabled else "0"
         )
-        self._auto_accept_status = (
-            "게임 수락 대기" if self.auto_accept_enabled else "사용 안 함"
-        )
+        with self._auto_accept_lock:
+            self._auto_accept_generation += 1
+            self._auto_accept_cancel.set()
+            self._auto_accept_cancel = threading.Event()
+            self._auto_accept_monitoring = False
+            self._auto_accept_cycle_seen = False
+            self._auto_accept_deadline = 0.0
+            self._auto_accept_status = (
+                "게임 수락 대기" if self.auto_accept_enabled else "사용 안 함"
+            )
+        self._lux_auto_ban_watcher_wake.set()
         self._render_automation_toggles()
+
+    def _auto_accept_monitor_is_current(self, generation: int) -> bool:
+        with self._auto_accept_lock:
+            return bool(
+                self.auto_accept_enabled
+                and self._auto_accept_monitoring
+                and self._auto_accept_generation == generation
+                and not self._auto_accept_cancel.is_set()
+            )
+
+    def _post_auto_accept_status(self, generation: int, status: str) -> None:
+        with self._auto_accept_lock:
+            if generation != self._auto_accept_generation:
+                return
+            self._auto_accept_status = status
+
+        def apply() -> None:
+            with self._auto_accept_lock:
+                if generation != self._auto_accept_generation:
+                    return
+            self._render_automation_toggles()
+
+        self._post_ui(apply)
+
+    def _reset_auto_accept_cycle(self) -> None:
+        with self._auto_accept_lock:
+            if self._auto_accept_monitoring:
+                self._auto_accept_generation += 1
+                self._auto_accept_cancel.set()
+                self._auto_accept_monitoring = False
+            self._auto_accept_cycle_seen = False
+            self._auto_accept_deadline = 0.0
+            if self.auto_accept_enabled:
+                self._auto_accept_status = "게임 수락 대기"
+
+    def _ensure_auto_accept_monitor(self) -> bool:
+        if not self.auto_accept_enabled or self.demo:
+            return False
+        delay = choose_auto_accept_delay_seconds()
+        now = time.monotonic()
+        with self._auto_accept_lock:
+            if self._auto_accept_cycle_seen or self._auto_accept_monitoring:
+                return False
+            self._auto_accept_generation += 1
+            generation = self._auto_accept_generation
+            cancel = threading.Event()
+            self._auto_accept_cancel = cancel
+            self._auto_accept_monitoring = True
+            self._auto_accept_cycle_seen = True
+            self._auto_accept_deadline = now + delay
+            self._auto_accept_status = f"약 {delay:.1f}초 후 수락 예정"
+        self._post_auto_accept_status(
+            generation, f"약 {delay:.1f}초 후 수락 예정",
+        )
+        threading.Thread(
+            target=self._run_auto_accept_monitor,
+            args=(generation, cancel, delay),
+            name="auto-accept-delay",
+            daemon=True,
+        ).start()
+        return True
+
+    def _run_auto_accept_monitor(
+        self, generation: int, cancel: threading.Event, delay: float,
+    ) -> None:
+        if cancel.wait(max(0.0, delay)):
+            return
+        if not self._auto_accept_monitor_is_current(generation):
+            return
+        try:
+            accepted = self.lcu.accept_ready_check_if_pending(
+                pre_commit_check=lambda: self._auto_accept_monitor_is_current(
+                    generation
+                ),
+            )
+        except LcuActionStateChanged:
+            accepted = False
+            status = "수락 상태 변경 · 다음 게임 대기"
+        except LcuUnavailable as exc:
+            accepted = False
+            status = f"자동 수락 실패 · {exc}"
+        else:
+            status = "게임 수락 완료" if accepted else "수락 상태 변경 · 다음 게임 대기"
+        with self._auto_accept_lock:
+            if generation != self._auto_accept_generation:
+                return
+            self._auto_accept_monitoring = False
+            self._auto_accept_deadline = 0.0
+        self._post_auto_accept_status(generation, status)
 
     def _auto_ban_champion(
         self, champion_key: int | None = None,
@@ -3403,13 +3579,37 @@ class AdvisorApp:
             self._post_lux_auto_ban_status(generation, status)
 
         while True:
-            if not self.lux_auto_ban_enabled:
+            auto_accept_on = bool(
+                getattr(self, "auto_accept_enabled", False)
+                and not getattr(self, "demo", False)
+            )
+            auto_ban_on = bool(
+                getattr(self, "lux_auto_ban_enabled", False)
+                and not getattr(self, "demo", False)
+            )
+            if not auto_accept_on and not auto_ban_on:
                 last_waiting_key = ""
                 wake.wait()
                 wake.clear()
                 continue
             interval = LUX_AUTO_BAN_IDLE_INTERVAL_SECONDS
             try:
+                if auto_accept_on:
+                    gameflow_phase = str(
+                        self.lcu.get("/lol-gameflow/v1/gameflow-phase")
+                    )
+                    if gameflow_phase == "ReadyCheck":
+                        self._ensure_auto_accept_monitor()
+                        interval = min(
+                            interval, LUX_AUTO_BAN_DISCOVERY_INTERVAL_SECONDS,
+                        )
+                    else:
+                        self._reset_auto_accept_cycle()
+                if not auto_ban_on:
+                    missing_session_count = 0
+                    wake.wait(interval)
+                    wake.clear()
+                    continue
                 champion_key, _champion_id, champion_name = (
                     self._auto_ban_champion()
                 )
@@ -3442,7 +3642,7 @@ class AdvisorApp:
                         )
             except LcuUnavailable:
                 missing_session_count += 1
-                if missing_session_count >= 3:
+                if auto_ban_on and missing_session_count >= 3:
                     with self._lux_auto_ban_lock:
                         if not self._lux_auto_ban_monitoring:
                             self._lux_auto_ban_completed_action_id = None
@@ -3456,7 +3656,7 @@ class AdvisorApp:
                     error=f"{type(exc).__name__}: {exc}",
                 )
                 missing_session_count += 1
-                if missing_session_count >= 3:
+                if auto_ban_on and missing_session_count >= 3:
                     with self._lux_auto_ban_lock:
                         if not self._lux_auto_ban_monitoring:
                             self._lux_auto_ban_completed_action_id = None
@@ -4066,13 +4266,19 @@ class AdvisorApp:
     def _render_automation_toggles(self) -> None:
         auto_on = bool(self.auto_accept_enabled and not self.demo)
         lux_on = bool(self.lux_auto_ban_enabled and not self.demo)
-        _champion_key, _champion_id, champion_name = self._auto_ban_champion()
+        _champion_key, champion_id, champion_name_ko = self._auto_ban_champion()
+        champion_name = self._champion_text(champion_id, champion_name_ko)
         self.auto_accept_button.configure(
-            text=f"자동 수락 {'ON' if auto_on else 'OFF'}",
+            text=self._text(
+                "automation.accept.button", state="ON" if auto_on else "OFF",
+            ),
             state="disabled" if self.demo else "normal",
         )
         self.lux_auto_ban_button.configure(
-            text=f"{champion_name} 자동 밴 {'ON' if lux_on else 'OFF'}",
+            text=self._text(
+                "automation.ban.button", champion=champion_name,
+                state="ON" if lux_on else "OFF",
+            ),
             state="disabled" if self.demo else "normal",
         )
         self._set_button_selected(self.auto_accept_button, auto_on, COLORS["green"])
@@ -4081,7 +4287,8 @@ class AdvisorApp:
 
     def _lux_auto_ban_display_text(self) -> str:
         now = time.monotonic()
-        _champion_key, _champion_id, champion_name = self._auto_ban_champion()
+        _champion_key, champion_id, champion_name_ko = self._auto_ban_champion()
+        champion_name = self._champion_text(champion_id, champion_name_ko)
         with self._lux_auto_ban_lock:
             status = self._lux_auto_ban_status
             monitoring = self._lux_auto_ban_monitoring
@@ -4091,37 +4298,62 @@ class AdvisorApp:
             target_ms = self._lux_auto_ban_target_remaining_ms
             fallback_deadline = self._lux_auto_ban_fallback_deadline
         if not monitoring:
-            return status
+            return self._tr(status)
         projected = projected_auto_ban_remaining_ms(
             remaining_ms, sampled_at, now,
         )
         if projected is None:
             until_check = max(0.0, fallback_deadline - now)
-            return (
-                f"{champion_name} {'선택됨' if staged else '선택 준비'} · "
-                f"LCU 타이머 없음 · 안전 검사까지 약 {until_check:.1f}초"
+            return self._text(
+                "automation.ban.fallback", champion=champion_name,
+                stage=self._text(
+                    "automation.ban.staged" if staged else "automation.ban.ready"
+                ),
+                seconds=until_check,
             )
         remaining_seconds = projected / 1000.0
         until_commit = max(0, projected - max(0, target_ms)) / 1000.0
         if until_commit <= 0:
-            return (
-                f"{champion_name} {'선택됨' if staged else '선택 준비'} · "
-                f"남은 약 {remaining_seconds:.1f}초 · 밴 확정 검사 중"
+            return self._text(
+                "automation.ban.committing", champion=champion_name,
+                stage=self._text(
+                    "automation.ban.staged" if staged else "automation.ban.ready"
+                ),
+                remaining=remaining_seconds,
             )
-        return (
-            f"{champion_name} {'선택됨' if staged else '선택 준비'} · "
-            f"남은 약 {remaining_seconds:.1f}초 · 확정까지 약 {until_commit:.1f}초"
+        return self._text(
+            "automation.ban.countdown", champion=champion_name,
+            stage=self._text(
+                "automation.ban.staged" if staged else "automation.ban.ready"
+            ),
+            remaining=remaining_seconds, commit=until_commit,
         )
+
+    def _auto_accept_display_text(self) -> str:
+        with self._auto_accept_lock:
+            status = self._auto_accept_status
+            monitoring = self._auto_accept_monitoring
+            deadline = self._auto_accept_deadline
+        if not monitoring:
+            return self._tr(status)
+        remaining = max(0.0, deadline - time.monotonic())
+        return self._text("automation.accept.countdown", seconds=remaining)
 
     def _render_automation_status_label(self) -> None:
         auto_on = bool(self.auto_accept_enabled and not self.demo)
         lux_on = bool(self.lux_auto_ban_enabled and not self.demo)
         enabled_status = []
         if auto_on:
-            enabled_status.append(f"수락: {self._auto_accept_status}")
+            enabled_status.append(self._text(
+                "automation.accept.status", status=self._auto_accept_display_text(),
+            ))
         if lux_on:
-            enabled_status.append(f"자동 밴: {self._lux_auto_ban_display_text()}")
-        text = " · ".join(enabled_status) if enabled_status else "자동화 모두 OFF"
+            enabled_status.append(self._text(
+                "automation.ban.status", status=self._lux_auto_ban_display_text(),
+            ))
+        text = " · ".join(enabled_status) if enabled_status else self._text(
+            "automation.all_off"
+        )
         color = COLORS["green"] if enabled_status else COLORS["muted"]
         signature = (text, color)
         if signature == getattr(self, "_lux_auto_ban_display_signature", None):
@@ -4132,7 +4364,10 @@ class AdvisorApp:
     def _tick_lux_auto_ban_display(self) -> None:
         """Animate only the small status label; never poll LCU from Tk."""
         try:
-            if self.lux_auto_ban_enabled and not self.demo:
+            if (
+                (self.auto_accept_enabled or self.lux_auto_ban_enabled)
+                and not self.demo
+            ):
                 self._render_automation_status_label()
             self.root.after(
                 LUX_AUTO_BAN_DISPLAY_INTERVAL_MS,
@@ -5932,7 +6167,7 @@ class AdvisorApp:
         top = tk.Frame(panel, bg=COLORS["panel"])
         top.pack(fill="x", pady=(0, 10))
         self.live_game_label = tk.Label(
-            top, text="게임 시작을 기다리는 중", bg=COLORS["panel"], fg=COLORS["muted"],
+            top, text=self._tr("게임 시작을 기다리는 중"), bg=COLORS["panel"], fg=COLORS["muted"],
             font=("Malgun Gothic", 10, "bold"),
         )
         self.live_game_label.pack(side="left")
@@ -5942,7 +6177,7 @@ class AdvisorApp:
         self.live_profile_status.pack(side="right")
         self.live_duo_status = tk.Label(
             panel,
-            text="DUO: 현재 10명의 최근 100경기 교집합 확인 · 카드 수치는 로컬/Riot 결합",
+            text=self._tr("DUO: 현재 10명의 최근 100경기 교집합 확인 · 카드 수치는 로컬/Riot 결합"),
             bg=COLORS["panel"], fg=COLORS["orange"], font=("Malgun Gothic", 8),
         )
         self.live_duo_status.pack(anchor="w", pady=(0, 8))
@@ -5968,12 +6203,12 @@ class AdvisorApp:
         ally_heading = tk.Frame(board, bg=COLORS["panel"])
         ally_heading.pack(fill="x", pady=(0, 6))
         tk.Label(
-            ally_heading, text="아군  ·  TOP   JGL   MID   ADC   SUP",
+            ally_heading, text=self._tr("아군  ·  TOP   JGL   MID   ADC   SUP"),
             bg=COLORS["panel"], fg=COLORS["green"],
             font=("Malgun Gothic", 11, "bold"),
         ).pack(side="left")
         tk.Label(
-            ally_heading, text="카드를 가로로 비교하세요",
+            ally_heading, text=self._tr("카드를 가로로 비교하세요"),
             bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 8),
         ).pack(side="right")
         self.live_allies_frame = tk.Frame(board, bg=COLORS["panel"])
@@ -5983,12 +6218,12 @@ class AdvisorApp:
         enemy_heading = tk.Frame(board, bg=COLORS["panel"])
         enemy_heading.pack(fill="x", pady=(0, 6))
         tk.Label(
-            enemy_heading, text="적군  ·  TOP   JGL   MID   ADC   SUP",
+            enemy_heading, text=self._tr("적군  ·  TOP   JGL   MID   ADC   SUP"),
             bg=COLORS["panel"], fg=COLORS["red"],
             font=("Malgun Gothic", 11, "bold"),
         ).pack(side="left")
         tk.Label(
-            enemy_heading, text="빨강은 패배·낮은 승률, 주황은 낮은 표본",
+            enemy_heading, text=self._tr("빨강은 패배·낮은 승률, 주황은 낮은 표본"),
             bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 8),
         ).pack(side="right")
         self.live_enemies_frame = tk.Frame(board, bg=COLORS["panel"])
@@ -6004,12 +6239,12 @@ class AdvisorApp:
         insight_header.pack(fill="x", pady=(0, 9))
         tk.Label(
             insight_header,
-            text="게임 승률과 라인전 지표를 분리하고, 저장된 솔로랭크 행동 표본을 비교합니다.",
+            text=self._tr("게임 승률과 라인전 지표를 분리하고, 저장된 솔로랭크 행동 표본을 비교합니다."),
             bg=COLORS["panel"], fg=COLORS["text"],
             font=("Malgun Gothic", 9, "bold"), anchor="w",
         ).pack(side="left")
         self.play_insight_status = tk.Label(
-            insight_header, text="게임 시작 후 자동 분석", bg=COLORS["panel"],
+            insight_header, text=self._tr("게임 시작 후 자동 분석"), bg=COLORS["panel"],
             fg=COLORS["muted"], font=("Malgun Gothic", 8),
         )
         self.play_insight_status.pack(side="right")
@@ -6043,7 +6278,7 @@ class AdvisorApp:
         card = tk.Frame(outer, bg=COLORS["surface"], padx=9, pady=5)
         card.pack(fill="both", expand=True)
         tk.Label(
-            card, text=title, bg=COLORS["surface"], fg=COLORS["muted"],
+            card, text=self._tr(title), bg=COLORS["surface"], fg=COLORS["muted"],
             font=("Malgun Gothic", 7, "bold"),
         ).pack(anchor="w")
         row = tk.Frame(card, bg=COLORS["surface"])
@@ -6105,7 +6340,7 @@ class AdvisorApp:
         history_recent_strip.pack(fill="x", pady=(0, 12))
         self.history_lp_strip_label = tk.Label(
             history_recent_strip,
-            text="LP 변동은 새 솔로랭크부터 정확히 기록합니다.",
+            text=self._tr("LP 변동은 새 솔로랭크부터 정확히 기록합니다."),
             bg=COLORS["chip"], fg=COLORS["muted"], padx=4,
             anchor="w", font=("Malgun Gothic", 7, "bold"),
         )
@@ -6124,11 +6359,11 @@ class AdvisorApp:
         left.pack(side="left", fill="y", padx=(0, 10))
         left.pack_propagate(False)
         tk.Label(
-            left, text="챔피언 성능", bg=COLORS["panel_2"], fg=COLORS["text"],
+            left, text=self._tr("챔피언 성능"), bg=COLORS["panel_2"], fg=COLORS["text"],
             font=("Malgun Gothic", 10, "bold"),
         ).pack(anchor="w")
         tk.Label(
-            left, text="저장된 솔로랭크 전체 표본", bg=COLORS["panel_2"], fg=COLORS["muted"],
+            left, text=self._tr("저장된 솔로랭크 전체 표본"), bg=COLORS["panel_2"], fg=COLORS["muted"],
             font=("Malgun Gothic", 7),
         ).pack(anchor="w", pady=(1, 6))
         position_filters = tk.Frame(left, bg=COLORS["panel_2"])
@@ -6163,7 +6398,7 @@ class AdvisorApp:
         match_header = tk.Frame(right, bg=COLORS["panel_2"])
         match_header.pack(fill="x", pady=(0, 8))
         tk.Label(
-            match_header, text="최근 경기", bg=COLORS["panel_2"], fg=COLORS["text"],
+            match_header, text=self._tr("최근 경기"), bg=COLORS["panel_2"], fg=COLORS["text"],
             font=("Malgun Gothic", 10, "bold"),
         ).pack(side="left")
         filters = tk.Frame(match_header, bg=COLORS["panel_2"])
@@ -6183,7 +6418,7 @@ class AdvisorApp:
             button.pack(side="left", padx=(0, 4))
             self.history_filter_buttons[key] = button
         tk.Label(
-            match_header, text="경기 상세에서 양 팀 10명·전투·시야·아이템 비교",
+            match_header, text=self._tr("경기 상세에서 양 팀 10명·전투·시야·아이템 비교"),
             bg=COLORS["panel_2"], fg=COLORS["muted"], font=("Malgun Gothic", 7),
         ).pack(side="right")
         self.history_matches_frame = tk.Frame(right, bg=COLORS["panel_2"])
@@ -6200,7 +6435,7 @@ class AdvisorApp:
         row = tk.Frame(selector, bg=COLORS["panel"])
         row.pack(fill="x")
         tk.Label(
-            row, text="챔피언", bg=COLORS["panel"], fg=COLORS["muted"],
+            row, text=self._tr("챔피언"), bg=COLORS["panel"], fg=COLORS["muted"],
             font=("Malgun Gothic", 9, "bold"),
         ).pack(side="left", padx=(0, 9))
         self.build_champion_var = tk.StringVar()
@@ -6231,7 +6466,7 @@ class AdvisorApp:
             self.build_bulk_button.configure(state="disabled")
         self.build_status_label = tk.Label(
             selector,
-            text="챔피언을 고르면 캐시를 먼저 읽고, 없으면 OP.GG에서 한 번 받아옵니다.",
+            text=self._tr("챔피언을 고르면 캐시를 먼저 읽고, 없으면 OP.GG에서 한 번 받아옵니다."),
             bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 8),
             anchor="w", justify="left",
         )
@@ -6242,7 +6477,7 @@ class AdvisorApp:
         )
         self.build_bulk_status_label = tk.Label(
             selector,
-            text="전체 저장은 5개 포지션의 실제 통계 챔피언만 순차 저장합니다.",
+            text=self._tr("전체 저장은 5개 포지션의 실제 통계 챔피언만 순차 저장합니다."),
             bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 8),
             anchor="w", justify="left",
         )
@@ -6255,7 +6490,7 @@ class AdvisorApp:
         action_header.pack(fill="x", pady=(0, 8))
         tk.Label(
             action_header,
-            text="원하는 항목만 적용하거나 전체를 한 번에 적용할 수 있습니다.",
+            text=self._tr("원하는 항목만 적용하거나 전체를 한 번에 적용할 수 있습니다."),
             bg=COLORS["panel"], fg=COLORS["muted"],
             font=("Malgun Gothic", 8),
         ).pack(side="left")
@@ -6301,7 +6536,7 @@ class AdvisorApp:
             self.build_content, "룬 · 스펠 · 스킬 · 아이템", COLORS["purple"]
         )
         self.build_guide_summary = tk.Label(
-            guide_panel, text="빌드 데이터 없음", bg=COLORS["panel"],
+            guide_panel, text=self._tr("빌드 데이터 없음"), bg=COLORS["panel"],
             fg=COLORS["muted"], anchor="w", justify="left",
             font=("Malgun Gothic", 9),
         )
@@ -6348,7 +6583,7 @@ class AdvisorApp:
             if champion_id else None
         )
         widget = cls(
-            parent, text=text, bg="#24466e" if selected else COLORS["chip"], fg=color,
+            parent, text=self._tr(text), bg="#24466e" if selected else COLORS["chip"], fg=color,
             relief="flat", bd=0, padx=10, pady=6, font=("Malgun Gothic", 9),
             image=icon or "", compound="left",
             **({"command": command, "cursor": "hand2", "activebackground": "#315c8e",
@@ -6362,11 +6597,383 @@ class AdvisorApp:
         for child in frame.winfo_children():
             child.destroy()
 
+    def _tr(self, text: object) -> str:
+        return translate_text(
+            text,
+            getattr(self, "ui_language", "ko"),
+            getattr(self, "_champion_name_translations", {}),
+        )
+
+    def _text(self, key: str, **values: object) -> str:
+        return localized_text(
+            key, getattr(self, "ui_language", "ko"), **values,
+        )
+
+    def _position_text(self, position: str | None) -> str:
+        normalized = str(position or "UNKNOWN").upper()
+        key = {
+            "TOP": "role.top", "JUNGLE": "role.jungle",
+            "MIDDLE": "role.middle", "MID": "role.middle",
+            "BOTTOM": "role.bottom", "ADC": "role.bottom",
+            "SUPPORT": "role.support", "UTILITY": "role.support",
+        }.get(normalized, "role.unknown")
+        return self._text(key)
+
+    def _champion_text(
+        self, champion_id: str | None, korean_name: str | None = None,
+    ) -> str:
+        if not champion_id:
+            return self._text("common.unknown")
+        if getattr(self, "ui_language", "ko") == "en":
+            return self.registry.normalize_id(champion_id)
+        return korean_name or self.registry.ko_name(champion_id)
+
+    def _rune_name_text(self, perk_id: int, fallback: str = "") -> str:
+        if getattr(self, "ui_language", "ko") == "en":
+            return RUNE_NAMES_EN.get(int(perk_id or 0), f"Rune {int(perk_id or 0)}")
+        option = self.rune_catalog.perk(perk_id)
+        return option.name if option else (fallback or f"룬 #{perk_id}")
+
+    def _rune_style_text(self, style_id: int, fallback: str = "") -> str:
+        if getattr(self, "ui_language", "ko") == "en":
+            return RUNE_STYLE_NAMES_EN.get(
+                int(style_id or 0), f"Rune path {int(style_id or 0)}",
+            )
+        style = self.rune_catalog.style(style_id)
+        return style.name if style else (fallback or f"계열 #{style_id}")
+
+    def _asset_name_text(self, asset: BuildAsset, kind: str) -> str:
+        if getattr(self, "ui_language", "ko") != "en":
+            return asset.name
+        if kind == "item":
+            return self.item_icon_cache.localized_item_name(
+                asset.asset_id, self.ui_language, asset.name,
+            )
+        if kind == "rune":
+            return self._rune_name_text(asset.asset_id, asset.name)
+        if kind == "spell":
+            return SUMMONER_SPELL_NAMES_EN.get(
+                int(asset.asset_id or 0), f"Summoner spell {asset.asset_id}",
+            )
+        return asset.name
+
+    def _asset_tooltip_text(self, asset: BuildAsset, kind: str) -> str:
+        if kind == "item":
+            return self.item_icon_cache.localized_tooltip_text(
+                asset.asset_id, getattr(self, "ui_language", "ko"),
+            )
+        name = self._asset_name_text(asset, kind)
+        if getattr(self, "ui_language", "ko") == "en":
+            label = "Rune" if kind == "rune" else "Summoner spell"
+            return f"{name}\n{label} ID {asset.asset_id}"
+        if kind == "rune":
+            return self.rune_catalog.tooltip_text(asset.asset_id, asset.name)
+        return f"{name}\n소환사 주문"
+
+    def _build_stat_text(
+        self, games: int | None, win_rate: float | None,
+    ) -> str:
+        if games and win_rate is not None:
+            return self._text("build.stats", games=games, win_rate=win_rate)
+        if games:
+            return self._text("build.stats_games", games=games)
+        if win_rate is not None:
+            return self._text("build.stats_rate", win_rate=win_rate)
+        return self._text("build.stats_none")
+
+    def _streak_text(self, value: int, prefix: str = "") -> str:
+        if abs(value) < 2:
+            return ""
+        count = f"{abs(value)}+" if abs(value) >= 10 else str(abs(value))
+        return self._text(
+            "play.streak.win" if value > 0 else "play.streak.loss",
+            prefix=prefix, count=count,
+        )
+
+    def _games_text(self, games: int | None) -> str:
+        if not games:
+            return self._tr("표본 미제공")
+        return (
+            f"{games:,} games" if getattr(self, "ui_language", "ko") == "en"
+            else f"{games:,}게임"
+        )
+
+    def _matchup_label_text(self, win_rate: float | None) -> str:
+        return self._tr(lane_matchup_label(win_rate))
+
+    def _on_widget_mapped(self, event: tk.Event) -> None:
+        if self.ui_language != "en":
+            return
+        widget = getattr(event, "widget", None)
+        if not isinstance(widget, tk.Misc):
+            return
+        self._language_mapped_widgets.add(widget)
+        if self._language_map_after_id is None:
+            try:
+                self._language_map_after_id = self.root.after(
+                    24, self._flush_mapped_widget_translations,
+                )
+            except tk.TclError:
+                self._language_map_after_id = None
+
+    def _flush_mapped_widget_translations(self) -> None:
+        self._language_map_after_id = None
+        widgets = tuple(self._language_mapped_widgets)
+        self._language_mapped_widgets.clear()
+        for widget in widgets:
+            self._translate_widget(widget)
+
+    def _translate_widget(self, widget: tk.Misc) -> None:
+        try:
+            if not widget.winfo_exists():
+                return
+        except tk.TclError:
+            return
+        try:
+            current = str(widget.cget("text"))
+        except (AttributeError, KeyError, tk.TclError):
+            current = ""
+        if current:
+            source = str(getattr(widget, "_advisor_i18n_source", current))
+            previous = str(getattr(widget, "_advisor_i18n_rendered", ""))
+            # Existing labels are frequently updated in place by live data.
+            # Treat anything other than our last rendering as fresh Korean
+            # source copy, then preserve it for a future switch back to Korean.
+            if not previous or current != previous:
+                source = current
+            rendered = self._tr(source)
+            if rendered != current:
+                try:
+                    widget.configure(text=rendered)
+                except (AttributeError, tk.TclError):
+                    pass
+            setattr(widget, "_advisor_i18n_source", source)
+            setattr(widget, "_advisor_i18n_rendered", rendered)
+            if self.ui_language == "en":
+                self._language_tracked_widgets.add(widget)
+        if isinstance(widget, ttk.Treeview):
+            if self.ui_language == "en":
+                self._language_tracked_widgets.add(widget)
+            sources = dict(getattr(widget, "_advisor_i18n_headings", {}))
+            try:
+                columns = ("#0", *tuple(widget.cget("columns")))
+            except tk.TclError:
+                columns = ()
+            for column in columns:
+                try:
+                    current_heading = str(widget.heading(column, "text"))
+                except tk.TclError:
+                    continue
+                source_heading = sources.get(column, current_heading)
+                previous_heading = self._tr(source_heading)
+                if current_heading not in {source_heading, previous_heading}:
+                    source_heading = current_heading
+                sources[column] = source_heading
+                translated_heading = self._tr(source_heading)
+                if translated_heading != current_heading:
+                    try:
+                        widget.heading(column, text=translated_heading)
+                    except tk.TclError:
+                        pass
+            setattr(widget, "_advisor_i18n_headings", sources)
+            item_sources = dict(
+                getattr(widget, "_advisor_i18n_items", {})
+            )
+            live_items: set[str] = set()
+
+            def translate_items(parent: str = "") -> None:
+                try:
+                    item_ids = tuple(widget.get_children(parent))
+                except tk.TclError:
+                    return
+                for item_id in item_ids:
+                    item_key = str(item_id)
+                    live_items.add(item_key)
+                    try:
+                        current_text = str(widget.item(item_id, "text") or "")
+                        current_values = tuple(widget.item(item_id, "values") or ())
+                    except tk.TclError:
+                        continue
+                    saved = item_sources.get(item_key)
+                    if saved:
+                        source_text, source_values, rendered_text, rendered_values = saved
+                    else:
+                        source_text = current_text
+                        source_values = current_values
+                        rendered_text = current_text
+                        rendered_values = current_values
+                    # Live rows can be updated in place.  Only treat the row as
+                    # fresh source copy when it differs from our last rendering;
+                    # this also makes an English -> Korean switch reversible.
+                    if current_text != rendered_text:
+                        source_text = current_text
+                    if current_values != tuple(rendered_values):
+                        source_values = current_values
+                    translated_text = self._tr(source_text)
+                    translated_values = tuple(
+                        self._tr(value) if isinstance(value, str) else value
+                        for value in source_values
+                    )
+                    if (
+                        translated_text != current_text
+                        or translated_values != current_values
+                    ):
+                        try:
+                            widget.item(
+                                item_id, text=translated_text,
+                                values=translated_values,
+                            )
+                        except tk.TclError:
+                            pass
+                    item_sources[item_key] = (
+                        source_text, source_values,
+                        translated_text, translated_values,
+                    )
+                    translate_items(item_id)
+
+            translate_items()
+            setattr(
+                widget, "_advisor_i18n_items",
+                {
+                    key: value for key, value in item_sources.items()
+                    if key in live_items
+                },
+            )
+        if isinstance(widget, ttk.Notebook):
+            if self.ui_language == "en":
+                self._language_tracked_widgets.add(widget)
+            tab_sources = dict(
+                getattr(widget, "_advisor_i18n_tabs", {})
+            )
+            try:
+                tab_ids = tuple(widget.tabs())
+            except tk.TclError:
+                tab_ids = ()
+            live_tabs: set[str] = set()
+            for tab_id in tab_ids:
+                tab_key = str(tab_id)
+                live_tabs.add(tab_key)
+                try:
+                    current_tab_text = str(widget.tab(tab_id, "text") or "")
+                except tk.TclError:
+                    continue
+                source_tab, rendered_tab = tab_sources.get(
+                    tab_key, (current_tab_text, current_tab_text),
+                )
+                if current_tab_text != rendered_tab:
+                    source_tab = current_tab_text
+                translated_tab = self._tr(source_tab)
+                if translated_tab != current_tab_text:
+                    try:
+                        widget.tab(tab_id, text=translated_tab)
+                    except tk.TclError:
+                        pass
+                tab_sources[tab_key] = (source_tab, translated_tab)
+            setattr(
+                widget, "_advisor_i18n_tabs",
+                {
+                    key: value for key, value in tab_sources.items()
+                    if key in live_tabs
+                },
+            )
+
+    def _translate_widget_tree(self, widget: tk.Misc) -> None:
+        self._translate_widget(widget)
+        try:
+            children = widget.winfo_children()
+        except tk.TclError:
+            return
+        for child in children:
+            self._translate_widget_tree(child)
+
+    def _update_fixed_language_texts(self) -> None:
+        notebook = getattr(self, "notebook", None)
+        if notebook is not None:
+            fixed_tabs = (
+                (getattr(self, "selection_tab", None), "1  선택창"),
+                (getattr(self, "play_tab", None), "2  플레이"),
+                (getattr(self, "history_tab", None), "3  전적"),
+                (getattr(self, "build_tab", None), "4  빌드 적용"),
+            )
+            for tab, source in fixed_tabs:
+                if tab is None:
+                    continue
+                try:
+                    notebook.tab(tab, text=self._tr(source))
+                except tk.TclError:
+                    pass
+        history_notebook = getattr(self, "history_notebook", None)
+        history_home = getattr(self, "history_home_tab", None)
+        if history_notebook is not None and history_home is not None:
+            try:
+                history_notebook.tab(history_home, text=self._tr("내 전적"))
+            except tk.TclError:
+                pass
+
+    def _active_language_roots(self) -> tuple[tk.Misc, ...]:
+        roots: list[tk.Misc] = []
+        header = getattr(self, "header_frame", None)
+        if isinstance(header, tk.Misc):
+            roots.append(header)
+        active = self._current_main_tab_index() if hasattr(self, "notebook") else 0
+        active_root = {
+            0: getattr(self, "selection_content", None),
+            1: getattr(self, "play_content", None),
+            2: getattr(self, "history_tab", None),
+            3: getattr(self, "build_content", None),
+        }.get(active)
+        if isinstance(active_root, tk.Misc):
+            roots.append(active_root)
+        try:
+            roots.extend(
+                child for child in self.root.winfo_children()
+                if isinstance(child, tk.Toplevel)
+            )
+        except tk.TclError:
+            pass
+        return tuple(dict.fromkeys(roots))
+
+    def _apply_language(self, *, full: bool = False) -> None:
+        self._update_fixed_language_texts()
+        roots: tuple[tk.Misc, ...] = (
+            (self.root,) if full else self._active_language_roots()
+        )
+        for root in roots:
+            self._translate_widget_tree(root)
+
+    def _schedule_language_refresh(self) -> None:
+        if (
+            getattr(self, "ui_language", "ko") != "en"
+            or getattr(self, "_language_refresh_after_id", None) is not None
+        ):
+            return
+        try:
+            self._language_refresh_after_id = self.root.after(
+                45, self._flush_language_refresh,
+            )
+        except tk.TclError:
+            self._language_refresh_after_id = None
+
+    def _flush_language_refresh(self) -> None:
+        self._language_refresh_after_id = None
+        self._update_fixed_language_texts()
+        tracked = tuple(getattr(self, "_language_tracked_widgets", ()))
+        for widget in tracked:
+            try:
+                exists = bool(widget.winfo_exists())
+            except tk.TclError:
+                exists = False
+            if not exists:
+                self._language_tracked_widgets.discard(widget)
+                continue
+            self._translate_widget(widget)
+
     def _render_all(self) -> None:
         self.draft.refresh_snapshot_id()
         active = self._current_main_tab_index()
         if active == 0:
             self._render_selection()
+            self._schedule_language_refresh()
             return
         self._render_header()
         if active == 1:
@@ -6375,6 +6982,7 @@ class AdvisorApp:
             self._render_history()
         elif active == 3:
             self._render_build()
+        self._schedule_language_refresh()
 
     def _render_selection(self) -> None:
         if self._current_main_tab_index() != 0:
@@ -6510,10 +7118,19 @@ class AdvisorApp:
     def _refresh_build_champion_values(self) -> None:
         values: list[str] = []
         mapping: dict[str, str] = {}
-        for champion_id, (_key, name_ko) in sorted(
-            self.registry.by_id.items(), key=lambda item: item[1][1]
-        ):
-            display = f"{name_ko} · {champion_id}"
+        champion_rows = sorted(
+            self.registry.by_id.items(),
+            key=(
+                (lambda item: item[0].casefold())
+                if self.ui_language == "en"
+                else (lambda item: item[1][1])
+            ),
+        )
+        for champion_id, (_key, name_ko) in champion_rows:
+            display = (
+                champion_id if self.ui_language == "en"
+                else f"{name_ko} · {champion_id}"
+            )
             values.append(display)
             mapping[display] = champion_id
         self._build_champion_display_to_id = mapping
@@ -6826,7 +7443,7 @@ class AdvisorApp:
             self._reset_rune_editor()
             if hasattr(self, "build_status_label"):
                 self.build_status_label.configure(
-                    text=f"현재 패치 한글 룬 {count}개를 로컬에 저장했습니다.",
+                    text=self._text("build.rune_cache", count=count),
                     fg=COLORS["green"],
                 )
             self._render_build()
@@ -7096,10 +7713,16 @@ class AdvisorApp:
                 and self._rune_editor_summary_label.winfo_exists()
             ):
                 active = self._active_rune_build(base)
-                names = " · ".join(perk.name for perk in active.perks)
+                names = " · ".join(
+                    self._rune_name_text(perk.asset_id, perk.name)
+                    for perk in active.perks
+                )
                 self._rune_editor_summary_label.configure(
                     text=(
-                        "직접 편집 적용값" if self._rune_editor_custom else "추천 적용값"
+                        self._tr(
+                            "직접 편집 적용값"
+                            if self._rune_editor_custom else "추천 적용값"
+                        )
                     ) + f"\n{names}"
                 )
         except tk.TclError:
@@ -7288,7 +7911,7 @@ class AdvisorApp:
         builds = self._spell_builds(guide)
         if not builds:
             tk.Label(
-                parent, text="추천 스펠 조합 없음", bg=COLORS["panel_2"],
+                parent, text=self._tr("추천 스펠 조합 없음"), bg=COLORS["panel_2"],
                 fg=COLORS["muted"], font=("Malgun Gothic", 8),
             ).pack(anchor="w", pady=(6, 8))
             return
@@ -7296,7 +7919,11 @@ class AdvisorApp:
             max(int(self._build_spell_index), 0), len(builds) - 1
         )
         tk.Label(
-            parent, text=f"OP.GG 추천 조합 · {len(builds)}개",
+            parent, text=(
+                f"OP.GG recommended combinations · {len(builds)}"
+                if self.ui_language == "en"
+                else f"OP.GG 추천 조합 · {len(builds)}개"
+            ),
             bg=COLORS["panel_2"], fg=COLORS["muted"],
             font=("Malgun Gothic", 7, "bold"),
         ).pack(anchor="w", pady=(4, 5))
@@ -7322,8 +7949,8 @@ class AdvisorApp:
             label = tk.Button(
                 card,
                 text=(
-                    f"조합 {index + 1}\n"
-                    f"{build_loadout_stat_text(spell_build.games, spell_build.win_rate)}"
+                    f"{'Combination' if self.ui_language == 'en' else '조합'} {index + 1}\n"
+                    f"{self._build_stat_text(spell_build.games, spell_build.win_rate)}"
                 ),
                 command=choose,
                 bg=background,
@@ -7500,17 +8127,15 @@ class AdvisorApp:
 
         if kind == "item":
             image = self.item_icon_cache.get(asset.asset_id, size, load_image)
-            tooltip = lambda value=asset: self.item_icon_cache.tooltip_text(value.asset_id)
+            tooltip = lambda value=asset: self._asset_tooltip_text(value, "item")
         else:
             image = self.build_icon_cache.get(
                 f"{kind}:{asset.asset_id}", asset.icon_url, size, load_image
             )
             if kind == "rune":
-                tooltip = lambda value=asset: self.rune_catalog.tooltip_text(
-                    value.asset_id, value.name
-                )
+                tooltip = lambda value=asset: self._asset_tooltip_text(value, "rune")
             else:
-                tooltip = lambda value=asset: f"{value.name}\n소환사 주문"
+                tooltip = lambda value=asset: self._asset_tooltip_text(value, "spell")
         if image:
             icon.configure(image=image, text="")
             icon.image = image
@@ -7558,7 +8183,7 @@ class AdvisorApp:
             icon.configure(image=image, text="")
             icon.image = image
         name_label = tk.Label(
-            frame, text=asset.name, bg=COLORS["surface"], fg=COLORS["text"],
+            frame, text=self._asset_name_text(asset, kind), bg=COLORS["surface"], fg=COLORS["text"],
             wraplength=54 if compact else 92, justify="center",
             font=("Malgun Gothic", 6 if compact else 7),
         )
@@ -7567,27 +8192,22 @@ class AdvisorApp:
             def update_item_name() -> None:
                 try:
                     if name_label.winfo_exists():
-                        name_label.configure(
-                            text=self.item_icon_cache.item_name(
-                                asset.asset_id, asset.name
-                            )
-                        )
+                        name_label.configure(text=self._asset_name_text(asset, "item"))
                 except tk.TclError:
                     return
 
             name_label.configure(
-                text=self.item_icon_cache.item_name(
-                    asset.asset_id, asset.name, update_item_name
+                text=self.item_icon_cache.localized_item_name(
+                    asset.asset_id, self.ui_language, asset.name,
+                    update_item_name,
                 )
             )
         if kind == "item":
-            tooltip = lambda item_id=asset.asset_id: self.item_icon_cache.tooltip_text(item_id)
+            tooltip = lambda value=asset: self._asset_tooltip_text(value, "item")
         elif kind == "rune":
-            tooltip = lambda value=asset: self.rune_catalog.tooltip_text(
-                value.asset_id, value.name
-            )
+            tooltip = lambda value=asset: self._asset_tooltip_text(value, "rune")
         else:
-            tooltip = lambda value=asset: f"{value.name}\nID {value.asset_id}"
+            tooltip = lambda value=asset: self._asset_tooltip_text(value, "spell")
         for target in (frame, icon, name_label):
             helper = _HoverTooltip(target, tooltip)
             setattr(target, "_advisor_tooltip", helper)
@@ -7641,7 +8261,11 @@ class AdvisorApp:
         tooltip = _HoverTooltip(
             button,
             lambda value=perk_id, name=asset.name:
-            self.rune_catalog.tooltip_text(value, name),
+            (
+                f"{self._rune_name_text(value, name)}\nRune ID {value}"
+                if self.ui_language == "en"
+                else self.rune_catalog.tooltip_text(value, name)
+            ),
         )
         setattr(button, "_advisor_tooltip", tooltip)
         return button
@@ -7651,15 +8275,18 @@ class AdvisorApp:
         self._rune_editor_hint_label = None
         self._rune_editor_summary_label = None
         tk.Label(
-            self.build_runes_frame, text="RUNES · 직접 선택",
+            self.build_runes_frame, text=self._tr("RUNES · 직접 선택"),
             bg=COLORS["panel_2"], fg=COLORS["purple"],
             font=("Malgun Gothic", 10, "bold"),
         ).pack(anchor="w")
         tk.Label(
             self.build_runes_frame,
             text=(
-                "선택한 OP.GG 추천 원본 · "
-                + build_loadout_stat_text(base.games, base.win_rate)
+                (
+                    "Selected OP.GG source · " if self.ui_language == "en"
+                    else "선택한 OP.GG 추천 원본 · "
+                )
+                + self._build_stat_text(base.games, base.win_rate)
             ),
             bg=COLORS["panel_2"],
             fg=(COLORS["green"] if base.win_rate is not None else COLORS["muted"]),
@@ -7669,6 +8296,9 @@ class AdvisorApp:
             tk.Label(
                 self.build_runes_frame,
                 text=(
+                    "Recommended runes can be applied immediately. "
+                    "The full rune tree is loaded from the League Client and cached locally."
+                    if self.ui_language == "en" else
                     "추천 룬은 바로 적용할 수 있습니다. 전체 룬 선택과 한글 설명은 "
                     "롤 클라이언트에서 읽어 로컬에 저장합니다."
                 ),
@@ -7699,9 +8329,8 @@ class AdvisorApp:
             if primary and sub:
                 self._rune_editor_hint_label = tk.Label(
                     self.build_runes_frame,
-                    text=(
-                        "추천값에서 시작 · 아이콘을 눌러 변경 · "
-                        "보조 룬은 서로 다른 두 줄 선택"
+                    text=self._tr(
+                        "추천값에서 시작 · 아이콘을 눌러 변경 · 보조 룬은 서로 다른 두 줄 선택"
                     ),
                     bg=COLORS["panel_2"],
                     fg=COLORS["green"] if self._rune_editor_custom else COLORS["muted"],
@@ -7718,20 +8347,27 @@ class AdvisorApp:
                     card = tk.Frame(selectors, bg=COLORS["panel_2"])
                     card.pack(side="left", fill="x", expand=True, padx=(0, 4))
                     tk.Label(
-                        card, text=title, bg=COLORS["panel_2"], fg=COLORS["muted"],
+                        card, text=self._tr(title), bg=COLORS["panel_2"], fg=COLORS["muted"],
                         font=("Malgun Gothic", 7, "bold"),
                     ).pack(anchor="w")
                     names = [
-                        self.rune_catalog.styles[value].name
+                        self._rune_style_text(
+                            value, self.rune_catalog.styles[value].name,
+                        )
                         for value in style_ids if value in self.rune_catalog.styles
                     ]
                     mapping = {
-                        self.rune_catalog.styles[value].name: value
+                        self._rune_style_text(
+                            value, self.rune_catalog.styles[value].name,
+                        ): value
                         for value in style_ids if value in self.rune_catalog.styles
                     }
                     variable = tk.StringVar(
-                        value=(self.rune_catalog.style(current_id).name
-                               if self.rune_catalog.style(current_id) else "")
+                        value=(
+                            self._rune_style_text(
+                                current_id, self.rune_catalog.style(current_id).name,
+                            ) if self.rune_catalog.style(current_id) else ""
+                        )
                     )
                     combo = ttk.Combobox(
                         card, textvariable=variable, values=names,
@@ -7769,12 +8405,18 @@ class AdvisorApp:
                 )
                 secondary_tree.pack(side="left", fill="both", expand=True, padx=(3, 0))
                 tk.Label(
-                    primary_tree, text=f"{primary.name} · 주 룬",
+                    primary_tree, text=self._text(
+                        "build.primary_tree",
+                        style=self._rune_style_text(primary.style_id, primary.name),
+                    ),
                     bg="#11182a", fg=COLORS["purple"],
                     font=("Malgun Gothic", 8, "bold"),
                 ).pack(anchor="w", pady=(0, 4))
                 tk.Label(
-                    secondary_tree, text=f"{sub.name} · 보조 2개",
+                    secondary_tree, text=self._text(
+                        "build.secondary_tree",
+                        style=self._rune_style_text(sub.style_id, sub.name),
+                    ),
                     bg="#101b27", fg=COLORS["blue"],
                     font=("Malgun Gothic", 8, "bold"),
                 ).pack(anchor="w", pady=(0, 4))
@@ -7816,7 +8458,7 @@ class AdvisorApp:
                 )
                 shard_card.pack(fill="x", pady=(7, 0))
                 tk.Label(
-                    shard_card, text="능력치 파편 · 3줄에서 각각 1개",
+                    shard_card, text=self._tr("능력치 파편 · 3줄에서 각각 1개"),
                     bg=COLORS["surface"], fg=COLORS["gold"],
                     font=("Malgun Gothic", 7, "bold"),
                 ).pack(anchor="w", pady=(0, 3))
@@ -7827,7 +8469,7 @@ class AdvisorApp:
                     row = tk.Frame(shard_rows, bg=COLORS["surface"])
                     row.pack(fill="x", pady=1)
                     tk.Label(
-                        row, text=shard_labels[offset], width=4,
+                        row, text=self._tr(shard_labels[offset]), width=6,
                         bg=COLORS["surface"], fg=COLORS["muted"],
                         font=("Malgun Gothic", 7, "bold"), anchor="w",
                     ).pack(side="left", padx=(0, 3))
@@ -7846,10 +8488,15 @@ class AdvisorApp:
                         choice.pack(side="left", padx=2)
 
                 active = self._active_rune_build(base)
-                names = " · ".join(perk.name for perk in active.perks)
+                names = " · ".join(
+                    self._rune_name_text(perk.asset_id, perk.name)
+                    for perk in active.perks
+                )
                 self._rune_editor_summary_label = tk.Label(
                     self.build_runes_frame,
-                    text=("직접 편집 적용값" if self._rune_editor_custom else "추천 적용값")
+                    text=self._tr(
+                        "직접 편집 적용값" if self._rune_editor_custom else "추천 적용값"
+                    )
                     + f"\n{names}",
                     bg=COLORS["panel_2"], fg=COLORS["text"],
                     width=1, wraplength=440, justify="left", anchor="w",
@@ -7877,15 +8524,20 @@ class AdvisorApp:
         if incoming_signature == self._build_render_signature:
             return
         self._build_render_signature = incoming_signature
-        role_name = position_name(self.draft.my_role)
-        self.build_position_label.configure(text=f"추천 포지션 · {role_name}")
+        role_name = self._position_text(self.draft.my_role)
+        self.build_position_label.configure(
+            text=self._text("build.position", role=role_name)
+        )
         self.build_refresh_button.configure(
             state=(
                 "disabled"
                 if self._build_refreshing or self._build_bulk_downloading or self.demo
                 else "normal"
             ),
-            text="빌드 불러오는 중..." if self._build_refreshing else "OP.GG 빌드 갱신",
+            text=(
+                self._tr("빌드 불러오는 중...") if self._build_refreshing
+                else self._tr("OP.GG 빌드 갱신")
+            ),
         )
         for frame in (
             self.build_presets_frame, self.build_runes_frame,
@@ -7907,7 +8559,11 @@ class AdvisorApp:
         )
         if not guide_matches:
             self.build_guide_summary.configure(
-                text=f"{self.registry.ko_name(self._build_selected_champion_id)} · {role_name} 빌드 데이터 없음"
+                text=self._text(
+                    "build.missing",
+                    champion=self._champion_text(self._build_selected_champion_id),
+                    role=role_name,
+                )
             )
             for frame, text in (
                 (self.build_presets_frame, "추천 목록 없음"),
@@ -7916,7 +8572,7 @@ class AdvisorApp:
                 (self.build_items_frame, "아이템 데이터 없음"),
             ):
                 tk.Label(
-                    frame, text=text, bg=COLORS["panel_2"], fg=COLORS["muted"],
+                    frame, text=self._tr(text), bg=COLORS["panel_2"], fg=COLORS["muted"],
                     font=("Malgun Gothic", 9),
                 ).pack(anchor="w")
             for button in self.build_apply_buttons:
@@ -7939,30 +8595,39 @@ class AdvisorApp:
             self._build_rune_index = matchup_index
         stamp = guide.updated_at.replace("T", " ")[:16]
         self.build_guide_summary.configure(
-            text=(
-                f"{guide.champion_name_ko} · {role_name} · 패치 {guide.patch} · "
-                f"{guide.tier} · {stamp} 갱신 · 출처 OP.GG"
+            text=self._text(
+                "build.summary",
+                champion=self._champion_text(
+                    guide.champion_id, guide.champion_name_ko,
+                ),
+                role=role_name, patch=guide.patch, tier=guide.tier,
+                stamp=stamp,
             ),
             fg=COLORS["muted"],
         )
         tk.Label(
-            self.build_presets_frame, text="추천 빌드 목록",
+            self.build_presets_frame, text=self._tr("추천 빌드 목록"),
             bg=COLORS["panel_2"], fg=COLORS["gold"],
             font=("Malgun Gothic", 10, "bold"),
         ).pack(anchor="w")
         tk.Label(
             self.build_presets_frame,
-            text="기본 추천과 상대 대응 추천을 구분합니다.",
+            text=self._tr("기본 추천과 상대 대응 추천을 구분합니다."),
             bg=COLORS["panel_2"], fg=COLORS["muted"],
             font=("Malgun Gothic", 7), wraplength=180, justify="left",
         ).pack(anchor="w", pady=(3, 8))
         tk.Label(
-            self.build_presets_frame, text="기본 추천 · OP.GG",
+            self.build_presets_frame, text=self._tr("기본 추천 · OP.GG"),
             bg=COLORS["panel_2"], fg=COLORS["purple"],
             font=("Malgun Gothic", 8, "bold"),
         ).pack(anchor="w", pady=(0, 5))
         for index, rune_build in enumerate(guide.rune_builds[:3]):
-            keystone = rune_build.perks[0].name if rune_build.perks else rune_build.name
+            keystone = (
+                self._rune_name_text(
+                    rune_build.perks[0].asset_id, rune_build.perks[0].name,
+                )
+                if rune_build.perks else rune_build.name
+            )
             selected = index == self._build_rune_index
             preset_bg = "#4b3470" if selected else COLORS["chip"]
             select_preset = lambda selected_index=index: self._set_build_rune_index(
@@ -7993,8 +8658,8 @@ class AdvisorApp:
             preset = tk.Button(
                 preset_card,
                 text=(
-                    f"기본 {index + 1}\n{keystone}\n"
-                    f"{build_loadout_stat_text(rune_build.games, rune_build.win_rate)}"
+                    f"{self._text('build.default_name', index=index + 1)}\n{keystone}\n"
+                    f"{self._build_stat_text(rune_build.games, rune_build.win_rate)}"
                 ),
                 command=select_preset,
                 bg=preset_bg,
@@ -8013,12 +8678,14 @@ class AdvisorApp:
             self.draft.selected_enemy_support_id
         )
         enemy_name = (
-            self.registry.ko_name(self.draft.selected_enemy_support_id)
-            if self.draft.selected_enemy_support_id else "상대 미확정"
+            self._champion_text(self.draft.selected_enemy_support_id)
+            if self.draft.selected_enemy_support_id else self._tr("상대 미확정")
         )
         matchup_runes = guide.rune_builds[matchup_index]
         matchup_keystone = (
-            matchup_runes.perks[0].name if matchup_runes.perks else matchup_runes.name
+            self._rune_name_text(
+                matchup_runes.perks[0].asset_id, matchup_runes.perks[0].name,
+            ) if matchup_runes.perks else matchup_runes.name
         )
         matchup_card = tk.Frame(
             self.build_presets_frame, bg="#172b34", padx=9, pady=8,
@@ -8028,10 +8695,10 @@ class AdvisorApp:
         tk.Label(
             matchup_card,
             text=(
-                f"상대 대응 추천 · {enemy_name}\n{focus}\n"
-                f"{matchup_keystone} 중심 · "
-                f"{build_loadout_stat_text(matchup_runes.games, matchup_runes.win_rate)}\n"
-                f"{matchup_reason}"
+                f"{self._text('build.matchup_title', enemy=enemy_name)}\n"
+                f"{self._tr(focus)}\n"
+                f"{self._text('build.matchup_keystone', keystone=matchup_keystone, stats=self._build_stat_text(matchup_runes.games, matchup_runes.win_rate))}\n"
+                f"{self._tr(matchup_reason)}"
             ),
             bg="#172b34", fg=COLORS["green"], justify="left", anchor="w",
             wraplength=180, font=("Malgun Gothic", 7, "bold"),
@@ -8039,7 +8706,7 @@ class AdvisorApp:
         matchup_assets = tk.Frame(matchup_card, bg="#172b34")
         matchup_assets.pack(fill="x", pady=(6, 0))
         tk.Label(
-            matchup_assets, text="대표 룬 · 아이템",
+            matchup_assets, text=self._tr("대표 룬 · 아이템"),
             bg="#172b34", fg=COLORS["muted"],
             font=("Malgun Gothic", 6, "bold"),
         ).pack(side="left")
@@ -8080,7 +8747,7 @@ class AdvisorApp:
         ).pack(anchor="w")
         self._render_spell_build_choices(self.build_spells_frame, guide)
         tk.Label(
-            self.build_spells_frame, text="선택 조합 · D / F 배치",
+            self.build_spells_frame, text=self._tr("선택 조합 · D / F 배치"),
             bg=COLORS["panel_2"], fg=COLORS["blue"],
             font=("Malgun Gothic", 7, "bold"),
         ).pack(anchor="w", pady=(4, 0))
@@ -8091,12 +8758,12 @@ class AdvisorApp:
         flash_row = tk.Frame(self.build_spells_frame, bg=COLORS["panel_2"])
         flash_row.pack(fill="x", pady=(0, 12))
         tk.Label(
-            flash_row, text="점멸 위치", bg=COLORS["panel_2"],
+            flash_row, text=self._tr("점멸 위치"), bg=COLORS["panel_2"],
             fg=COLORS["muted"], font=("Malgun Gothic", 8, "bold"),
         ).pack(side="left", padx=(0, 6))
         for slot in ("D", "F"):
             button = self._button(
-                flash_row, f"점멸 {slot}",
+                flash_row, self._text("build.flash_slot", slot=slot),
                 lambda selected=slot: self._set_flash_slot(selected),
                 COLORS["blue"] if slot == self._flash_slot else COLORS["muted"],
                 width=8,
@@ -8115,7 +8782,7 @@ class AdvisorApp:
             self.build_spells_frame, text="SKILL MAX ORDER", bg=COLORS["panel_2"],
             fg=COLORS["gold"], font=("Malgun Gothic", 9, "bold"),
         ).pack(anchor="w")
-        priority = "  →  ".join(guide.skill_priority) or "데이터 없음"
+        priority = "  →  ".join(guide.skill_priority) or self._tr("데이터 없음")
         tk.Label(
             self.build_spells_frame, text=priority, bg=COLORS["panel_2"],
             fg=COLORS["text"], font=("Consolas", 18, "bold"),
@@ -8146,7 +8813,7 @@ class AdvisorApp:
             accent: str, background: str, border: str,
         ) -> None:
             tk.Label(
-                self.build_items_frame, text=title,
+                self.build_items_frame, text=self._tr(title),
                 bg=COLORS["panel_2"], fg=accent,
                 font=("Malgun Gothic", 8, "bold"),
             ).pack(anchor="w", pady=(8, 4))
@@ -8157,7 +8824,7 @@ class AdvisorApp:
                 )
                 final_card.pack(fill="x", pady=(0, 6))
                 tk.Label(
-                    final_card, text=f"{title.split('·')[0].strip()} {index}",
+                    final_card, text=f"{self._tr(title.split('·')[0].strip())} {index}",
                     bg=background, fg=accent,
                     font=("Malgun Gothic", 7, "bold"),
                 ).pack(anchor="w", pady=(0, 4))
@@ -8178,13 +8845,13 @@ class AdvisorApp:
         if not base_builds:
             tk.Label(
                 self.build_items_frame,
-                text="완성 아이템 후보가 6개 미만입니다.",
+                text=self._tr("완성 아이템 후보가 6개 미만입니다."),
                 bg=COLORS["panel_2"], fg=COLORS["orange"],
                 font=("Malgun Gothic", 7),
             ).pack(anchor="w")
         if self.draft.selected_enemy_support_id:
             render_complete_section(
-                f"{enemy_name} 상대 대응 완성 빌드 · 로컬 대응 기준",
+                self._text("build.enemy_completed", enemy=enemy_name),
                 matchup_builds, COLORS["green"], "#172b34", "#285e59",
             )
 
@@ -8192,8 +8859,9 @@ class AdvisorApp:
         detail_toggle = self._button(
             self.build_items_frame,
             (
-                f"상세 아이템 후보 접기 · {candidate_count}개" if self._build_item_details_expanded
-                else f"상세 아이템 후보 펼치기 · {candidate_count}개"
+                self._text("build.detail_collapse", count=candidate_count)
+                if self._build_item_details_expanded
+                else self._text("build.detail_expand", count=candidate_count)
             ),
             self._toggle_build_item_details, COLORS["green"],
         )
@@ -8217,7 +8885,7 @@ class AdvisorApp:
             )
         if self.demo:
             self.build_apply_status.configure(
-                text="데모 화면에서는 롤 클라이언트를 변경하지 않습니다.", fg=COLORS["gold"]
+                text=self._tr("데모 화면에서는 롤 클라이언트를 변경하지 않습니다."), fg=COLORS["gold"]
             )
         self._mark_build_render_current()
 
@@ -8227,13 +8895,13 @@ class AdvisorApp:
         if detail_frame.winfo_children():
             return
         tk.Label(
-            detail_frame, text="핵심 · 순서별 · 상황별 아이템 후보",
+            detail_frame, text=self._tr("핵심 · 순서별 · 상황별 아이템 후보"),
             bg=COLORS["panel_2"], fg=COLORS["green"],
             font=("Malgun Gothic", 8, "bold"),
         ).pack(anchor="w", pady=(8, 2))
         for group in guide.item_groups:
             tk.Label(
-                detail_frame, text=group.title, bg=COLORS["panel_2"],
+                detail_frame, text=self._tr(group.title), bg=COLORS["panel_2"],
                 fg=COLORS["muted"], font=("Malgun Gothic", 8, "bold"),
             ).pack(anchor="w", pady=(8, 3))
             item_grid = tk.Frame(detail_frame, bg=COLORS["panel_2"])
@@ -8443,26 +9111,28 @@ class AdvisorApp:
         self._render_automation_toggles()
         if self.demo:
             text, color = (
-                "● DEMO · 100% 가상 데이터 · 실계정과 실제 전적을 읽지 않습니다",
+                self._text("header.connection.demo"),
                 COLORS["gold"],
             )
         elif self.game_phase == "InProgress":
-            text, color = "● 게임 진행 중 · 플레이 탭에서 플레이어 전적 확인", COLORS["green"]
+            text, color = self._text("header.connection.game"), COLORS["green"]
         elif self.draft.connection_state == "CHAMP_SELECT":
-            text, color = "● 롤 클라이언트 연결됨 · 픽/밴 감지 · 빌드 적용 가능", COLORS["green"]
+            text, color = self._text("header.connection.draft"), COLORS["green"]
         elif self.draft.connection_state == "LOBBY":
-            text, color = "● 롤 클라이언트 연결됨 · 게임 시작 대기", COLORS["blue"]
+            text, color = self._text("header.connection.lobby"), COLORS["blue"]
         else:
-            text, color = "○ 롤 클라이언트 대기 중 · 챔피언 선택에 들어가면 자동 연결", COLORS["muted"]
+            text, color = self._text("header.connection.waiting"), COLORS["muted"]
         self.connection_label.configure(text=text, fg=color)
         if self.demo:
-            self.opgg_header_label.configure(text="OP.GG 데모 데이터 · 수치는 화면 예시")
+            self.opgg_header_label.configure(text=self._text("header.opgg.demo"))
         elif self.opgg_meta_snapshot or self.opgg_snapshot:
             header_snapshot = self.opgg_meta_snapshot or self.opgg_snapshot
             assert header_snapshot is not None
             stamp = header_snapshot.updated_at.replace("T", " ")[:16]
             self.opgg_header_label.configure(
-                text=f"OP.GG {header_snapshot.patch} · 순위+상성 · {stamp} 갱신"
+                text=self._text(
+                    "header.opgg.cached", patch=header_snapshot.patch, stamp=stamp,
+                )
             )
         else:
             self.opgg_header_label.configure(text="OP.GG 캐시 없음")
@@ -8479,7 +9149,9 @@ class AdvisorApp:
             hours = int(remaining.total_seconds()) // 3600
             minutes = (int(remaining.total_seconds()) % 3600) // 60
             self.riot_button.configure(
-                state="disabled", text=f"전적 캐시 {hours:02d}:{minutes:02d}"
+                state="disabled", text=self._text(
+                    "header.riot.cooldown", hours=hours, minutes=minutes,
+                )
             )
         else:
             self.riot_button.configure(state="normal", text="전적 갱신")
@@ -8504,7 +9176,9 @@ class AdvisorApp:
             hours, seconds = divmod(seconds, 3600)
             minutes = seconds // 60
             self.api_key_status_label.configure(
-                text=f"Riot 개발 키 · 저장 기준 남은 {hours:02d}:{minutes:02d}",
+                text=self._text(
+                    "header.key.remaining", hours=hours, minutes=minutes,
+                ),
                 fg=COLORS["green"],
             )
             self.settings_button.configure(text="Riot 설정")
@@ -8520,16 +9194,29 @@ class AdvisorApp:
         )
         self.header_metrics["phase"][0].configure(text=phase_value, fg=color)
         self.header_metrics["phase"][1].configure(text=phase_detail)
-        role_name = position_name(self.draft.my_role)
-        target = self.draft.selected_enemy_support_name_ko or "블라인드"
+        role_name = self._position_text(self.draft.my_role)
+        target = (
+            self._champion_text(
+                self.draft.selected_enemy_support_id,
+                self.draft.selected_enemy_support_name_ko,
+            )
+            if self.draft.selected_enemy_support_id else self._tr("블라인드")
+        )
         self.app_title_label.configure(text=f"LOL {role_name.upper()} PICK ADVISOR")
         self.root.title(f"LOL Pick Advisor · {role_name}")
-        order = f"우리 팀 {self.draft.my_pick_order}픽" if self.draft.my_pick_order else "픽 순서 미확인"
+        order = (
+            self._text("header.draft.order", order=self.draft.my_pick_order)
+            if self.draft.my_pick_order else self._tr("픽 순서 미확인")
+        )
         self.header_metrics["draft"][0].configure(text=target)
-        self.header_metrics["draft"][1].configure(text=f"적 {role_name} 기준 · {order}")
+        self.header_metrics["draft"][1].configure(
+            text=self._text("header.draft.detail", role=role_name, order=order)
+        )
         match_count = self.storage.count_matches()
         self.header_metrics["cache"][0].configure(
-            text="가상 표본" if self.demo else f"{match_count:,} 경기"
+            text=self._tr("가상 표본") if self.demo else self._text(
+                "common.matches", count=match_count,
+            )
         )
         self.header_metrics["cache"][1].configure(
             text=(
@@ -8552,12 +9239,21 @@ class AdvisorApp:
         self.header_metrics["data"][0].configure(text=data_value, fg=data_color)
         self.header_metrics["data"][1].configure(
             text=(
-                "외부 계정 연결 없음"
+                self._tr("외부 계정 연결 없음")
                 if self.demo else
-                f"Riot {'OK' if key_ready else '갱신 필요'} · "
-                f"OP.GG {'OK' if opgg_ready else '없음'}"
+                self._text(
+                    "header.data.detail",
+                    riot=("OK" if key_ready else (
+                        "refresh required" if self.ui_language == "en" else "갱신 필요"
+                    )),
+                    opgg=("OK" if opgg_ready else (
+                        "none" if self.ui_language == "en" else "없음"
+                    )),
+                )
             )
         )
+        if self.ui_language == "en":
+            self._translate_widget_tree(self.header_frame)
 
     def _draft_team_slots(self, ally: bool) -> list[DraftMember | None]:
         members = list(
@@ -8601,16 +9297,21 @@ class AdvisorApp:
             outer = tk.Frame(frame, bg=border, padx=1, pady=1)
             outer.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 3, 3))
             role = ROLE_LABELS.get(member.role, "?") if member else "?"
-            name = member.champion_name_ko if member and member.champion_id else "선택 대기"
+            name = (
+                self._champion_text(member.champion_id, member.champion_name_ko)
+                if member and member.champion_id
+                else self._text("draft.slot.waiting")
+            )
             status = {
-                "LOCKED": "확정 픽", "HOVER": "픽 의사", "EMPTY": "공개 전",
+                "LOCKED": self._text("draft.slot.locked"),
+                "HOVER": self._text("draft.slot.hover"),
+                "EMPTY": self._text("draft.slot.empty"),
             }.get(state, state)
             order = member.pick_order if member and member.pick_order else index + 1
-            turn_text = (
-                f" · 전체 {member.pick_turn}턴"
-                if member and member.pick_turn is not None else ""
-            )
-            prefix = "나 · " if is_me else ""
+            turn_text = self._text(
+                "draft.slot.turn", turn=member.pick_turn,
+            ) if member and member.pick_turn is not None else ""
+            prefix = self._text("draft.slot.me") if is_me else ""
             icon = (
                 self.icon_cache.get(
                     member.champion_id, 42, self._selection_icon_ready("draft")
@@ -8618,7 +9319,10 @@ class AdvisorApp:
                 if member and member.champion_id else None
             )
             command = None
-            if not ally and member and member.champion_id and state == "LOCKED":
+            if (
+                not ally and member and member.champion_id
+                and state in {"LOCKED", "HOVER"}
+            ):
                 command = lambda champion_id=member.champion_id: self._select_enemy_support(
                     champion_id
                 )
@@ -8630,7 +9334,10 @@ class AdvisorApp:
             } if command else {}
             widget = cls(
                 outer,
-                text=f"팀 {order}픽{turn_text} · {prefix}{role}\n{name}\n{status}",
+                text=self._text(
+                    "draft.slot", order=order, turn=turn_text,
+                    me=prefix, role=role, champion=name, status=status,
+                ),
                 image=icon or "", compound="left", justify="left", anchor="w",
                 bg=COLORS["surface_selected"] if selected else COLORS["panel_2"],
                 fg=accent if state != "EMPTY" else COLORS["muted"],
@@ -8657,8 +9364,12 @@ class AdvisorApp:
             else:
                 champion_id = ""
                 state = "EMPTY"
-            name = self.registry.ko_name(champion_id) if champion_id else "--"
-            status = "금지" if state == "LOCKED" else ("금지 중" if state == "HOVER" else "대기")
+            name = self._champion_text(champion_id) if champion_id else "--"
+            status = (
+                self._text("draft.ban.locked") if state == "LOCKED" else
+                self._text("draft.ban.hover") if state == "HOVER" else
+                self._text("draft.ban.waiting")
+            )
             color = (
                 COLORS["red"] if state == "LOCKED" else
                 COLORS["orange"] if state == "HOVER" else COLORS["muted"]
@@ -8670,22 +9381,31 @@ class AdvisorApp:
                 if champion_id else None
             )
             tk.Label(
-                frame, text=f"{index + 1}밴 {name} · {status}", image=icon or "",
+                frame, text=self._text(
+                    "draft.ban", order=index + 1, champion=name, status=status,
+                ), image=icon or "",
                 compound="left", bg=COLORS["chip"], fg=color,
                 padx=7, pady=5, font=("Malgun Gothic", 7, "bold"),
             ).pack(side="left", padx=(0, 4), pady=1)
 
     def _render_draft(self) -> None:
-        role_name = position_name(self.draft.my_role)
-        order = f"우리 팀 {self.draft.my_pick_order}픽" if self.draft.my_pick_order else "픽 순서 확인 전"
-        states = {"WAITING": "픽 대기", "SELECTING": "내 픽 진행 중", "LOCKED": "내 픽 확정"}
+        role_name = self._position_text(self.draft.my_role)
+        order = (
+            self._text("draft.order.team", order=self.draft.my_pick_order)
+            if self.draft.my_pick_order else self._text("draft.order.unknown")
+        )
+        states = {
+            "WAITING": self._text("draft.state.waiting"),
+            "SELECTING": self._text("draft.state.selecting"),
+            "LOCKED": self._text("draft.state.locked"),
+        }
         unknown_selected = self.draft.selected_enemy_support_source == "MANUAL_UNKNOWN"
         stale = self._recommendations_stale()
         revision = self._selection_panel_revisions.get("draft", 0)
         swap_note = {
-            "SENT": "픽 순서 교환 요청 중",
-            "RECEIVED": "픽 순서 교환 요청 받음",
-            "ACCEPTED": "픽 순서 교환 반영 중",
+            "SENT": self._text("draft.swap.sent"),
+            "RECEIVED": self._text("draft.swap.received"),
+            "ACCEPTED": self._text("draft.swap.accepted"),
         }.get(self.draft.pick_order_swap_state, "")
         notice = self._pick_order_change_notice or swap_note
 
@@ -8699,44 +9419,47 @@ class AdvisorApp:
         ):
             notice_text = f"    {notice}" if notice else ""
             self.pick_order_label.configure(
-                text=(
-                    f"내 포지션: {role_name}    나의 픽 순서: {order}    "
-                    f"현재 상태: {states.get(self.draft.my_status, self.draft.my_status)}"
-                    f"{notice_text}    스냅샷: {self.draft.snapshot_id}"
+                text=self._text(
+                    "draft.summary", role=role_name, order=order,
+                    state=states.get(self.draft.my_status, self.draft.my_status),
+                    notice=notice_text, snapshot=self.draft.snapshot_id,
                 )
             )
             self.enemy_instruction_label.configure(
-                text=f"상대 팀  ·  적 {role_name} 챔피언을 직접 클릭해서 지정"
+                text=self._text("draft.enemy.instruction", role=role_name)
             )
-            self.enemy_unknown_button.configure(text=f"적 {role_name} 모르겠음")
+            self.enemy_unknown_button.configure(
+                text=self._text("draft.enemy.unknown_button", role=role_name)
+            )
             self._set_button_selected(
                 self.enemy_unknown_button, unknown_selected, COLORS["orange"]
             )
             if unknown_selected:
                 self.enemy_support_label.configure(
-                    text=f"선택한 적 {role_name}: 모르겠음 · ChatGPT가 블라인드 안정성을 우선 판단"
+                    text=self._text("draft.enemy.selected_unknown", role=role_name)
                 )
             elif self.draft.selected_enemy_support_id:
                 source = (
-                    "직접 확정"
+                    self._text("draft.enemy.manual")
                     if self.draft.selected_enemy_support_source == "MANUAL_ENEMY_SUPPORT"
-                    else "자동 추정 · 확실하지 않음"
+                    else self._text("draft.enemy.auto")
                 )
                 self.enemy_support_label.configure(
-                    text=(
-                        f"선택한 적 {role_name}: "
-                        f"{self.draft.selected_enemy_support_name_ko} · {source}"
+                    text=self._text(
+                        "draft.enemy.selected", role=role_name,
+                        champion=self._champion_text(
+                            self.draft.selected_enemy_support_id,
+                            self.draft.selected_enemy_support_name_ko,
+                        ),
+                        source=source,
                     )
                 )
             else:
                 self.enemy_support_label.configure(
-                    text=f"선택한 적 {role_name}: 아직 모름 · ChatGPT에는 미확정 정보로 전달"
+                    text=self._text("draft.enemy.pending", role=role_name)
                 )
             self.stale_label.configure(
-                text=(
-                    "⚠ 확정 픽·밴이 변경되어 기존 추천이 오래되었습니다. 새 질문을 복사하세요."
-                    if stale else ""
-                )
+                text=self._text("draft.stale") if stale else ""
             )
 
         ally_ban_signature = tuple(
@@ -8828,60 +9551,74 @@ class AdvisorApp:
 
         if not hover or not hover.champion_id:
             self.hover_matchup_badge.configure(
-                text="HOVER 대기", bg=COLORS["chip"], fg=COLORS["muted"]
+                text=self._text("hover.waiting.badge"),
+                bg=COLORS["chip"], fg=COLORS["muted"]
             )
-            self.hover_matchup_title.configure(text="내 픽 의사 즉시 상성")
-            self.hover_matchup_cache.configure(text="로컬 캐시 우선", fg=COLORS["muted"])
+            self.hover_matchup_title.configure(text=self._text("hover.waiting.title"))
+            self.hover_matchup_cache.configure(text=self._tr("로컬 캐시 우선"), fg=COLORS["muted"])
             self._set_hover_matchup_icon(self.hover_matchup_ally_icon, None)
             self._set_hover_matchup_icon(self.hover_matchup_enemy_icon, enemy_id)
-            self.hover_matchup_ally_name.configure(text="내 챔피언 대기", fg=COLORS["muted"])
+            self.hover_matchup_ally_name.configure(
+                text=self._text("hover.waiting.ally"), fg=COLORS["muted"]
+            )
             self.hover_matchup_enemy_name.configure(
-                text=self.registry.ko_name(enemy_id) if enemy_id else "상대 대기",
+                text=(
+                    self._champion_text(enemy_id)
+                    if enemy_id else self._text("hover.waiting.enemy")
+                ),
                 fg=COLORS["red"] if enemy_id else COLORS["muted"],
             )
             self.hover_matchup_rate.configure(
-                text="롤에서 챔피언을 올려놓으면 즉시 비교합니다.", fg=COLORS["muted"]
+                text=self._text("hover.waiting.rate"), fg=COLORS["muted"]
             )
             self.hover_matchup_detail.configure(
-                text="OP.GG 상성 · 내 맞상대 전적 · 원딜 조합을 한 번에 확인"
+                text=self._text("hover.waiting.detail")
             )
             self.hover_matchup_local.configure(
-                text="HOVER를 취소하면 이 대기 상태로 돌아옵니다.", fg=COLORS["muted"]
+                text=self._text("hover.waiting.local"), fg=COLORS["muted"]
             )
             self.hover_matchup_card.configure(highlightbackground=COLORS["divider"])
             return
 
-        hover_name = hover.champion_name_ko or self.registry.ko_name(hover.champion_id)
+        hover_name = self._champion_text(hover.champion_id, hover.champion_name_ko)
         locked = hover.state == "LOCKED"
         self.hover_matchup_badge.configure(
-            text="내 픽 확정" if locked else "픽 의사(HOVER) · 확정 아님",
+            text=self._text("hover.locked.badge" if locked else "hover.intent.badge"),
             bg="#17362e" if locked else "#174667",
             fg=COLORS["green"] if locked else COLORS["blue"],
         )
         self.hover_matchup_title.configure(
-            text=(
-                f"{hover_name} 픽 확정 상태의 즉시 판단"
-                if locked else f"{hover_name}을(를) 올려놓은 상태의 즉시 판단"
+            text=self._text(
+                "hover.locked.title" if locked else "hover.intent.title",
+                champion=hover_name,
             )
         )
         self._set_hover_matchup_icon(self.hover_matchup_ally_icon, hover.champion_id)
         self._set_hover_matchup_icon(self.hover_matchup_enemy_icon, enemy_id)
         self.hover_matchup_ally_name.configure(text=hover_name, fg=COLORS["blue"])
         self.hover_matchup_enemy_name.configure(
-            text=self.registry.ko_name(enemy_id) if enemy_id else "상대 미확정",
+            text=(
+                self._champion_text(enemy_id)
+                if enemy_id else self._text("hover.enemy.pending")
+            ),
             fg=COLORS["red"] if enemy_id else COLORS["orange"],
         )
 
         if not enemy_id:
-            self.hover_matchup_cache.configure(text="상대 지정 대기", fg=COLORS["orange"])
+            self.hover_matchup_cache.configure(
+                text=self._text("hover.enemy.waiting"), fg=COLORS["orange"]
+            )
             self.hover_matchup_rate.configure(
-                text=f"{hover_name} 블라인드 픽 검토 중", fg=COLORS["gold"]
+                text=self._text("hover.blind.rate", champion=hover_name),
+                fg=COLORS["gold"]
             )
             self.hover_matchup_detail.configure(
-                text=f"적 {position_name(position)}을 지정하면 맞대결 승률을 즉시 표시합니다."
+                text=self._text(
+                    "hover.blind.detail", role=self._position_text(position),
+                )
             )
             self.hover_matchup_local.configure(
-                text="현재는 포지션 메타와 내 전체 챔피언 전적만 참고할 수 있습니다.",
+                text=self._text("hover.blind.local"),
                 fg=COLORS["muted"],
             )
             self.hover_matchup_card.configure(highlightbackground=COLORS["orange"])
@@ -8891,83 +9628,107 @@ class AdvisorApp:
         fresh = bool(snapshot and self._matchup_snapshot_fresh(snapshot))
         error = self._hover_matchup_errors.get(cache_key, "")
         if fresh:
-            cache_text, cache_color = "상성 캐시 유효", COLORS["green"]
+            cache_text, cache_color = self._text("hover.cache.fresh"), COLORS["green"]
         elif snapshot and fetching:
-            cache_text, cache_color = "오래된 로컬 · 갱신 중", COLORS["orange"]
+            cache_text, cache_color = self._text("hover.cache.refreshing"), COLORS["orange"]
         elif snapshot:
-            cache_text, cache_color = "오래된 로컬 캐시", COLORS["orange"]
+            cache_text, cache_color = self._text("hover.cache.stale"), COLORS["orange"]
         elif fetching:
-            cache_text, cache_color = "백그라운드 조회 중", COLORS["blue"]
+            cache_text, cache_color = self._text("hover.cache.fetching"), COLORS["blue"]
         elif error:
-            cache_text, cache_color = "조회 실패 · 표본 없음", COLORS["orange"]
+            cache_text, cache_color = self._text("hover.cache.failed"), COLORS["orange"]
         else:
-            cache_text, cache_color = "로컬 상성 없음", COLORS["muted"]
+            cache_text, cache_color = self._text("hover.cache.missing"), COLORS["muted"]
         self.hover_matchup_cache.configure(text=cache_text, fg=cache_color)
 
         if counter:
             rate = counter.versus_win_rate
-            result = lane_matchup_label(rate)
+            result = self._matchup_label_text(rate)
             rate_color = (
                 COLORS["green"] if rate >= 51.5 else
                 COLORS["red"] if rate < 48.5 else COLORS["gold"]
             )
             self.hover_matchup_rate.configure(
-                text=f"OP.GG {hover_name} 승률 {_fmt_rate(rate)} · {result}",
+                text=self._text(
+                    "hover.matchup.rate", champion=hover_name,
+                    rate=_fmt_rate(rate), result=result,
+                ),
                 fg=rate_color,
             )
             overall = (
-                f" · 챔피언 전체 {_fmt_rate(counter.overall_win_rate)}"
+                self._text(
+                    "hover.matchup.overall",
+                    rate=_fmt_rate(counter.overall_win_rate),
+                )
                 if counter.overall_win_rate is not None else ""
             )
             self.hover_matchup_detail.configure(
-                text=(
-                    f"vs {self.registry.ko_name(enemy_id)} · {_fmt_games(counter.games)}"
-                    f"{overall} · {'로컬 값을 표시하며 갱신 중' if fetching else '확정 전 참고 지표'}"
+                text=self._text(
+                    "hover.matchup.detail",
+                    enemy=self._champion_text(enemy_id),
+                    games=self._games_text(counter.games), overall=overall,
+                    note=self._text(
+                        "hover.matchup.note.refreshing"
+                        if fetching else "hover.matchup.note.reference"
+                    ),
                 )
             )
             self.hover_matchup_card.configure(highlightbackground=rate_color)
         else:
-            message = "상성 표본 확인 중…" if fetching else "OP.GG 상성 표본 없음"
+            message = self._text(
+                "hover.matchup.loading" if fetching else "hover.matchup.no_sample"
+            )
             self.hover_matchup_rate.configure(
-                text=f"{hover_name} vs {self.registry.ko_name(enemy_id)} · {message}",
+                text=self._text(
+                    "hover.matchup.empty", champion=hover_name,
+                    enemy=self._champion_text(enemy_id), message=message,
+                ),
                 fg=COLORS["blue"] if fetching else COLORS["orange"],
             )
             self.hover_matchup_detail.configure(
-                text=(
-                    "현재 OP.GG 상대 상성표에 이 조합의 수치가 없습니다."
-                    + (f" · {error}" if error and not fetching else "")
+                text=self._text(
+                    "hover.matchup.no_value",
+                    error=(f" · {error}" if error and not fetching else ""),
                 )
             )
             self.hover_matchup_card.configure(highlightbackground=COLORS["orange"])
 
         if self._hover_personal_context is None:
-            local_parts = ["내 전적 연결 대기"]
+            local_parts = [self._text("hover.local.waiting")]
         elif self._hover_personal_context in self._hover_personal_loading:
-            local_parts = ["내 로컬 맞상대 전적 계산 중…"]
+            local_parts = [self._text("hover.local.loading")]
         elif personal and personal.matchup_games:
             local_parts = [
-                f"내 맞상대 {personal.matchup_games}판 · "
-                f"{personal.matchup_wins}승 {personal.matchup_losses}패 · "
-                f"승률 {_fmt_rate(personal.matchup_win_rate)}"
+                self._text(
+                    "hover.local.matchup", games=personal.matchup_games,
+                    wins=personal.matchup_wins, losses=personal.matchup_losses,
+                    rate=_fmt_rate(personal.matchup_win_rate),
+                )
             ]
         elif personal and personal.games:
             local_parts = [
-                f"내 {hover_name} {personal.games}판 · 승률 {_fmt_rate(personal.win_rate)} · "
-                "이 맞상대 기록은 없음"
+                self._text(
+                    "hover.local.champion", champion=hover_name,
+                    games=personal.games, rate=_fmt_rate(personal.win_rate),
+                )
             ]
         else:
-            local_parts = ["내 로컬 맞상대 기록 없음"]
+            local_parts = [self._text("hover.local.none")]
         if synergy and synergy.win_rate is not None:
             adc = allied_adc_member(self.draft)
             if adc:
                 local_parts.append(
-                    f"{adc.champion_name_ko}×{hover_name} 조합 "
-                    f"{_fmt_rate(synergy.win_rate)} ({_fmt_games(synergy.games)})"
+                    self._text(
+                        "hover.local.synergy",
+                        adc=self._champion_text(adc.champion_id, adc.champion_name_ko),
+                        support=hover_name, rate=_fmt_rate(synergy.win_rate),
+                        games=self._games_text(synergy.games),
+                    )
                 )
         source_note = (
-            "적 챔피언 자동 추정 · 확실하지 않음"
+            self._text("hover.source.auto")
             if self.draft.selected_enemy_support_source == "AUTO_ENEMY_SUPPORT"
-            else "적 챔피언 직접 지정"
+            else self._text("hover.source.manual")
         )
         local_parts.append(source_note)
         self.hover_matchup_local.configure(
@@ -9163,19 +9924,25 @@ class AdvisorApp:
             self.opgg_calc_label.configure(text="")
             return
         self.copy_top3_button.configure(state="normal")
-        role_name = position_name(self.draft.my_role)
+        role_name = self._position_text(self.draft.my_role)
         if snapshot.enemy_support_id:
-            self.counter_tree.heading("winrate", text="OP.GG 상대 승률")
-            summary = (
-                f"{snapshot.enemy_support_name_ko} 적 {role_name} · 패치 {snapshot.patch} · {snapshot.region} · "
-                f"{snapshot.tier}    전체 승률 {_fmt_rate(snapshot.target_overall_win_rate)} · "
-                f"픽률 {_fmt_rate(snapshot.target_pick_rate)} · 밴률 {_fmt_rate(snapshot.target_ban_rate)}"
+            self.counter_tree.heading("winrate", text=self._tr("OP.GG 상대 승률"))
+            summary = self._text(
+                "details.matchup.summary",
+                champion=self._champion_text(
+                    snapshot.enemy_support_id, snapshot.enemy_support_name_ko,
+                ),
+                role=role_name, patch=snapshot.patch, region=snapshot.region,
+                tier=snapshot.tier,
+                win_rate=_fmt_rate(snapshot.target_overall_win_rate),
+                pick_rate=_fmt_rate(snapshot.target_pick_rate),
+                ban_rate=_fmt_rate(snapshot.target_ban_rate),
             )
         else:
-            self.counter_tree.heading("winrate", text="OP.GG 전체 승률")
-            summary = (
-                f"상대 {role_name} 미확인 · 패치 {snapshot.patch} · {snapshot.region} · {snapshot.tier} · "
-                "블라인드 픽용 전체 승률 순위"
+            self.counter_tree.heading("winrate", text=self._tr("OP.GG 전체 승률"))
+            summary = self._text(
+                "details.blind.summary", role=role_name, patch=snapshot.patch,
+                tier=f"{snapshot.region} · {snapshot.tier}",
             )
         self.opgg_summary_label.configure(text=summary)
         puuid = self.storage.get_setting("riot_puuid")
@@ -9190,9 +9957,14 @@ class AdvisorApp:
             self.opgg_calc_label.configure(text="내 전적 조합 계산 중…", fg=COLORS["blue"])
         else:
             self.opgg_calc_label.configure(
-                text=(
-                    f"{SUPPORT_FILTER_LABELS[self._support_filter] if self.draft.my_role == 'SUPPORT' else role_name + ' 전체'} "
-                    f"{len(counters)}개 · 점수 계산 완료"
+                text=self._text(
+                    "details.calc.done",
+                    filter=(
+                        self._tr(SUPPORT_FILTER_LABELS[self._support_filter])
+                        if self.draft.my_role == "SUPPORT"
+                        else f"{role_name} {self._tr('전체')}"
+                    ),
+                    count=len(counters),
                 ),
                 fg=COLORS["muted"],
             )
@@ -9211,7 +9983,7 @@ class AdvisorApp:
             self.counter_tree.insert(
                 "", "end", text=f"  {counter.champion_name_ko}", image=icon or "", values=(
                     index, f"{score:.0f}", confidence, _fmt_rate(counter.versus_win_rate),
-                    _fmt_games(counter.games), status,
+                    self._games_text(counter.games), status,
                 ), tags=(("blocked",) if counter.champion_id in unavailable else
                          (("weak",) if counter.versus_win_rate < 50 else
                           (("strong",) if score >= 60 else (("good",) if score >= 53 else ()))))
@@ -9312,7 +10084,10 @@ class AdvisorApp:
         if not support_mode:
             self._support_filter = "ALL"
         self.position_filter_label.configure(
-            text="플레이 유형" if support_mode else f"추천 포지션 · {position_name(self.draft.my_role)}"
+            text=(
+                self._tr("플레이 유형") if support_mode
+                else f"{self._tr('추천 포지션')} · {self._position_text(self.draft.my_role)}"
+            )
         )
         for key, button in self.support_filter_buttons.items():
             if key != "ALL" and not support_mode:
@@ -9321,8 +10096,8 @@ class AdvisorApp:
             if not button.winfo_manager():
                 button.pack(side="left", padx=(0, 5))
             button.configure(
-                text=(position_name(self.draft.my_role) + " 전체")
-                if key == "ALL" and not support_mode else SUPPORT_FILTER_LABELS[key]
+                text=(self._position_text(self.draft.my_role) + " " + self._tr("전체"))
+                if key == "ALL" and not support_mode else self._tr(SUPPORT_FILTER_LABELS[key])
             )
             selected = key == self._support_filter
             self._set_button_selected(button, selected, COLORS["blue"])
@@ -9396,17 +10171,33 @@ class AdvisorApp:
             )),
         ):
             return
-        target = self.draft.selected_enemy_support_name_ko or "모르겠음"
-        role_name = position_name(self.draft.my_role)
+        target = (
+            self._champion_text(
+                self.draft.selected_enemy_support_id,
+                self.draft.selected_enemy_support_name_ko,
+            )
+            if self.draft.selected_enemy_support_id
+            else self._text("prompt.target.unknown")
+        )
+        role_name = self._position_text(self.draft.my_role)
         certainty = {
-            "MANUAL_ENEMY_SUPPORT": "사용자 확정",
-            "AUTO_ENEMY_SUPPORT": "자동 추정 · 확실하지 않음",
-            "MANUAL_UNKNOWN": "미확정 · 블라인드 판단",
-        }.get(self.draft.selected_enemy_support_source, "미확정 · 블라인드 판단")
+            "MANUAL_ENEMY_SUPPORT": self._text("prompt.certainty.manual"),
+            "AUTO_ENEMY_SUPPORT": self._text("prompt.certainty.auto"),
+            "MANUAL_UNKNOWN": self._text("prompt.certainty.unknown"),
+        }.get(
+            self.draft.selected_enemy_support_source,
+            self._text("prompt.certainty.unknown"),
+        )
         ally_locked = len(self.draft.ally_locked)
         ally_hover = len(self.draft.ally_hover) + int(self.draft.my_hover is not None)
-        matchup = "상성 포함" if self.opgg_snapshot and self.opgg_snapshot.enemy_support_id else "상성 캐시 없음"
-        meta = "메타 순위 포함" if self.opgg_meta_snapshot else "메타 캐시 없음"
+        matchup = self._text(
+            "prompt.matchup.ready"
+            if self.opgg_snapshot and self.opgg_snapshot.enemy_support_id
+            else "prompt.matchup.missing"
+        )
+        meta = self._text(
+            "prompt.meta.ready" if self.opgg_meta_snapshot else "prompt.meta.missing"
+        )
         adc = allied_adc_member(self.draft)
         synergy_ready = bool(
             adc and self.opgg_synergy_snapshot
@@ -9434,14 +10225,22 @@ class AdvisorApp:
             )
         )
         self.prompt_summary_label.configure(
-            text=(
-                f"1회 규칙: {'CLI 등록 완료' if codex_memory_ready else '수동 등록 완료' if manual_memory_ready else 'Riot 설정에서 등록 필요'} · "
-                f"이번 짧은 질문 {short_prompt_size:,}자 · 내 포지션 {role_name} · 확정 픽 {ally_locked + len(self.draft.enemy_locked)}명 · "
-                f"아군 픽 의사 {ally_hover}명 · 밴 {len(self.draft.ally_bans) + len(self.draft.enemy_bans)}명\n"
-                f"적 {role_name}: {target} ({certainty}) · OP.GG: {meta} · {matchup} · "
-                f"원딜 조합: {'OP.GG 포함' if synergy_ready else '대기/미확정'} · "
-                f"내 로컬 조합 {local_combo_count}개 · 응답 스냅샷: {self.draft.snapshot_id}\n"
-                "종합 판단: 라인 상성 + 원딜 궁합 + 이니시/보호 + AD·AP 균형 + 앞라인 + 픽 순서"
+            text=self._text(
+                "prompt.summary",
+                memory=self._text(
+                    "prompt.memory.cli" if codex_memory_ready else
+                    "prompt.memory.manual" if manual_memory_ready else
+                    "prompt.memory.required"
+                ),
+                size=short_prompt_size, role=role_name,
+                locked=ally_locked + len(self.draft.enemy_locked),
+                hover=ally_hover,
+                bans=len(self.draft.ally_bans) + len(self.draft.enemy_bans),
+                target=target, certainty=certainty, meta=meta, matchup=matchup,
+                synergy=self._text(
+                    "prompt.synergy.ready" if synergy_ready else "prompt.synergy.pending"
+                ),
+                local=local_combo_count, snapshot=self.draft.snapshot_id,
             )
         )
         stale = self._recommendations_stale()
@@ -9477,50 +10276,56 @@ class AdvisorApp:
             )
             label.configure(bg=background, fg=color)
         if self._codex_cli_running:
-            status = "Codex가 현재 픽을 분석 중입니다 · UI는 계속 사용할 수 있습니다"
+            status = self._text("prompt.exchange.running")
             status_color = COLORS["blue"]
         elif self._codex_cli_error:
-            status = f"Codex CLI 추천 실패 · {self._codex_cli_error}"
+            status = self._text("prompt.exchange.cli_error", error=self._codex_cli_error)
             status_color = COLORS["red"]
         elif self._recommendation_apply_error:
-            status = f"추천 결과 형식 확인 필요 · {self._recommendation_apply_error}"
+            status = self._text(
+                "prompt.exchange.format_error", error=self._recommendation_apply_error,
+            )
             status_color = COLORS["red"]
         elif not memory_registered:
-            status = "처음 한 번만 · Riot 설정에서 ‘1회 규칙 보내기’를 누르세요"
+            status = self._text("prompt.exchange.setup")
             status_color = COLORS["gold"]
         elif stale:
-            status = "분석 당시 추천 3개 표시 중 · 실행 시 최신 롤 세션 재확인"
+            status = self._text("prompt.exchange.stale")
             status_color = COLORS["orange"]
         elif recommendation_ready:
-            status = "추천 3개 준비 완료 · 바로 아래 결과를 확인하세요"
+            status = self._text("prompt.exchange.ready")
             status_color = COLORS["green"]
         elif copied:
-            status = "질문 복사됨 · ChatGPT 답변을 복사한 뒤 ‘답변 붙여넣고 분석’"
+            status = self._text("prompt.exchange.copied")
             status_color = COLORS["blue"]
         elif codex_memory_ready:
-            status = "CLI 준비 완료 · 현재 픽이 정해지면 ‘Codex CLI로 추천 받기’"
+            status = self._text("prompt.exchange.cli_ready")
             status_color = COLORS["green"]
         else:
-            status = "수동 방식 준비 완료 · 질문 복사 또는 CLI 대화 등록 가능"
+            status = self._text("prompt.exchange.manual_ready")
             status_color = COLORS["gold"]
         self.exchange_status.configure(text=status, fg=status_color)
         if self._codex_cli_running:
-            cli_status = "빠른 모델로 분석 중… · 완료된 추천 카드만 부분 갱신"
+            cli_status = self._text("prompt.cli.running")
             cli_color = COLORS["blue"]
         elif self._codex_cli_error:
-            cli_status = f"마지막 요청 실패 · {self._codex_cli_error}"
+            cli_status = self._text("prompt.cli.error", error=self._codex_cli_error)
             cli_color = COLORS["red"]
         elif self.codex_cli is None:
-            cli_status = self._codex_cli_error or "Codex CLI를 찾지 못했습니다."
+            cli_status = self._codex_cli_error or self._text("prompt.cli.missing")
             cli_color = COLORS["red"]
         elif codex_memory_ready:
-            cli_status = f"ChatGPT 로그인 · 전용 대화 연결됨 · {codex_thread_id[:8]}… · Luna/none 초고속"
+            cli_status = self._text(
+                "prompt.cli.ready", thread=codex_thread_id[:8],
+            )
             cli_color = COLORS["green"]
         elif codex_thread_id:
-            cli_status = f"thread_id {codex_thread_id[:8]}… · 1회 규칙 등록 확인 필요"
+            cli_status = self._text(
+                "prompt.cli.thread", thread=codex_thread_id[:8],
+            )
             cli_color = COLORS["orange"]
         else:
-            cli_status = "Riot 설정 → 1회 규칙 보내기 → thread_id 자동 저장"
+            cli_status = self._text("prompt.cli.setup")
             cli_color = COLORS["gold"]
         self.codex_cli_status_label.configure(text=cli_status, fg=cli_color)
         self.codex_recommend_button.configure(
@@ -9534,8 +10339,8 @@ class AdvisorApp:
                 else "disabled"
             ),
             text=(
-                "Codex 분석 중…" if self._codex_cli_running
-                else f"Codex로 {role_name} 픽 추천"
+                self._text("prompt.button.running") if self._codex_cli_running
+                else self._text("prompt.button.recommend", role=role_name)
             ),
         )
 
@@ -9580,20 +10385,18 @@ class AdvisorApp:
         self._recommendation_action_buttons = []
         if not self.recommendations:
             self.champion_action_status.configure(
-                text="추천 챔피언의 선택/픽/밴은 버튼을 누를 때마다 최신 롤 세션을 재확인합니다.",
+                text=self._text("recommendations.empty.status"),
                 fg=COLORS["muted"],
             )
             tk.Label(
                 self.cards_frame,
-                text="질문을 ChatGPT에 붙여넣고 답변을 가져오면 추천 3개가 여기에 표시됩니다.",
+                text=self._text("recommendations.empty.body"),
                 bg=COLORS["panel"], fg=COLORS["muted"], font=("Malgun Gothic", 10),
             ).pack(anchor="w", pady=12)
             return
         self.champion_action_status.configure(
-            text=(
-                "분석 당시 추천입니다 · 모든 버튼은 최신 롤 세션을 다시 확인합니다."
-                if stale else
-                "현재 드래프트 추천 · 1순위를 롤에 자동 선택하며 확정은 하지 않습니다."
+            text=self._text(
+                "recommendations.stale" if stale else "recommendations.current"
             ),
             fg=COLORS["orange"] if stale else COLORS["green"],
         )
@@ -9996,10 +10799,12 @@ class AdvisorApp:
         self._render_play_prediction()
         self._render_duo_legend()
         if not self.live_game.players:
-            self.live_game_label.configure(text="게임이 시작되면 자동으로 플레이 탭으로 이동합니다.")
+            self.live_game_label.configure(
+                text=self._tr("게임이 시작되면 자동으로 플레이 탭으로 이동합니다.")
+            )
             self.live_profile_status.configure(text="")
             self.live_duo_status.configure(
-                text="DUO: 게임 시작 후 현재 10명의 최근 100경기 교집합을 확인합니다.",
+                text=self._tr("DUO: 게임 시작 후 현재 10명의 최근 100경기 교집합을 확인합니다."),
                 fg=COLORS["orange"],
             )
             if self._play_roster_signature == "EMPTY":
@@ -10010,7 +10815,7 @@ class AdvisorApp:
             self._clear(self.live_enemies_frame)
             for frame in (self.live_allies_frame, self.live_enemies_frame):
                 tk.Label(
-                    frame, text="플레이어 데이터 대기 중", bg=COLORS["panel_2"], fg=COLORS["muted"],
+                    frame, text=self._tr("플레이어 데이터 대기 중"), bg=COLORS["panel_2"], fg=COLORS["muted"],
                     padx=14, pady=20, font=("Malgun Gothic", 9),
                 ).grid(row=0, column=0, columnspan=5, sticky="ew", pady=3)
             self._schedule_play_insight_render()
@@ -10350,7 +11155,7 @@ class AdvisorApp:
 
         if not self.live_game.players:
             self.play_insight_status.configure(
-                text="게임 시작 후 자동 분석", fg=COLORS["muted"]
+                text=self._tr("게임 시작 후 자동 분석"), fg=COLORS["muted"]
             )
             empty_signature = repr((self._live_signature, "EMPTY"))
             if empty_signature != self._play_insight_signature:
@@ -10360,7 +11165,7 @@ class AdvisorApp:
                     self._clear(section)
                 tk.Label(
                     self.play_insight_sections["lane"],
-                    text="현재 게임 정보 대기 중 · 플레이어 카드는 먼저 표시되고 분석은 뒤에서 채워집니다.",
+                    text=self._tr("현재 게임 정보 대기 중 · 플레이어 카드는 먼저 표시되고 분석은 뒤에서 채워집니다."),
                     bg=COLORS["surface"], fg=COLORS["muted"], padx=14, pady=16,
                     font=("Malgun Gothic", 9), anchor="w",
                 ).pack(fill="x")
@@ -10726,7 +11531,7 @@ class AdvisorApp:
                 f"시즌 {profile.season_wins}승 {season_losses}패 · "
                 f"{_fmt_rate(profile.season_win_rate)}"
             )
-            streak = streak_badge_text(profile.overall_streak)
+            streak = self._streak_text(profile.overall_streak)
             if streak:
                 lines.append(streak)
         else:
@@ -10757,8 +11562,9 @@ class AdvisorApp:
                     if profile.champion_games else profile.champion_source_detail
                 ),
             ]
-            champion_streak = streak_badge_text(
-                profile.champion_streak, f"{opponent.champion_name_ko} "
+            champion_streak = self._streak_text(
+                profile.champion_streak,
+                f"{self._champion_text(opponent.champion_id, opponent.champion_name_ko)} ",
             )
             if champion_streak:
                 champion_lines.append(champion_streak)
@@ -11068,7 +11874,7 @@ class AdvisorApp:
                     f"{losses}패 · {(profile.recent_win_rate or 0.0):.0f}%"
                 )
                 recent_lines.append(f"최근 KDA {(profile.recent_kda or 0.0):.1f}")
-            streak = streak_badge_text(profile.overall_streak)
+            streak = self._streak_text(profile.overall_streak)
             if streak:
                 recent_lines.append(streak)
             if profile.season_wins + profile.season_losses:
@@ -11396,11 +12202,11 @@ class AdvisorApp:
             ally_average - enemy_average
             if ally_average is not None and enemy_average is not None else None
         )
-        ally_detail = f"랭크 표본 {len(ally_rates)}명"
-        enemy_detail = f"랭크 표본 {len(enemy_rates)}명"
+        ally_detail = self._text("play.rank_sample", count=len(ally_rates))
+        enemy_detail = self._text("play.rank_sample", count=len(enemy_rates))
         if difference is not None:
-            ally_detail += f" · 적 대비 {difference:+.1f}%p"
-            enemy_detail += f" · 아군 대비 {-difference:+.1f}%p"
+            ally_detail += self._text("play.compare_enemy", difference=difference)
+            enemy_detail += self._text("play.compare_ally", difference=-difference)
         self.play_metrics["ally"][0].configure(text=_fmt_rate(ally_average))
         self.play_metrics["ally"][1].configure(text=ally_detail)
         self.play_metrics["enemy"][0].configure(text=_fmt_rate(enemy_average))
@@ -11410,9 +12216,14 @@ class AdvisorApp:
             if profile.status in {"OK", "LOCAL_ONLY", "PARTIAL"}
         )
         total = len(self.live_game.players)
-        self.play_metrics["cache"][0].configure(text=f"{loaded}/{total or 10}명")
+        self.play_metrics["cache"][0].configure(
+            text=self._text("play.checked_players", loaded=loaded, total=total or 10)
+        )
         self.play_metrics["cache"][1].configure(
-            text="OP.GG+로컬+Riot 결합" if loaded else "게임 시작 후 자동 확인"
+            text=(
+                self._text("play.data_sources") if loaded
+                else self._text("play.auto_check")
+            )
         )
         duo_groups = {
             visual[0]: visual[3]
@@ -11426,20 +12237,30 @@ class AdvisorApp:
                 duo_groups.values(),
                 key=lambda level: DUO_LEVEL_PRIORITY.get(level, 0),
             )
-            if duo_groups else "없음"
+            if duo_groups else self._text("common.none")
         )
-        self.play_metrics["duo"][0].configure(text=f"{len(duo_groups)}쌍")
-        self.play_metrics["duo"][1].configure(text=f"가장 강한 신호 · {strongest}")
+        self.play_metrics["duo"][0].configure(
+            text=self._text("play.duo_pairs", count=len(duo_groups))
+        )
+        self.play_metrics["duo"][1].configure(
+            text=self._text("play.strongest_signal", signal=self._tr(strongest))
+        )
         matchups = list(getattr(self, "lane_matchups", {}).values())
         ready_matchups = sum(stat.ally_win_rate is not None for stat in matchups)
         refreshing = self._live_signature in getattr(
             self, "_lane_matchup_refreshing", set()
         )
         self.play_metrics["matchup"][0].configure(
-            text=f"{ready_matchups}/{len(matchups) or 5}라인"
+            text=self._text(
+                "play.matchup_lines", ready=ready_matchups,
+                total=len(matchups) or 5,
+            )
         )
         self.play_metrics["matchup"][1].configure(
-            text="누락 라인 순차 갱신 중" if refreshing else "OP.GG 맞대결 캐시"
+            text=(
+                self._text("play.matchup_refreshing") if refreshing
+                else self._text("play.matchup_cache")
+            )
         )
         self._update_live_prediction()
 
@@ -11491,7 +12312,7 @@ class AdvisorApp:
         if not self.live_game.players:
             self._live_prediction = None
             value_label.configure(text="--", fg=COLORS["gold"])
-            detail_label.configure(text="게임 시작 후 계산")
+            detail_label.configure(text=self._text("play.prediction_waiting"))
             return
         candidate = estimate_live_game_prediction(
             self.live_game,
@@ -11685,7 +12506,7 @@ class AdvisorApp:
 
         top = tk.Frame(card, bg=COLORS["panel_2"])
         top.pack(fill="x")
-        role = ROLE_LABELS.get(player.position, player.position)
+        role = self._position_text(player.position)
         tk.Label(
             top, text=role, bg=team_color, fg="#07101b", padx=7, pady=2,
             font=("Malgun Gothic", 7, "bold"),
@@ -11699,7 +12520,7 @@ class AdvisorApp:
         if duo_visual:
             duo_group, duo_color, _partner, _level, _evidence = duo_visual
             tk.Label(
-                top, text=f"●● 듀오 {duo_group}", bg=duo_color,
+                top, text=self._text("play.duo_badge", group=duo_group), bg=duo_color,
                 fg="#07101b", padx=6, pady=2,
                 font=("Malgun Gothic", 7, "bold"),
             ).pack(side="right")
@@ -11711,7 +12532,10 @@ class AdvisorApp:
 
         display_name = player.riot_id if len(player.riot_id) <= 20 else player.riot_id[:19] + "…"
         player_name_label = tk.Label(
-            card, text=f"{display_name}{'  · 나' if player.is_active_player else ''}",
+            card, text=(
+                display_name
+                + (self._text("play.me_suffix") if player.is_active_player else "")
+            ),
             bg=COLORS["panel_2"],
             fg=(
                 COLORS["gold"] if player.is_active_player
@@ -11729,7 +12553,9 @@ class AdvisorApp:
         identity = tk.Frame(card, bg=COLORS["panel_2"])
         identity.pack(fill="x", pady=(1, 6))
         icon_label = tk.Label(
-            identity, text=player.champion_name_ko[:1], width=68, height=3,
+            identity, text=self._champion_text(
+                player.champion_id, player.champion_name_ko,
+            )[:1], width=68, height=3,
             bg=COLORS["chip"], fg=COLORS["gold"], font=("Malgun Gothic", 16, "bold"),
             highlightthickness=2 if duo_visual else 1,
             highlightbackground=duo_visual[1] if duo_visual else border_color,
@@ -11745,20 +12571,24 @@ class AdvisorApp:
         identity_text = tk.Frame(identity, bg=COLORS["panel_2"])
         identity_text.pack(side="left", fill="both", expand=True)
         tk.Label(
-            identity_text, text=player.champion_name_ko, bg=COLORS["panel_2"],
+            identity_text, text=self._champion_text(
+                player.champion_id, player.champion_name_ko,
+            ), bg=COLORS["panel_2"],
             fg=COLORS["text"], font=("Malgun Gothic", 10, "bold"),
         ).pack(anchor="w")
 
         self._render_duo_group_strip(card, duo_visual)
 
         if not available or not profile:
-            status_text = "전적 불러오는 중"
+            status_text = self._text("play.status_loading")
             if profile and profile.status == "NO_LOCAL_DATA":
-                status_text = "OP.GG 시즌 전적 확인 중"
+                status_text = self._tr("OP.GG 시즌 전적 확인 중")
+            elif profile and profile.status == "PRIVATE_OR_UNAVAILABLE":
+                status_text = self._text("play.status_private")
             elif profile and profile.status not in {"NO_DATA", "LOADING"}:
                 status_text = profile.status
             tk.Label(
-                identity_text, text="랭크 --", bg=COLORS["panel_2"], fg=COLORS["muted"],
+                identity_text, text=self._tr("랭크 --"), bg=COLORS["panel_2"], fg=COLORS["muted"],
                 font=("Malgun Gothic", 7),
             ).pack(anchor="w", pady=(2, 0))
             self._render_lane_matchup_strip(card, player)
@@ -11766,10 +12596,10 @@ class AdvisorApp:
                 card, text=status_text, bg=COLORS["surface"], fg=COLORS["muted"],
                 padx=6, pady=18, font=("Malgun Gothic", 8),
             ).pack(fill="x", pady=(0, 6))
-            self._winrate_bar(card, None, "시즌 데이터 대기")
+            self._winrate_bar(card, None, self._tr("시즌 데이터 대기"))
             return
 
-        rank_text = "언랭크"
+        rank_text = self._text("play.rank_unranked")
         if profile.tier != "UNRANKED":
             rank_text = f"{profile.tier} {profile.rank} · {profile.league_points}LP"
         rank_color = {
@@ -11785,7 +12615,10 @@ class AdvisorApp:
         if duo_visual:
             tk.Label(
                 identity_text,
-                text=f"시즌 {profile.season_wins}W - {profile.season_losses}L",
+                text=self._text(
+                    "play.season_record", wins=profile.season_wins,
+                    losses=profile.season_losses,
+                ),
                 bg=COLORS["panel_2"], fg=team_color, font=("Malgun Gothic", 7, "bold"),
             ).pack(anchor="w", pady=(2, 0))
 
@@ -11799,26 +12632,33 @@ class AdvisorApp:
         champion_losses = max(profile.champion_games - profile.champion_wins, 0)
         if profile.champion_data_source == "OPGG":
             champion_value = (
-                f"{profile.champion_games}판 · {_fmt_rate(profile.champion_win_rate)}"
+                self._text(
+                    "play.champion_record", games=profile.champion_games,
+                    rate=_fmt_rate(profile.champion_win_rate),
+                )
             )
-            champion_detail = (
-                f"OP.GG 시즌 · {profile.champion_wins}승 {champion_losses}패"
+            champion_detail = self._text(
+                "play.champion_source_opgg", wins=profile.champion_wins,
+                losses=champion_losses,
             )
             sample_color = (
                 COLORS["orange"] if profile.champion_games < 5 else COLORS["green"]
             )
         elif profile.champion_data_source == "OPGG_NOT_LISTED":
-            champion_value = "상위 목록 밖"
-            champion_detail = "OP.GG 시즌 챔피언 풀에서 미확인"
+            champion_value = self._text("play.opgg_not_listed")
+            champion_detail = self._text("play.opgg_not_listed_detail")
             sample_color = COLORS["muted"]
         elif profile.champion_data_source == "RIOT_LIVE":
             champion_value = (
-                f"{profile.champion_games}판 · {_fmt_rate(profile.champion_win_rate)}"
-                if profile.champion_games else "0판 · 선택 기록 없음"
+                self._text(
+                    "play.champion_record", games=profile.champion_games,
+                    rate=_fmt_rate(profile.champion_win_rate),
+                ) if profile.champion_games else self._text("play.current_no_selection")
             )
-            champion_detail = (
-                f"Riot 최근 {profile.local_sample_games}/{profile.champion_sample_target} · "
-                f"{profile.champion_wins}승 {champion_losses}패"
+            champion_detail = self._text(
+                "play.champion_source_riot", loaded=profile.local_sample_games,
+                target=profile.champion_sample_target,
+                wins=profile.champion_wins, losses=champion_losses,
             )
             sample_color = (
                 COLORS["orange"]
@@ -11828,75 +12668,107 @@ class AdvisorApp:
             )
         elif profile.champion_data_source == "LOCAL":
             champion_value = (
-                f"{profile.champion_games}판 · {_fmt_rate(profile.champion_win_rate)}"
-                if profile.champion_games else "0판 · 기록 없음"
+                self._text(
+                    "play.champion_record", games=profile.champion_games,
+                    rate=_fmt_rate(profile.champion_win_rate),
+                ) if profile.champion_games else self._text("play.current_none")
             )
-            champion_detail = (
-                f"내 저장 {profile.local_sample_games}경기 · "
-                f"{profile.champion_wins}승 {champion_losses}패"
+            champion_detail = self._text(
+                "play.champion_source_local", sample=profile.local_sample_games,
+                wins=profile.champion_wins, losses=champion_losses,
             )
             sample_color = (
                 COLORS["orange"] if 0 < profile.champion_games < 5 else COLORS["green"]
             )
         else:
-            champion_value = "OP.GG 확인 중…"
-            champion_detail = "실패 시 Riot 최근 표본으로 대체"
+            champion_value = self._text("play.opgg_checking")
+            champion_detail = self._text("play.opgg_fallback")
             sample_color = COLORS["blue"]
         if partial and profile.champion_data_source not in {
             "RIOT_LIVE", "OPGG", "OPGG_NOT_LISTED"
         }:
-            champion_value = "OP.GG 확인 중…" if not player.is_active_player else "계산 중…"
-            champion_detail = (
-                "시즌 챔피언 전적 요청 중"
-                if not player.is_active_player else "내 저장 전적 계산 중"
+            champion_value = (
+                self._text("play.opgg_checking")
+                if not player.is_active_player else self._tr("계산 중")
             )
-        self._compact_stat(stats, 0, "현 챔프", champion_value, champion_detail, sample_color)
+            champion_detail = (
+                self._tr("시즌 챔피언 전적 요청 중")
+                if not player.is_active_player else self._tr("내 저장 전적 계산 중")
+            )
+        self._compact_stat(
+            stats, 0, self._tr("현 챔프"), champion_value,
+            champion_detail, sample_color,
+        )
 
         if profile.last_game_champion_id:
-            last_result = "승" if profile.last_game_won else "패"
+            last_result = self._tr("승" if profile.last_game_won else "패")
             kda_text = "Perfect" if profile.last_game_deaths == 0 else f"{profile.last_game_kda:.1f}"
             last_value = f"{last_result} · KDA {kda_text}"
             last_detail = (
-                f"{self.registry.ko_name(profile.last_game_champion_id)}  "
+                f"{self._champion_text(profile.last_game_champion_id)}  "
                 f"{profile.last_game_kills}/{profile.last_game_deaths}/{profile.last_game_assists}"
             )
             last_color = COLORS["green"] if profile.last_game_won else COLORS["red"]
         elif partial:
-            last_value, last_detail, last_color = "계산 중…", "상세 기록", COLORS["blue"]
+            last_value, last_detail, last_color = (
+                self._tr("계산 중"), self._tr("상세 기록"), COLORS["blue"]
+            )
         else:
-            last_value, last_detail, last_color = "데이터 없음", "솔로랭크", COLORS["muted"]
-        self._compact_stat(stats, 1, "전판", last_value, last_detail, last_color)
+            last_value, last_detail, last_color = (
+                self._tr("데이터 없음"), self._tr("솔로랭크"), COLORS["muted"]
+            )
+        self._compact_stat(stats, 1, self._tr("전판"), last_value, last_detail, last_color)
         self._render_recent_form_summary(card, player, profile)
 
         if partial:
-            relationship = "나와 기록 · 순차 계산 중…"
+            relationship = self._text("play.relationship_loading")
         elif player.is_active_player:
-            relationship = "나와 기록 · 내 계정"
+            relationship = self._text("play.relationship_me")
         else:
             relation_parts: list[str] = []
             if profile.together_games:
                 relation_parts.append(
-                    f"동팀 {profile.together_games}판 {_fmt_rate(profile.together_win_rate)}"
+                    self._text(
+                        "play.relationship_team", games=profile.together_games,
+                        rate=_fmt_rate(profile.together_win_rate),
+                    )
                 )
             if profile.against_games:
                 relation_parts.append(
-                    f"상대 {profile.against_games}판 {_fmt_rate(profile.against_my_win_rate)}"
+                    self._text(
+                        "play.relationship_enemy", games=profile.against_games,
+                        rate=_fmt_rate(profile.against_my_win_rate),
+                    )
                 )
-            relationship = "나와 · " + (" / ".join(relation_parts) if relation_parts else "만난 기록 없음")
+            relationship = self._text(
+                "play.relationship", record=(
+                    " / ".join(relation_parts)
+                    if relation_parts else self._text("play.relationship_none")
+                ),
+            )
         tk.Label(
             card, text=relationship, bg=COLORS["panel_2"], fg=COLORS["purple"],
             font=("Malgun Gothic", 7, "bold"), anchor="w",
         ).pack(fill="x")
 
         if partial:
-            meeting = "최근 만남 · 순차 계산 중…"
+            meeting = self._text("play.recent_meeting_loading")
         elif profile.last_met_game_number:
-            when = "직전판" if profile.last_met_game_number == 1 else f"최근 {profile.last_met_game_number}번째"
-            side = "동팀" if profile.last_met_same_team else "상대"
-            result = "승" if profile.last_met_my_win else "패"
-            meeting = f"최근 만남 · {when} · {side} · {result}"
+            when = (
+                self._text("play.previous_match")
+                if profile.last_met_game_number == 1 else self._text(
+                    "play.recent_index", index=profile.last_met_game_number,
+                )
+            )
+            side = self._text(
+                "play.same_team" if profile.last_met_same_team else "play.opponent"
+            )
+            result = self._tr("승" if profile.last_met_my_win else "패")
+            meeting = self._text(
+                "play.recent_meeting", when=when, side=side, result=result,
+            )
         else:
-            meeting = "최근 만남 · 없음"
+            meeting = self._text("play.recent_meeting_none")
         tk.Label(
             card, text=meeting, bg=COLORS["panel_2"], fg=COLORS["muted"],
             font=("Malgun Gothic", 7), anchor="w",
@@ -11913,16 +12785,20 @@ class AdvisorApp:
 
         self._winrate_bar(
             card, profile.season_win_rate,
-            f"시즌 성적 · {profile.season_wins}승 {profile.season_losses}패",
+            self._text(
+                "play.season_bar", wins=profile.season_wins,
+                losses=profile.season_losses,
+            ),
         )
 
     def _render_recent_form_badges(
         self, parent: tk.Widget, player: LivePlayer, profile: PlayerProfileStat,
     ) -> None:
         badges: list[tuple[str, str]] = []
-        overall = streak_badge_text(profile.overall_streak)
-        champion = streak_badge_text(
-            profile.champion_streak, f"{player.champion_name_ko} ",
+        overall = self._streak_text(profile.overall_streak)
+        champion = self._streak_text(
+            profile.champion_streak,
+            f"{self._champion_text(player.champion_id, player.champion_name_ko)} ",
         )
         if overall:
             badges.append((
@@ -11942,10 +12818,10 @@ class AdvisorApp:
                 else COLORS["red"] if recent_rate is not None and recent_rate <= 40
                 else COLORS["blue"]
             )
-            badges.append((
-                f"최근 {profile.recent_games}경기 · {profile.recent_wins}승 {losses}패",
-                color,
-            ))
+            badges.append((self._text(
+                "play.recent_form", games=profile.recent_games,
+                wins=profile.recent_wins, losses=losses,
+            ), color))
         if not badges:
             return
         row = tk.Frame(parent, bg=COLORS["panel_2"])
@@ -11981,16 +12857,19 @@ class AdvisorApp:
             else COLORS["red"] if win_rate <= 40.0
             else COLORS["blue"]
         )
-        details = [
-            f"최근 {profile.recent_games}경기",
-            f"{profile.recent_wins}승 {losses}패",
-            f"{win_rate:.0f}%",
-            f"KDA {(profile.recent_kda or 0.0):.1f}",
-        ]
+        details = [self._text(
+            "play.recent_details", games=profile.recent_games,
+            wins=profile.recent_wins, losses=losses, rate=win_rate,
+            kda=(profile.recent_kda or 0.0),
+        )]
         if profile.recent_op_score > 0:
             details.append(f"OP {profile.recent_op_score:.1f}")
         if profile.last_op_score_rank > 0:
-            details.append(f"전판 {profile.last_op_score_rank}등")
+            details.append(
+                f"Previous rank {profile.last_op_score_rank}"
+                if self.ui_language == "en"
+                else f"전판 {profile.last_op_score_rank}등"
+            )
         tk.Label(
             panel, text=" · ".join(details), bg=COLORS["surface"], fg=form_color,
             font=("Malgun Gothic", 7, "bold"), anchor="w",
@@ -12004,9 +12883,16 @@ class AdvisorApp:
             tk.Label(
                 panel,
                 text=(
-                    f"{player.champion_name_ko} 최근 {profile.champion_recent_games}경기 · "
-                    f"{profile.champion_recent_wins}승 {champion_losses}패 · "
-                    f"{champion_rate:.0f}%"
+                    self._text(
+                        "play.champion_recent",
+                        champion=self._champion_text(
+                            player.champion_id, player.champion_name_ko,
+                        ),
+                        games=profile.champion_recent_games,
+                        wins=profile.champion_recent_wins,
+                        losses=champion_losses,
+                        rate=champion_rate,
+                    )
                 ),
                 bg=COLORS["surface"], fg="#b9c6dc",
                 font=("Malgun Gothic", 6, "bold"), anchor="w",
@@ -12481,17 +13367,31 @@ class AdvisorApp:
         rank_value, rank_detail = self._history_rank_text(game_name, tag_line)
         self.history_metrics["rank"][0].configure(text=rank_value)
         self.history_metrics["rank"][1].configure(text=rank_detail)
-        self.history_metrics["games"][0].configure(text=f"{overview.games:,}경기")
+        self.history_metrics["games"][0].configure(
+            text=self._text("history.games", count=overview.games)
+        )
         self.history_metrics["games"][1].configure(
-            text=f"{overview.wins}승 {overview.games - overview.wins}패 · {_fmt_rate(overview.win_rate)}"
+            text=self._text(
+                "history.record", wins=overview.wins,
+                losses=overview.games - overview.wins,
+                rate=self._tr(_fmt_rate(overview.win_rate)),
+            )
         )
         streak = (
-            f"{overview.current_streak}연승" if overview.current_streak > 0 else
-            f"{abs(overview.current_streak)}연패" if overview.current_streak < 0 else "연속 기록 없음"
+            self._text("history.win_streak", count=overview.current_streak)
+            if overview.current_streak > 0 else
+            self._text("history.loss_streak", count=abs(overview.current_streak))
+            if overview.current_streak < 0 else self._text("history.no_streak")
         )
-        self.history_metrics["recent"][0].configure(text=_fmt_rate(overview.recent_20_win_rate))
+        self.history_metrics["recent"][0].configure(
+            text=self._tr(_fmt_rate(overview.recent_20_win_rate))
+        )
         self.history_metrics["recent"][1].configure(
-            text=f"{overview.recent_20_wins}승 {overview.recent_20_games - overview.recent_20_wins}패 · {streak}"
+            text=self._text(
+                "history.recent_record", wins=overview.recent_20_wins,
+                losses=overview.recent_20_games - overview.recent_20_wins,
+                streak=streak,
+            )
         )
         lp_sum, lp_games, lp_window = recent_exact_lp_summary(overview.entries)
         if lp_sum is None:
@@ -12506,8 +13406,10 @@ class AdvisorApp:
             )
             self.history_lp_strip_label.configure(
                 text=(
-                    f"최근 20경기 LP {lp_sum:+d} · "
-                    f"정확 관측 {lp_games}/{lp_window}경기"
+                    self._text(
+                        "history.lp_summary", delta=lp_sum,
+                        known=lp_games, window=lp_window,
+                    )
                 ),
                 fg=lp_color,
             )
@@ -12525,7 +13427,7 @@ class AdvisorApp:
                 )
                 chip.pack(side="left", padx=(3, 0))
                 icon_label = tk.Label(
-                    chip, text=self.registry.ko_name(stat.champion_id)[:1],
+                    chip, text=self._champion_text(stat.champion_id)[:1],
                     bg=COLORS["chip"], fg=COLORS["gold"], width=22,
                     font=("Malgun Gothic", 7, "bold"),
                 )
@@ -12547,9 +13449,11 @@ class AdvisorApp:
                     icon_label.configure(image=image, text="", width=0)
                 tk.Label(
                     chip,
-                    text=(
-                        f"{self.registry.ko_name(stat.champion_id)} "
-                        f"{stat.games}판 · {_fmt_rate(stat.win_rate)}"
+                    text=self._text(
+                        "history.champion_chip",
+                        champion=self._champion_text(stat.champion_id),
+                        games=stat.games,
+                        rate=self._tr(_fmt_rate(stat.win_rate)),
                     ),
                     bg=COLORS["surface"], fg=COLORS["text"],
                     font=("Malgun Gothic", 7, "bold"),
@@ -12558,12 +13462,15 @@ class AdvisorApp:
             text=f"{overview.kda:.2f}" if overview.kda is not None else "--"
         )
         self.history_metrics["kda"][1].configure(
-            text=f"누적 {overview.kills}/{overview.deaths}/{overview.assists}"
+            text=self._text(
+                "history.total_kda", kills=overview.kills,
+                deaths=overview.deaths, assists=overview.assists,
+            )
         )
         self.history_metrics["vision"][0].configure(
             text=f"{overview.average_vision:.1f}" if overview.average_vision is not None else "--"
         )
-        self.history_metrics["vision"][1].configure(text="경기당 시야 점수")
+        self.history_metrics["vision"][1].configure(text=self._tr("경기당 시야 점수"))
         prediction_hits, prediction_total, prediction_rate = (
             recent_prediction_accuracy(overview.entries)
         )
@@ -12573,20 +13480,22 @@ class AdvisorApp:
             )
             self.history_metrics["prediction"][1].configure(
                 text=(
-                    f"최근 20 중 {prediction_hits}/{prediction_total}경기 적중"
+                    self._text(
+                        "history.prediction_accuracy", hits=prediction_hits,
+                        total=prediction_total,
+                    )
                 )
             )
         else:
             self.history_metrics["prediction"][0].configure(text="--")
             self.history_metrics["prediction"][1].configure(
-                text="새 게임부터 기록"
+                text=self._tr("새 게임부터 기록")
             )
 
         if getattr(self, "demo", False):
             self.history_status_label.configure(
                 text=(
-                    f"DEMO · 가상 솔로랭크 {overview.games:,}경기 · "
-                    "실제 계정 데이터 없음"
+                    self._text("history.demo_status", games=overview.games)
                 ),
                 fg=COLORS["gold"],
             )
@@ -12594,7 +13503,7 @@ class AdvisorApp:
             self.history_status_label.configure(text="새 로컬 데이터 분석 중…", fg=COLORS["blue"])
         else:
             self.history_status_label.configure(
-                text=f"로컬 솔로랭크 {overview.games:,}경기 · 외부 요청 없음",
+                text=self._text("history.local_status", games=overview.games),
                 fg=COLORS["green"],
             )
 
@@ -12651,7 +13560,10 @@ class AdvisorApp:
             remaining = len(entries) - self._history_visible_count
             self.history_more_button.configure(
                 state="normal" if remaining > 0 else "disabled",
-                text=f"경기 더 보기 · {remaining:,}개 남음" if remaining > 0 else "모든 저장 경기 표시됨",
+                text=(
+                    self._text("history.more", remaining=remaining)
+                    if remaining > 0 else self._text("history.all_shown")
+                ),
             )
 
     def _set_history_result_filter(self, result_filter: str) -> None:
@@ -12677,27 +13589,31 @@ class AdvisorApp:
         opgg_profile = self.storage.load_opgg_player_profile_any_age(riot_id)
         if opgg_profile:
             if opgg_profile.tier == "UNRANKED":
-                return "UNRANKED", "OP.GG · 솔로랭크 배치 전"
+                return "UNRANKED", self._tr("OP.GG · 솔로랭크 배치 전")
             return (
                 f"{opgg_profile.tier} {opgg_profile.division}",
                 f"{opgg_profile.league_points}LP · "
-                f"{opgg_profile.season_wins}승 {opgg_profile.season_losses}패 · OP.GG",
+                + self._text(
+                    "history.record", wins=opgg_profile.season_wins,
+                    losses=opgg_profile.season_losses, rate="OP.GG",
+                ),
             )
         cached = self.storage.load_live_profile_any_age(
             riot_id
         )
         if not cached:
-            return "랭크 미확인", "Riot 전적 갱신 필요"
+            return self._tr("랭크 미확인"), self._tr("Riot 전적 갱신 필요")
         _puuid, payload, _updated_at = cached
         entry = payload.get("solo_entry") or {}
         tier = str(entry.get("tier") or "UNRANKED")
         if tier == "UNRANKED":
-            return "UNRANKED", "솔로랭크 배치 전"
+            return "UNRANKED", self._tr("솔로랭크 배치 전")
         wins = int(entry.get("wins") or 0)
         losses = int(entry.get("losses") or 0)
         return (
             f"{tier} {entry.get('rank') or ''}",
-            f"{entry.get('leaguePoints') or 0}LP · {wins}승 {losses}패",
+            f"{entry.get('leaguePoints') or 0}LP · "
+            + self._text("history.record", wins=wins, losses=losses, rate="Riot"),
         )
 
     def _render_history_champion(self, stat: object) -> None:
@@ -12710,7 +13626,7 @@ class AdvisorApp:
         )
         outer.pack(fill="x", pady=2)
         icon_label = tk.Label(
-            outer, text=self.registry.ko_name(champion_id)[:1],
+            outer, text=self._champion_text(champion_id)[:1],
             bg=COLORS["chip"], fg=COLORS["gold"], width=34,
             font=("Malgun Gothic", 9, "bold"),
         )
@@ -12732,7 +13648,7 @@ class AdvisorApp:
         title = tk.Frame(name, bg=COLORS["surface"])
         title.pack(fill="x")
         tk.Label(
-            title, text=self.registry.ko_name(champion_id), bg=COLORS["surface"],
+            title, text=self._champion_text(champion_id), bg=COLORS["surface"],
             fg=COLORS["text"], font=("Malgun Gothic", 8, "bold"),
         ).pack(side="left")
         badge_color = POSITION_BADGE_COLORS.get(position, COLORS["muted"])
@@ -12740,20 +13656,23 @@ class AdvisorApp:
             title,
             text=(
                 f"{POSITION_GLYPHS.get(position, '?')} "
-                f"{ROLE_LABELS.get(position, position)}"
+                f"{self._position_text(position)}"
             ),
             bg=COLORS["chip"], fg=badge_color, padx=4, pady=1,
             font=("Segoe UI Symbol", 6, "bold"),
         ).pack(side="left", padx=(5, 0))
         tk.Label(
             name,
-            text=f"{getattr(stat, 'games', 0)}판 · KDA {getattr(stat, 'kda', None) or 0:.2f}",
+            text=(
+                self._games_text(int(getattr(stat, "games", 0) or 0))
+                + f" · KDA {getattr(stat, 'kda', None) or 0:.2f}"
+            ),
             bg=COLORS["surface"], fg=COLORS["muted"], font=("Malgun Gothic", 7),
         ).pack(anchor="w")
         rate = getattr(stat, "win_rate", None)
         color = COLORS["green"] if rate is not None and rate >= 50 else COLORS["red"]
         tk.Label(
-            outer, text=_fmt_rate(rate), bg=COLORS["surface"], fg=color,
+            outer, text=self._tr(_fmt_rate(rate)), bg=COLORS["surface"], fg=color,
             font=("Malgun Gothic", 8, "bold"),
         ).pack(side="right")
 
@@ -12797,6 +13716,10 @@ class AdvisorApp:
             name, filename = SUMMONER_SPELLS.get(
                 int(spell_id), (f"스펠 #{spell_id}", "")
             )
+            if self.ui_language == "en":
+                name = SUMMONER_SPELL_NAMES_EN.get(
+                    int(spell_id), f"Summoner spell {spell_id}",
+                )
             url = (
                 f"https://ddragon.leagueoflegends.com/cdn/{version}/img/spell/{filename}"
                 if filename and version != "fallback" else ""
@@ -12804,15 +13727,27 @@ class AdvisorApp:
             assets.append(("spell", int(spell_id), name, url, name))
         if primary_rune_id:
             option = self.rune_catalog.perk(primary_rune_id)
-            name = option.name if option else f"핵심 룬 #{primary_rune_id}"
+            name = self._rune_name_text(
+                primary_rune_id, option.name if option else "",
+            )
             url = option.icon_url if option else ""
-            tooltip = self.rune_catalog.tooltip_text(primary_rune_id, name)
+            tooltip = (
+                f"{name}\nRune ID {primary_rune_id}"
+                if self.ui_language == "en"
+                else self.rune_catalog.tooltip_text(primary_rune_id, name)
+            )
             assets.append(("rune", primary_rune_id, name, url, tooltip))
         if secondary_style_id:
             style = self.rune_catalog.style(secondary_style_id)
-            name = style.name if style else f"보조 룬 #{secondary_style_id}"
+            name = self._rune_style_text(
+                secondary_style_id, style.name if style else "",
+            )
             url = style.icon_url if style else ""
-            assets.append(("rune-style", secondary_style_id, name, url, f"보조 룬 · {name}"))
+            assets.append((
+                "rune-style", secondary_style_id, name, url,
+                f"Secondary rune path · {name}"
+                if self.ui_language == "en" else f"보조 룬 · {name}",
+            ))
         return assets
 
     def _loadout_icon(
@@ -12900,7 +13835,7 @@ class AdvisorApp:
         loadout = tk.Frame(summary, bg=result_bg)
         loadout.pack(side="left", fill="y", padx=(0, 9))
         champion_label = tk.Label(
-            loadout, text=self.registry.ko_name(entry.champion_id)[:1],
+            loadout, text=self._champion_text(entry.champion_id)[:1],
             bg=COLORS["chip"], fg=COLORS["gold"], width=52,
             font=("Malgun Gothic", 13, "bold"), highlightthickness=1,
             highlightbackground=result_color,
@@ -12934,12 +13869,12 @@ class AdvisorApp:
         result_heading = tk.Frame(result, bg=result_bg)
         result_heading.pack(fill="x")
         tk.Label(
-            result_heading, text="승리" if entry.won else "패배",
+            result_heading, text=self._tr("승리" if entry.won else "패배"),
             bg=result_color, fg="#07101b", padx=7, pady=2,
             font=("Malgun Gothic", 8, "bold"),
         ).pack(side="left")
         tk.Label(
-            result_heading, text=self.registry.ko_name(entry.champion_id),
+            result_heading, text=self._champion_text(entry.champion_id),
             bg=result_bg, fg=result_color, padx=6,
             font=("Malgun Gothic", 9, "bold"),
         ).pack(side="left")
@@ -12966,15 +13901,17 @@ class AdvisorApp:
                 else COLORS["gold"]
             )
             accuracy = (
-                "적중" if entry.prediction_correct is True
-                else "빗나감" if entry.prediction_correct is False
-                else "결과 대기"
+                self._tr("적중") if entry.prediction_correct is True
+                else self._tr("빗나감") if entry.prediction_correct is False
+                else self._tr("결과 대기")
             )
             tk.Label(
                 result,
-                text=(
-                    f"예측 {entry.predicted_win_rate:.1f}% "
-                    f"{'승' if entry.predicted_win else '패'} · {accuracy}"
+                text=self._text(
+                    "history.result_prediction",
+                    rate=entry.predicted_win_rate,
+                    result=self._tr("승" if entry.predicted_win else "패"),
+                    accuracy=accuracy,
                 ),
                 bg=result_badge_bg, fg=prediction_color,
                 padx=5, pady=1, font=("Malgun Gothic", 6, "bold"),
@@ -12989,7 +13926,10 @@ class AdvisorApp:
         ).pack(anchor="w")
         tk.Label(
             core,
-            text=f"CS {entry.cs} ({entry.cs_per_minute:.1f}/분) · 시야 {entry.vision_score}",
+            text=self._text(
+                "history.cs_vision", cs=entry.cs,
+                per_minute=entry.cs_per_minute, vision=entry.vision_score,
+            ),
             bg=result_bg, fg=COLORS["muted"], font=("Malgun Gothic", 7),
         ).pack(anchor="w", pady=(2, 0))
 
@@ -12997,14 +13937,14 @@ class AdvisorApp:
         items.pack(side="left", fill="y", padx=(3, 8))
         items.pack_propagate(False)
         tk.Label(
-            items, text="아이템", bg=result_bg, fg=COLORS["muted"],
+            items, text=self._tr("아이템"), bg=result_bg, fg=COLORS["muted"],
             font=("Malgun Gothic", 6, "bold"),
         ).pack(anchor="w")
         item_row = tk.Frame(items, bg=result_bg)
         item_row.pack(anchor="w", pady=(2, 0))
         if not entry.items:
             tk.Label(
-                item_row, text="기록 없음", bg=result_bg, fg=COLORS["muted"],
+                item_row, text=self._tr("기록 없음"), bg=result_bg, fg=COLORS["muted"],
                 font=("Malgun Gothic", 7),
             ).pack(side="left")
         for item_id in entry.items[:7]:
@@ -13053,7 +13993,7 @@ class AdvisorApp:
             team = tk.Frame(lineup, bg=COLORS["panel_2"])
             team.pack(fill="x", pady=(0 if team_index == 0 else 4, 0))
             tk.Label(
-                team, text="아군" if team_index == 0 else "적군",
+                team, text=self._tr("아군" if team_index == 0 else "적군"),
                 bg=COLORS["panel_2"],
                 fg=COLORS["blue"] if team_index == 0 else COLORS["red"],
                 font=("Malgun Gothic", 7, "bold"), anchor="w", width=5,
@@ -13103,18 +14043,22 @@ class AdvisorApp:
                 helper = _HoverTooltip(name_label, lambda value=riot_id: value)
                 setattr(name_label, "_advisor_tooltip", helper)
 
-    @staticmethod
-    def _history_time(game_creation: int) -> str:
+    def _history_time(self, game_creation: int) -> str:
         if not game_creation:
-            return "시간 미상"
+            return self._text("time.unknown")
         played = datetime.fromtimestamp(game_creation / 1000)
         elapsed = datetime.now() - played
         if elapsed < timedelta(hours=1):
-            return f"{max(int(elapsed.total_seconds() // 60), 1)}분 전"
+            return self._text(
+                "time.minutes_ago",
+                value=max(int(elapsed.total_seconds() // 60), 1),
+            )
         if elapsed < timedelta(days=1):
-            return f"{int(elapsed.total_seconds() // 3600)}시간 전"
+            return self._text(
+                "time.hours_ago", value=int(elapsed.total_seconds() // 3600),
+            )
         if elapsed < timedelta(days=7):
-            return f"{elapsed.days}일 전"
+            return self._text("time.days_ago", value=elapsed.days)
         return played.strftime("%m.%d %H:%M")
 
     def _show_more_history(self) -> None:
@@ -13135,8 +14079,8 @@ class AdvisorApp:
         self.history_more_button.configure(
             state="normal" if remaining > 0 else "disabled",
             text=(
-                f"경기 더 보기 · {remaining:,}개 남음"
-                if remaining > 0 else "모든 저장 경기 표시됨"
+                self._text("history.more", remaining=remaining)
+                if remaining > 0 else self._text("history.all_shown")
             ),
         )
         self._history_matches_signature = repr((
@@ -13608,36 +14552,57 @@ class AdvisorApp:
         self._sync_hover_matchup()
 
     def _auto_select_enemy_support(self, draft: DraftSnapshot) -> None:
-        enemy_ids = {member.champion_id for member in draft.enemy_locked}
         if self._manual_enemy_support == MANUAL_UNKNOWN_SUPPORT:
             draft.selected_enemy_support_id = None
             draft.selected_enemy_support_name_ko = "모르겠음"
             draft.selected_enemy_support_source = "MANUAL_UNKNOWN"
             return
-        if self._manual_enemy_support in enemy_ids:
+        if self._manual_enemy_support:
             draft.selected_enemy_support_id = self._manual_enemy_support
             draft.selected_enemy_support_name_ko = self.registry.ko_name(self._manual_enemy_support)
             draft.selected_enemy_support_source = "MANUAL_ENEMY_SUPPORT"
             return
-        self._manual_enemy_support = None
         role_match = next(
-            (member for member in draft.enemy_locked if member.role == draft.my_role), None
+            (
+                member for member in draft.enemy_locked
+                if member.champion_id and member.role == draft.my_role
+            ),
+            None,
         )
+        if self._support_catalog_ids is None:
+            catalog = self.storage.load_opgg_position_catalog(
+                "SUPPORT", max_age=None,
+            )
+            self._support_catalog_ids = set(catalog[1] if catalog else ())
         candidates = (
             [
                 member for member in draft.enemy_locked
-                if self.registry.support_score(member.champion_id)
+                if member.champion_id and (
+                    member.champion_id in self._support_catalog_ids
+                    or self.registry.support_score(member.champion_id)
+                )
             ]
             if draft.my_role == "SUPPORT" else []
         )
         chosen = role_match or (
-            max(candidates, key=lambda m: self.registry.support_score(m.champion_id))
+            max(
+                candidates,
+                key=lambda member: (
+                    100 if member.champion_id in self._support_catalog_ids else 0,
+                    self.registry.support_score(member.champion_id),
+                    -(member.pick_order or 99),
+                ),
+            )
             if candidates else None
         )
         if chosen:
             draft.selected_enemy_support_id = chosen.champion_id
             draft.selected_enemy_support_name_ko = chosen.champion_name_ko
             draft.selected_enemy_support_source = "AUTO_ENEMY_SUPPORT"
+        else:
+            draft.selected_enemy_support_id = None
+            draft.selected_enemy_support_name_ko = ""
+            draft.selected_enemy_support_source = "UNKNOWN"
 
     def _copy_memory_prompt(self) -> None:
         prompt = build_memory_prompt()
@@ -13711,7 +14676,7 @@ class AdvisorApp:
         self._recommendation_apply_error = ""
         self.codex_recommend_button.configure(state="disabled", text="Codex 분석 중…")
         self.codex_cli_status_label.configure(
-            text="Luna/none 초고속 · 현재 드래프트만 분석 중…",
+            text="Luna/none · 규칙+현재 드래프트만 빠르게 분석 중…",
             fg=COLORS["blue"],
         )
         self.exchange_status.configure(
@@ -14197,7 +15162,7 @@ class AdvisorApp:
 
     def _open_settings(self) -> None:
         dialog = tk.Toplevel(self.root)
-        dialog.title("Riot API · Codex CLI 설정")
+        dialog.title(self._tr("Riot API · Codex CLI 설정"))
         dialog.configure(bg=COLORS["panel"])
         dialog.geometry("760x780")
         dialog.minsize(680, 620)
@@ -14238,12 +15203,12 @@ class AdvisorApp:
             ("Codex thread_id", "codex_thread_id", False),
         ]
         entries: dict[str, tk.Entry] = {}
-        tk.Label(settings_body, text="Riot 전적 · Codex 추천 설정", bg=COLORS["panel"], fg=COLORS["gold"],
+        tk.Label(settings_body, text=self._tr("Riot 전적 · Codex 추천 설정"), bg=COLORS["panel"], fg=COLORS["gold"],
                  font=("Malgun Gothic", 14, "bold")).pack(anchor="w", padx=20, pady=(18, 12))
         form = tk.Frame(settings_body, bg=COLORS["panel"])
         form.pack(fill="x", padx=20)
         for row, (label, key, secret) in enumerate(fields):
-            tk.Label(form, text=label, bg=COLORS["panel"], fg=COLORS["muted"], width=15,
+            tk.Label(form, text=self._tr(label), bg=COLORS["panel"], fg=COLORS["muted"], width=15,
                      anchor="w", font=("Malgun Gothic", 9)).grid(row=row, column=0, sticky="w", pady=6)
             entry = tk.Entry(form, bg="#0b1220", fg=COLORS["text"], insertbackground=COLORS["text"],
                              relief="flat", show="*" if secret else "", font=("Malgun Gothic", 10))
@@ -14254,11 +15219,42 @@ class AdvisorApp:
         form.grid_columnconfigure(1, weight=1)
         tk.Label(
             settings_body,
-            text=("게임 이름과 태그는 롤 클라이언트에서 자동 감지됩니다.\n"
-                  "API 키가 이미 저장되어 있으면 입력란은 비워 두세요. 새 키만 입력하면 교체됩니다.\n"
-                  "Codex thread_id와 개발 키는 이 PC의 data/advisor.db에만 저장됩니다."),
+            text=self._tr(
+                "게임 이름과 태그는 롤 클라이언트에서 자동 감지됩니다.\n"
+                "API 키가 이미 저장되어 있으면 입력란은 비워 두세요. 새 키만 입력하면 교체됩니다.\n"
+                "Codex thread_id와 개발 키는 이 PC의 data/advisor.db에만 저장됩니다."
+            ),
             bg=COLORS["panel"], fg=COLORS["orange"], font=("Malgun Gothic", 8),
         ).pack(anchor="w", padx=20, pady=(8, 12))
+
+        language_outer = tk.Frame(
+            settings_body, bg=COLORS["border"], padx=1, pady=1,
+        )
+        language_outer.pack(fill="x", padx=20, pady=(0, 12))
+        language_panel = tk.Frame(
+            language_outer, bg=COLORS["panel_2"], padx=14, pady=11,
+        )
+        language_panel.pack(fill="x")
+        tk.Label(
+            language_panel, text=self._tr("화면 언어"),
+            bg=COLORS["panel_2"], fg=COLORS["blue"],
+            font=("Malgun Gothic", 9, "bold"), width=15, anchor="w",
+        ).pack(side="left")
+        language_var = tk.StringVar(
+            value=LANGUAGE_LABELS.get(self.ui_language, "한국어")
+        )
+        language_combo = ttk.Combobox(
+            language_panel, textvariable=language_var,
+            values=[LANGUAGE_LABELS["ko"], LANGUAGE_LABELS["en"]],
+            state="readonly", width=16, font=("Malgun Gothic", 9),
+        )
+        language_combo.pack(side="left", ipady=4)
+        tk.Label(
+            language_panel,
+            text=self._tr("언어 변경은 저장 즉시 적용되고 다음 실행에도 유지됩니다."),
+            bg=COLORS["panel_2"], fg=COLORS["muted"],
+            font=("Malgun Gothic", 8),
+        ).pack(side="left", padx=(12, 0))
 
         feature_outer = tk.Frame(
             settings_body, bg=COLORS["border"], padx=1, pady=1,
@@ -14269,13 +15265,13 @@ class AdvisorApp:
         )
         feature_panel.pack(fill="x")
         tk.Label(
-            feature_panel, text="자동화 · AI 기능 허용",
+            feature_panel, text=self._tr("자동화 · AI 기능 허용"),
             bg=COLORS["panel_2"], fg=COLORS["purple"],
             font=("Malgun Gothic", 10, "bold"),
         ).pack(anchor="w")
         tk.Label(
             feature_panel,
-            text=(
+            text=self._tr(
                 "픽 추천은 명시적으로 허용한 경우에만 선택창에 표시되고 Codex CLI로 전송됩니다. "
                 "자동 밴은 아래에서 선택한 챔피언을 사용합니다."
             ),
@@ -14288,7 +15284,7 @@ class AdvisorApp:
             value=bool(self.codex_recommendations_enabled)
         )
         codex_check = tk.Checkbutton(
-            feature_grid, text="픽 추천 사용 (Codex CLI)",
+            feature_grid, text=self._tr("픽 추천 사용 (Codex CLI)"),
             variable=codex_enabled_var,
             bg=COLORS["panel_2"], fg=COLORS["text"],
             activebackground=COLORS["panel_2"], activeforeground=COLORS["text"],
@@ -14297,16 +15293,44 @@ class AdvisorApp:
         )
         codex_check.grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 9))
 
+        stop_queue_after_dodge_var = tk.BooleanVar(
+            value=bool(self.stop_queue_after_dodge_enabled)
+        )
+        tk.Checkbutton(
+            feature_grid, text=self._tr("닷지 후 게임찾기 자동 중단"),
+            variable=stop_queue_after_dodge_var,
+            bg=COLORS["panel_2"], fg=COLORS["text"],
+            activebackground=COLORS["panel_2"], activeforeground=COLORS["text"],
+            selectcolor=COLORS["surface_selected"],
+            font=("Malgun Gothic", 9, "bold"), cursor="hand2",
+        ).grid(row=1, column=0, columnspan=2, sticky="w")
         tk.Label(
-            feature_grid, text="자동 밴 챔피언",
+            feature_grid,
+            text=self._tr("기본 OFF · 닷지 후 자동으로 다시 큐를 잡지 않습니다."),
+            bg=COLORS["panel_2"], fg=COLORS["muted"],
+            font=("Malgun Gothic", 8),
+        ).grid(row=2, column=0, columnspan=2, sticky="w", pady=(2, 9))
+
+        tk.Label(
+            feature_grid, text=self._tr("자동 밴 챔피언"),
             bg=COLORS["panel_2"], fg=COLORS["text"],
             font=("Malgun Gothic", 9, "bold"), width=15, anchor="w",
-        ).grid(row=1, column=0, sticky="w")
+        ).grid(row=3, column=0, sticky="w")
+        auto_ban_rows = sorted(
+            self.registry.by_id.items(),
+            key=(
+                (lambda item: item[0].casefold())
+                if self.ui_language == "en"
+                else (lambda item: item[1][1])
+            ),
+        )
         auto_ban_choices = [
-            (f"{name_ko} · {champion_id}", int(champion_key))
-            for champion_id, (champion_key, name_ko) in sorted(
-                self.registry.by_id.items(), key=lambda item: item[1][1]
+            (
+                champion_id if self.ui_language == "en"
+                else f"{name_ko} · {champion_id}",
+                int(champion_key),
             )
+            for champion_id, (champion_key, name_ko) in auto_ban_rows
         ]
         auto_ban_key_by_label = dict(auto_ban_choices)
         selected_auto_ban_label = next(
@@ -14314,7 +15338,7 @@ class AdvisorApp:
                 label for label, key in auto_ban_choices
                 if key == self._auto_ban_champion()[0]
             ),
-            "럭스 · Lux",
+            "Lux" if self.ui_language == "en" else "럭스 · Lux",
         )
         auto_ban_choice_var = tk.StringVar(value=selected_auto_ban_label)
         auto_ban_combo = ttk.Combobox(
@@ -14322,7 +15346,7 @@ class AdvisorApp:
             values=[label for label, _key in auto_ban_choices],
             state="readonly", width=34, font=("Malgun Gothic", 9),
         )
-        auto_ban_combo.grid(row=1, column=1, sticky="ew", padx=(8, 0), ipady=4)
+        auto_ban_combo.grid(row=3, column=1, sticky="ew", padx=(8, 0), ipady=4)
         feature_grid.columnconfigure(1, weight=1)
 
         data_outer = tk.Frame(
@@ -14336,13 +15360,13 @@ class AdvisorApp:
         data_heading = tk.Frame(data_panel, bg=COLORS["panel_2"])
         data_heading.pack(fill="x")
         tk.Label(
-            data_heading, text="데이터 재사용 · 표시 설정",
+            data_heading, text=self._tr("데이터 재사용 · 표시 설정"),
             bg=COLORS["panel_2"], fg=COLORS["green"],
             font=("Malgun Gothic", 10, "bold"),
         ).pack(side="left")
         tk.Label(
             data_panel,
-            text=(
+            text=self._tr(
                 "오래된 로컬 데이터는 즉시 보여 주고, 아래 시간이 지난 뒤에만 "
                 "같은 외부 요청을 다시 보냅니다. (24시간=1일, 재요청 1~720시간 · 메타 1~20개)"
             ),
@@ -14363,7 +15387,7 @@ class AdvisorApp:
                 padx=(0, 12) if index % 2 == 0 else (12, 0), pady=4,
             )
             tk.Label(
-                card, text=label, bg=COLORS["panel_2"], fg=COLORS["text"],
+                card, text=self._tr(label), bg=COLORS["panel_2"], fg=COLORS["text"],
                 font=("Malgun Gothic", 8, "bold"), width=21, anchor="w",
             ).pack(side="left")
             entry = tk.Entry(
@@ -14374,7 +15398,7 @@ class AdvisorApp:
             entry.insert(0, str(self._data_preference(key)))
             entry.pack(side="left", ipady=4)
             tk.Label(
-                card, text=unit, bg=COLORS["panel_2"], fg=COLORS["muted"],
+                card, text=self._tr(unit), bg=COLORS["panel_2"], fg=COLORS["muted"],
                 font=("Malgun Gothic", 8),
             ).pack(side="left", padx=(5, 0))
             data_entries[key] = entry
@@ -14568,7 +15592,9 @@ class AdvisorApp:
             puuid: str = "", codex_thread_id: str = "",
             data_preferences: dict[str, int] | None = None,
             codex_recommendations_enabled: bool = False,
+            stop_queue_after_dodge_enabled: bool = False,
             auto_ban_champion_key: int = 99,
+            ui_language: str = "ko",
         ) -> None:
             self.storage.set_setting("riot_game_name", game_name)
             self.storage.set_setting("riot_tag_line", tag_line)
@@ -14593,12 +15619,23 @@ class AdvisorApp:
                 "codex_recommendations_enabled",
                 "1" if self.codex_recommendations_enabled else "0",
             )
+            self.stop_queue_after_dodge_enabled = bool(
+                stop_queue_after_dodge_enabled
+            )
+            self.storage.set_setting(
+                "stop_queue_after_dodge_enabled",
+                "1" if self.stop_queue_after_dodge_enabled else "0",
+            )
+            self.ui_language = normalize_language(ui_language)
+            self.storage.set_setting("ui_language", self.ui_language)
             self._set_auto_ban_champion(auto_ban_champion_key)
             self._reload_data_preferences()
             self._tab_build_refresh_attempted.clear()
             self._synergy_checked_adc = ""
             self._opgg_profiles_checked_signature = ""
-            self._selection_panel_signatures.pop("meta", None)
+            self._selection_panel_signatures.clear()
+            self._hover_matchup_signature = ""
+            self._lux_auto_ban_display_signature = None
             self._apply_codex_recommendation_visibility()
             dialog.destroy()
             status_text = (
@@ -14606,7 +15643,11 @@ class AdvisorApp:
             )
             self.exchange_status.configure(text=status_text, fg=COLORS["green"])
             self._render_header()
-            self._render_opgg_meta()
+            if self._current_main_tab_index() == 0:
+                self._render_selection()
+            else:
+                self._render_opgg_meta()
+            self._apply_language(full=True)
             if (
                 self._cache_manager_window
                 and self._cache_manager_window.winfo_exists()
@@ -14636,13 +15677,23 @@ class AdvisorApp:
                 auto_ban_choice_var.get(), 99,
             )
             codex_allowed = bool(codex_enabled_var.get())
+            stop_after_dodge = bool(stop_queue_after_dodge_var.get())
+            selected_language = next(
+                (
+                    code for code, label in LANGUAGE_LABELS.items()
+                    if label == language_var.get()
+                ),
+                "ko",
+            )
             if not new_api_key:
                 finish_save(
                     game_name, tag_line, "",
                     codex_thread_id=codex_thread_id,
                     data_preferences=data_preferences,
                     codex_recommendations_enabled=codex_allowed,
+                    stop_queue_after_dodge_enabled=stop_after_dodge,
                     auto_ban_champion_key=selected_auto_ban_key,
+                    ui_language=selected_language,
                 )
                 return
             if not game_name or not tag_line:
@@ -14668,10 +15719,14 @@ class AdvisorApp:
                     text="API 키 확인 성공 · 저장합니다.", fg=COLORS["green"]
                 )
                 finish_save(
-                    game_name, tag_line, new_api_key, puuid, codex_thread_id,
-                    data_preferences,
-                    codex_allowed,
-                    selected_auto_ban_key,
+                    game_name, tag_line, new_api_key,
+                    puuid=puuid,
+                    codex_thread_id=codex_thread_id,
+                    data_preferences=data_preferences,
+                    codex_recommendations_enabled=codex_allowed,
+                    stop_queue_after_dodge_enabled=stop_after_dodge,
+                    auto_ban_champion_key=selected_auto_ban_key,
+                    ui_language=selected_language,
                 )
 
             def error(exc: Exception) -> None:
@@ -14994,6 +16049,8 @@ class AdvisorApp:
                     continue
         finally:
             try:
+                if processed:
+                    self._schedule_language_refresh()
                 # Yield immediately after a full slice so mouse/paint events
                 # always get a turn while loaders are publishing.
                 delay = (
@@ -15016,6 +16073,60 @@ class AdvisorApp:
 
         self._background(lambda: self.registry.refresh(), success, lambda _exc: None)
 
+    def _reset_draft_after_dodge(self) -> None:
+        """Clear every champ-select-only value when a draft is dodged."""
+        role = str(getattr(self.draft, "my_role", "SUPPORT") or "SUPPORT")
+        self.draft = DraftSnapshot(my_role=role, connection_state="LOBBY")
+        self.draft.refresh_snapshot_id()
+        self._manual_enemy_support = None
+        self._support_filter = "ALL"
+        self._pending_auto_hover = None
+        self._recommendation_generation += 1
+        self.recommendations = []
+        self.recommendation_snapshot_id = ""
+        self.recommendation_context_signature = ""
+        self._prompt_copied_snapshot_id = ""
+        self._champ_select_inner_phase = ""
+        self._local_pick_action_in_progress = False
+        self.opgg_meta_snapshot = self.storage.load_opgg_snapshot(None, role)
+        self.opgg_snapshot = self.opgg_meta_snapshot
+        self.opgg_synergy_snapshot = None
+        self._synergy_checked_adc = ""
+        self._selection_matchup_refreshing.clear()
+        self._selection_panel_signatures.clear()
+
+    def _stop_matchmaking_after_dodge(self) -> None:
+        if not self.stop_queue_after_dodge_enabled or self.demo:
+            return
+
+        def work() -> bool:
+            # Lobby and Matchmaking can arrive in either order after a dodge.
+            # Retry briefly in a worker so Tk and LCU polling remain responsive.
+            for _attempt in range(18):
+                if not self.stop_queue_after_dodge_enabled:
+                    return False
+                phase = str(self.lcu.get("/lol-gameflow/v1/gameflow-phase"))
+                if phase in {"ReadyCheck", "ChampSelect", "GameStart", "InProgress"}:
+                    return False
+                if phase in {"Lobby", "Matchmaking", "None"}:
+                    try:
+                        self.lcu.stop_matchmaking_search()
+                    except LcuUnavailable:
+                        time.sleep(0.2)
+                        continue
+                    return True
+                time.sleep(0.2)
+            return False
+
+        def success(stopped: bool) -> None:
+            if stopped:
+                self.exchange_status.configure(
+                    text="닷지 감지 · 게임찾기 자동 중단 완료",
+                    fg=COLORS["orange"],
+                )
+
+        self._background(work, success, lambda _exc: None)
+
     def _poll_lcu(self) -> None:
         if self.demo or self._lcu_polling:
             return
@@ -15031,11 +16142,7 @@ class AdvisorApp:
             draft = None
             automation: dict[str, object] = {}
             if phase == "ReadyCheck" and auto_accept_enabled:
-                try:
-                    if self.lcu.accept_ready_check_if_pending():
-                        automation["auto_accept"] = "게임 수락 완료"
-                except LcuUnavailable as exc:
-                    automation["auto_accept_error"] = str(exc)
+                automation["auto_accept_ready"] = True
             if phase == "ChampSelect":
                 session = self.lcu.champ_select_session()
                 draft = parse_lcu_session(session, self.registry)
@@ -15091,6 +16198,11 @@ class AdvisorApp:
             draft_changed = False
             swap_state_changed = False
             active_game_phases = {"GameStart", "Reconnect", "InProgress"}
+            draft_dodged = bool(
+                previous_phase == "ChampSelect"
+                and phase != "ChampSelect"
+                and phase not in active_game_phases
+            )
             if phase in active_game_phases and previous_phase not in active_game_phases:
                 # This is intentionally a local cache read and a tiny SQLite
                 # write. It must finish before we publish InProgress so the
@@ -15099,22 +16211,18 @@ class AdvisorApp:
                     force_new=previous_phase == "ChampSelect"
                 )
             self.game_phase = phase
-            if automation.get("auto_accept"):
-                self._auto_accept_status = str(automation["auto_accept"])
+            if draft_dodged:
+                self._reset_draft_after_dodge()
+                if self.stop_queue_after_dodge_enabled:
+                    self.root.after(250, self._stop_matchmaking_after_dodge)
+            if automation.get("auto_accept_ready"):
+                self._ensure_auto_accept_monitor()
+            elif phase != "ReadyCheck":
+                self._reset_auto_accept_cycle()
             lux_session = automation.get("lux_session")
             if isinstance(lux_session, dict):
                 self._ensure_lux_auto_ban_monitor(
                     int(automation.get("lux_action_id") or 0), lux_session,
-                )
-            auto_accept_error = automation.get("auto_accept_error")
-            if auto_accept_error:
-                self.auto_accept_enabled = False
-                self.storage.set_setting("auto_accept_enabled", "0")
-                self._auto_accept_status = "실패 후 자동 OFF"
-                messagebox.showwarning(
-                    "자동 수락 실패",
-                    f"{auto_accept_error} 롤 클라이언트에서 직접 수락해 주세요. 자동 수락을 OFF로 바꿨습니다.",
-                    parent=self.root,
                 )
             if identity:
                 game_name = str(identity.get("gameName") or "").strip()
@@ -15130,6 +16238,12 @@ class AdvisorApp:
                 if self._identity_checked:
                     self._schedule_non_owner_prune(25)
             if phase == "ChampSelect" and draft:
+                if previous_phase != "ChampSelect":
+                    # A newly opened draft is definitive proof that an older
+                    # loading-roster record must not be reused, even in the
+                    # extraordinarily unlikely case of identical champions.
+                    self._clear_live_roster_identities()
+                    self._manual_enemy_support = None
                 role_changed = draft.my_role != self.draft.my_role
                 old_pick_order = self.draft.my_pick_order
                 old_local_cell = self.draft.local_player_cell_id
@@ -15202,7 +16316,7 @@ class AdvisorApp:
                 self.draft.connection_state = "IN_GAME"
                 if previous_phase != "InProgress":
                     self.notebook.select(self.play_tab)
-                    self.root.after(250, self._poll_live)
+                    self.root.after(35, self._poll_live)
             else:
                 self._pending_auto_hover = None
                 if previous_phase == "InProgress":
@@ -15224,6 +16338,11 @@ class AdvisorApp:
                     self._live_active_signature = ""
                 if phase not in {"GameStart", "Reconnect"}:
                     self.draft.connection_state = "LOBBY"
+            if phase in {"GameStart", "Reconnect", "InProgress"}:
+                # Privacy mode can expose the ten Riot IDs for only a moment on
+                # the loading screen. A tiny player-list watcher captures that
+                # local response independently of Tk rendering and remote APIs.
+                self._start_live_identity_capture()
             if phase_changed:
                 self._render_all()
             elif draft_changed or swap_state_changed:
@@ -15248,7 +16367,11 @@ class AdvisorApp:
                 and draft.pick_order_swap_state in {"SENT", "RECEIVED", "ACCEPTED"}
             )
             self.root.after(
-                140 if pending_swap else (350 if phase == "ChampSelect" else 1400),
+                (
+                    140 if pending_swap else
+                    220 if phase == "ReadyCheck" else
+                    350 if phase == "ChampSelect" else 1400
+                ),
                 self._poll_lcu,
             )
 
@@ -15287,13 +16410,121 @@ class AdvisorApp:
 
         self._background(work, success, error)
 
+    def _clear_live_roster_identities(self) -> None:
+        with self._live_identity_lock:
+            self._live_identity_generation += 1
+            self._live_identity_payload = None
+            self.storage.set_setting(LIVE_IDENTITY_CACHE_SETTING, "")
+
+    def _remember_live_roster_identities(
+        self,
+        snapshot: LiveGameSnapshot,
+        generation: int | None = None,
+    ) -> int:
+        """Persist only Riot IDs actually observed from the current roster."""
+        with self._live_identity_lock:
+            if (
+                generation is not None
+                and generation != self._live_identity_generation
+            ):
+                return 0
+            previous = self._live_identity_payload
+            updated = update_live_identity_payload(snapshot, previous)
+            if updated is not previous:
+                self._live_identity_payload = updated
+                if updated is not None:
+                    self.storage.set_setting(
+                        LIVE_IDENTITY_CACHE_SETTING,
+                        json.dumps(updated, ensure_ascii=False, separators=(",", ":")),
+                    )
+            if (
+                not isinstance(updated, dict)
+                or str(updated.get("fingerprint") or "")
+                != live_roster_fingerprint(snapshot)
+            ):
+                return 0
+            return len(updated.get("players") or [])
+
+    def _restore_live_roster_identities(
+        self, snapshot: LiveGameSnapshot,
+    ) -> LiveGameSnapshot:
+        with self._live_identity_lock:
+            payload = self._live_identity_payload
+        return merge_live_roster_identities(snapshot, payload)
+
+    def _start_live_identity_capture(self) -> None:
+        """Catch the short loading-screen identity window off the Tk thread."""
+        if self.demo:
+            return
+        with self._live_identity_capture_lock:
+            if self._live_identity_capture_running:
+                return
+            self._live_identity_capture_running = True
+        with self._live_identity_lock:
+            capture_generation = self._live_identity_generation
+
+        def runner() -> None:
+            started_at = time.monotonic()
+            first_success_at: float | None = None
+            last_fingerprint = ""
+            last_known = 0
+            inactive_since: float | None = None
+            try:
+                while time.monotonic() - started_at < LIVE_IDENTITY_CAPTURE_MAX_SECONDS:
+                    with self._live_identity_lock:
+                        if capture_generation != self._live_identity_generation:
+                            break
+                    now = time.monotonic()
+                    if self.game_phase not in {"GameStart", "Reconnect", "InProgress"}:
+                        inactive_since = inactive_since or now
+                        if now - inactive_since >= 2.0:
+                            break
+                    else:
+                        inactive_since = None
+                    try:
+                        snapshot = self.live_client.identity_snapshot()
+                    except LiveClientUnavailable:
+                        time.sleep(0.25)
+                        continue
+                    fingerprint = live_roster_fingerprint(snapshot)
+                    if fingerprint != last_fingerprint:
+                        first_success_at = now
+                        last_fingerprint = fingerprint
+                    elif first_success_at is None:
+                        first_success_at = now
+                    known = self._remember_live_roster_identities(
+                        snapshot, capture_generation,
+                    )
+                    if known > last_known:
+                        last_known = known
+                        self._post_ui(self._poll_live)
+                    player_count = len(snapshot.players)
+                    if player_count and known >= player_count:
+                        break
+                    if first_success_at is not None and now - first_success_at >= LIVE_IDENTITY_CAPTURE_FAST_SECONDS:
+                        break
+                    time.sleep(0.10)
+            finally:
+                with self._live_identity_capture_lock:
+                    self._live_identity_capture_running = False
+
+        threading.Thread(
+            target=runner, name="live-identity-capture", daemon=True,
+        ).start()
+
     def _poll_live(self) -> None:
         if self.demo or self.game_phase != "InProgress" or self._live_polling:
             return
         self._live_polling = True
 
+        def work() -> LiveGameSnapshot:
+            snapshot = self.live_client.snapshot()
+            self._remember_live_roster_identities(snapshot)
+            return snapshot
+
         def success(snapshot: LiveGameSnapshot) -> None:
             self._live_polling = False
+            snapshot = self._restore_live_roster_identities(snapshot)
             self._attach_draft_pick_context(snapshot)
             signature = live_roster_signature(snapshot)
             active_signature = live_active_context_signature(snapshot)
@@ -15348,13 +16579,22 @@ class AdvisorApp:
                 # The roster and every analysis input are unchanged.  Only the
                 # game clock needs a cheap update on the steady 3-second poll.
                 self._render_live_game_clock()
-            self.root.after(3000, self._poll_live)
+            known_identities = live_identity_count(snapshot)
+            retry_delay = (
+                140 if snapshot.game_time <= 5.0
+                and known_identities < len(snapshot.players)
+                else 3000
+            )
+            self.root.after(retry_delay, self._poll_live)
 
         def error(_exc: Exception) -> None:
             self._live_polling = False
-            self.root.after(1800, self._poll_live)
+            # The first Live Client endpoint can appear partway through the
+            # loading screen. Retry quickly before the brief Riot-ID window is
+            # redacted; steady-state failures retain the old, slower cadence.
+            self.root.after(140 if not self.live_game.players else 1800, self._poll_live)
 
-        self._background(self.live_client.snapshot, success, error)
+        self._background(work, success, error)
 
     def _profile_with_opgg(
         self,
@@ -15363,6 +16603,18 @@ class AdvisorApp:
         player: LivePlayer,
     ) -> PlayerProfileStat:
         """Overlay OP.GG season data without discarding Riot/local relationships."""
+        if opgg_profile.status == "PRIVATE_OR_UNAVAILABLE":
+            if base.status in {"OK", "LOCAL_ONLY", "PARTIAL"}:
+                return replace(
+                    base,
+                    champion_source_detail="OP.GG 비공개/조회 불가 · Riot 캐시 사용",
+                )
+            return replace(
+                base,
+                champion_data_source="PRIVATE_OR_UNAVAILABLE",
+                sample_scope="계정 비공개 또는 조회 불가",
+                status="PRIVATE_OR_UNAVAILABLE",
+            )
         tier = base.tier
         rank = base.rank
         league_points = base.league_points
@@ -15472,12 +16724,24 @@ class AdvisorApp:
         self._opgg_profiles_loading = True
         self._opgg_profile_reload_requested = False
         signature = self._live_signature
-        players = list(self.live_game.players)
+        players = [
+            player for player in self.live_game.players
+            if live_identity_available(player)
+        ]
+        if not players:
+            self._opgg_profiles_loading = False
+            self._opgg_profiles_checked_signature = self._live_signature
+            self.live_profile_status.configure(
+                text="로딩 구간에서 Riot ID를 확인하지 못했습니다 · 비공개 표시 유지",
+                fg=COLORS["muted"],
+            )
+            return
 
         def work() -> tuple[int, int, int, str]:
             cached_count = refreshed_count = failure_count = 0
             last_error = ""
             refresh_players: list[LivePlayer] = []
+            cached_riot_ids: set[str] = set()
             for player in players:
                 fresh = self.storage.load_opgg_player_profile(
                     player.riot_id,
@@ -15490,6 +16754,7 @@ class AdvisorApp:
                 )
                 if cached:
                     cached_count += 1
+                    cached_riot_ids.add(player.riot_id)
                     self._post_ui(
                         lambda riot_id=player.riot_id, profile=cached:
                         self._apply_opgg_live_profile(riot_id, profile, signature)
@@ -15540,6 +16805,26 @@ class AdvisorApp:
                         except (OpggMcpError, ValueError, TypeError) as exc:
                             failure_count += 1
                             last_error = str(exc)
+                            if (
+                                player.riot_id not in cached_riot_ids
+                                and opgg_account_unavailable_error(exc)
+                            ):
+                                unavailable = OpggMcpSummonerProfile(
+                                    riot_id=player.riot_id,
+                                    game_name=player.riot_game_name,
+                                    tag_line=player.riot_tag_line,
+                                    region="KR",
+                                    fetched_at=datetime.now().isoformat(timespec="seconds"),
+                                    recent_matches_status="ERROR",
+                                    status="PRIVATE_OR_UNAVAILABLE",
+                                )
+                                self.storage.save_opgg_player_profile(unavailable)
+                                self._post_ui(
+                                    lambda riot_id=player.riot_id, value=unavailable:
+                                    self._apply_opgg_live_profile(
+                                        riot_id, value, signature,
+                                    )
+                                )
             return cached_count, refreshed_count, failure_count, last_error
 
         def success(result: tuple[int, int, int, str]) -> None:
@@ -15606,6 +16891,15 @@ class AdvisorApp:
             # Phase 1: one cheap cache lookup per player. These partial profiles
             # are posted before any match-history scans begin.
             for player in players:
+                if not live_identity_available(player):
+                    cached_rows.append((player, "", {}, ""))
+                    self._post_ui(
+                        lambda riot_id=player.riot_id:
+                        self._apply_live_profile(
+                            riot_id, unavailable_player_profile(), signature,
+                        )
+                    )
+                    continue
                 cached = self.storage.load_live_profile_any_age(player.riot_id)
                 if cached:
                     puuid, payload, updated_at = cached
@@ -15944,6 +17238,25 @@ class AdvisorApp:
             or self._duo_checked_signature == self._live_signature
         ):
             return
+        signature = self._live_signature
+        players = sorted(
+            (
+                player for player in self.live_game.players
+                if live_identity_available(player)
+            ),
+            key=lambda player: (
+                not player.is_active_player,
+                player.team != self.live_game.active_team,
+                player.position,
+            ),
+        )
+        if not players:
+            self._duo_checked_signature = self._live_signature
+            self.live_duo_status.configure(
+                text="DUO 확인 불가 · 로딩 구간 Riot ID가 비공개였습니다.",
+                fg=COLORS["muted"],
+            )
+            return
         api_key = self.storage.get_setting("riot_api_key")
         if not api_key or self.storage.riot_api_key_needs_refresh():
             self.live_duo_status.configure(
@@ -15951,15 +17264,6 @@ class AdvisorApp:
                 fg=COLORS["red"],
             )
             return
-        signature = self._live_signature
-        players = sorted(
-            self.live_game.players,
-            key=lambda player: (
-                not player.is_active_player,
-                player.team != self.live_game.active_team,
-                player.position,
-            ),
-        )
         active_team = self.live_game.active_team
         team_groups = self._live_team_groups(players, active_team)
         self._duo_checking = True
@@ -15983,7 +17287,28 @@ class AdvisorApp:
                     continue
                 puuid = self.storage.find_puuid_by_riot_id(player.riot_id)
                 if not puuid:
-                    account = client.resolve_account(player.riot_game_name, player.riot_tag_line)
+                    try:
+                        account = client.resolve_account(
+                            player.riot_game_name, player.riot_tag_line,
+                        )
+                    except RiotApiError as exc:
+                        if riot_authentication_error(exc):
+                            raise
+                        histories[player.riot_id] = []
+                        self._post_ui(
+                            lambda riot_id=player.riot_id:
+                            self._apply_live_profile(
+                                riot_id, unavailable_player_profile(), signature,
+                            )
+                        )
+                        self._post_ui(
+                            lambda done=index, total=len(players):
+                            self.live_duo_status.configure(
+                                text=f"Riot 현 챔프 표본·DUO 확인 중 {done}/{total}명",
+                                fg=COLORS["blue"],
+                            )
+                        )
+                        continue
                     puuid = str(account.get("puuid") or "")
                     if puuid:
                         self.storage.save_player_identity(player.riot_id, puuid)
@@ -15999,7 +17324,15 @@ class AdvisorApp:
                     )
                     payload = dict(existing[1]) if existing else {}
                     if not recent_profile:
-                        entries = client.league_entries_by_puuid(puuid, platform="kr")
+                        try:
+                            entries = client.league_entries_by_puuid(
+                                puuid, platform="kr",
+                            )
+                        except RiotApiError as exc:
+                            if riot_authentication_error(exc):
+                                raise
+                            entries = []
+                            payload["rank_unavailable"] = True
                         solo_entry = next(
                             (
                                 entry for entry in entries
@@ -16039,7 +17372,9 @@ class AdvisorApp:
                             self.storage.save_live_profile(
                                 player.riot_id, puuid, payload
                             )
-                        except RiotApiError:
+                        except RiotApiError as exc:
+                            if riot_authentication_error(exc):
+                                raise
                             history = stale_history
                     histories[player.riot_id] = history
                     remote_sample = (
@@ -16056,7 +17391,13 @@ class AdvisorApp:
                                 continue
                             if fetched_details >= LIVE_PROFILE_DETAIL_BUDGET:
                                 break
-                            self.storage.save_matches([client.match(match_id)])
+                            try:
+                                detail = client.match(match_id)
+                            except RiotApiError as exc:
+                                if riot_authentication_error(exc):
+                                    raise
+                                continue
+                            self.storage.save_matches([detail])
                             fetched_details += 1
                         inspected, champion_games, champion_wins = (
                             self.storage.player_champion_record_for_matches(
@@ -16124,7 +17465,12 @@ class AdvisorApp:
                             if match is None:
                                 if fetched_details >= LIVE_TOTAL_DETAIL_BUDGET:
                                     break
-                                match = client.match(match_id)
+                                try:
+                                    match = client.match(match_id)
+                                except RiotApiError as exc:
+                                    if riot_authentication_error(exc):
+                                        raise
+                                    continue
                                 self.storage.save_matches([match])
                                 fetched_details += 1
                             participants = match.get("info", {}).get("participants", [])

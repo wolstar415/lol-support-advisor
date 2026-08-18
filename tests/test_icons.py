@@ -193,6 +193,35 @@ class FailedIconCallbackTests(unittest.TestCase):
                 cache._ready.get_nowait()
             self.assertEqual(callbacks, [])
 
+
+class LocalizedItemMetadataTests(unittest.TestCase):
+    def test_english_item_name_and_tooltip_use_cached_en_us_catalog(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = ChampionRegistry(Path(temp_dir) / "champions.json")
+            registry.version = "16.16"
+            cache = ItemIconCache(
+                _FakeRoot(), registry, Path(temp_dir) / "items",
+            )
+            cache._apply_localized_metadata({
+                "data": {
+                    "3070": {
+                        "name": "Tear of the Goddess",
+                        "plaintext": "Increases maximum mana",
+                        "description": "<mainText>Gain <attention>Mana</attention></mainText>",
+                        "gold": {"total": 400},
+                    },
+                },
+            }, "16.16", "en_US")
+
+            self.assertEqual(
+                cache.localized_item_name(3070, "en", "여신의 눈물"),
+                "Tear of the Goddess",
+            )
+            tooltip = cache.localized_tooltip_text(3070, "en")
+            self.assertIn("Tear of the Goddess", tooltip)
+            self.assertIn("Cost 400 gold", tooltip)
+            self.assertNotIn("여신", tooltip)
+
     def test_remote_failure_and_invalid_input_do_not_queue_callbacks(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             cache = RemoteIconCache(_FakeRoot(), Path(temp_dir) / "remote")

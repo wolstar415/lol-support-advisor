@@ -116,27 +116,55 @@ class CodexCliClient:
             + "\n\n지금은 1회 규칙 등록 단계다. 파일·명령·웹 도구를 사용하지 말고 "
               "LOL_PICK_MEMORY_READY 한 줄만 답해."
         )
-        return self._run_turn(prompt, thread_id.strip())
+        # Always create a clean memory-only base. Reusing an old recommendation
+        # thread makes every later turn slower as draft history accumulates.
+        return self._run_turn(prompt, "")
 
     def recommend(self, thread_id: str, prompt: str) -> CodexTurn:
         if not thread_id.strip():
             raise CodexCliError(
                 "저장된 thread_id가 없습니다. Riot 설정에서 1회 규칙 보내기를 먼저 누르세요."
             )
-        return self._run_turn(prompt, thread_id.strip())
+        # Resume the memory-only base ephemerally. The recommendation answer is
+        # not appended to that base, so the next request stays equally small.
+        return self._run_turn(
+            prompt, thread_id.strip(), ephemeral=True,
+            preserve_thread_id=True,
+        )
 
-    def _run_turn(self, prompt: str, thread_id: str) -> CodexTurn:
+    def _run_turn(
+        self,
+        prompt: str,
+        thread_id: str,
+        *,
+        ephemeral: bool = False,
+        preserve_thread_id: bool = False,
+    ) -> CodexTurn:
         try:
-            return self._run_turn_once(prompt, thread_id, self.model)
+            return self._run_turn_once(
+                prompt, thread_id, self.model,
+                ephemeral=ephemeral,
+                preserve_thread_id=preserve_thread_id,
+            )
         except CodexCliError as exc:
             if not self._looks_like_model_error(str(exc)):
                 raise
             # Older plans/CLI releases may not expose the preferred fast model.
             # Retrying without -m lets the signed-in account choose its default.
-            return self._run_turn_once(prompt, thread_id, "")
+            return self._run_turn_once(
+                prompt, thread_id, "",
+                ephemeral=ephemeral,
+                preserve_thread_id=preserve_thread_id,
+            )
 
     def _run_turn_once(
-        self, prompt: str, thread_id: str, model: str,
+        self,
+        prompt: str,
+        thread_id: str,
+        model: str,
+        *,
+        ephemeral: bool = False,
+        preserve_thread_id: bool = False,
     ) -> CodexTurn:
         if thread_id:
             args = [
@@ -151,6 +179,8 @@ class CodexCliClient:
             ]
         if model:
             args.extend(("--model", model))
+        if ephemeral:
+            args.append("--ephemeral")
         args.extend(("--config", f'model_reasoning_effort="{FAST_REASONING_EFFORT}"'))
         if thread_id:
             args.extend((thread_id, "-"))
@@ -161,6 +191,10 @@ class CodexCliClient:
         if result.returncode:
             raise CodexCliError(self._friendly_error(result.stderr, result.stdout))
         returned_thread_id, message = parse_codex_jsonl(result.stdout, thread_id)
+        if preserve_thread_id and thread_id:
+            # An ephemeral resume may announce a transient child id. Keep the
+            # persistent memory-base id for the next recommendation.
+            returned_thread_id = thread_id
         if not returned_thread_id:
             raise CodexCliError("Codex CLI 응답에서 thread_id를 찾지 못했습니다.")
         if not message:

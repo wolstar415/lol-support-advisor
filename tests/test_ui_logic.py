@@ -17,6 +17,7 @@ from lol_support_advisor.ui import (
     behavior_strength_signals, behavior_weakness_signals,
     build_guide_has_statistics, build_loadout_stat_text,
     cache_manager_champion_ids,
+    choose_auto_accept_delay_seconds,
     choose_lux_auto_ban_target_ms,
     final_item_builds, matchup_build_reason,
     game_prediction_display_signature, local_draft_selection,
@@ -30,6 +31,8 @@ from lol_support_advisor.ui import (
     matchup_counter_for_candidate,
     opgg_recent_form, participant_performance_ranks, representative_build_item,
     recent_match_ids_from_payload, streak_badge_text, support_archetype,
+    opgg_account_unavailable_error, riot_authentication_error,
+    unavailable_player_profile,
     recommendation_action_available, recommendation_draft_context_signature,
     exact_lp_badge_text, recent_exact_lp_summary, recent_prediction_accuracy,
     team_objective_counts, duo_group_visuals,
@@ -39,6 +42,8 @@ from lol_support_advisor.history import (
 )
 from lol_support_advisor.icons import ItemIconCache
 from lol_support_advisor.player_history import OtherPlayerHistoryPager
+from lol_support_advisor.opgg_mcp import OpggMcpError
+from lol_support_advisor.riot_api import RiotApiError
 from lol_support_advisor.storage import Storage
 from lol_support_advisor.models import (
     BuildAsset, BuildItemGroup, ChampionBuildGuide, DraftBan, DraftMember,
@@ -53,6 +58,118 @@ from lol_support_advisor.models import (
 
 
 class DuoEvidenceTests(unittest.TestCase):
+    def test_auto_accept_uses_a_small_human_delay(self) -> None:
+        seen: list[tuple[float, float]] = []
+
+        def picker(minimum: float, maximum: float) -> float:
+            seen.append((minimum, maximum))
+            return 1.75
+
+        self.assertEqual(choose_auto_accept_delay_seconds(picker), 1.75)
+        self.assertEqual(seen, [(1.3, 2.2)])
+
+    def test_manual_enemy_selection_survives_a_transient_empty_snapshot(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._manual_enemy_support = "Leona"
+        app._support_catalog_ids = None
+        app.registry = SimpleNamespace(
+            ko_name=lambda champion_id: {"Leona": "레오나"}.get(
+                champion_id, champion_id,
+            ),
+            support_score=lambda _champion_id: 0,
+        )
+        app.storage = SimpleNamespace(load_opgg_position_catalog=lambda *_args, **_kwargs: None)
+        draft = DraftSnapshot(my_role="SUPPORT")
+
+        app._auto_select_enemy_support(draft)
+
+        self.assertEqual(draft.selected_enemy_support_id, "Leona")
+        self.assertEqual(draft.selected_enemy_support_source, "MANUAL_ENEMY_SUPPORT")
+
+    def test_support_catalog_can_infer_enemy_support_without_role_metadata(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._manual_enemy_support = None
+        app._support_catalog_ids = None
+        app.registry = SimpleNamespace(
+            ko_name=lambda champion_id: champion_id,
+            support_score=lambda _champion_id: 0,
+        )
+        app.storage = SimpleNamespace(
+            load_opgg_position_catalog=lambda *_args, **_kwargs: (
+                "16.16", ["Thresh"],
+            ),
+        )
+        draft = DraftSnapshot(
+            my_role="SUPPORT",
+            enemy_locked=[
+                DraftMember("Aatrox", "아트록스", "UNKNOWN"),
+                DraftMember("Thresh", "쓰레쉬", "UNKNOWN"),
+            ],
+        )
+
+        app._auto_select_enemy_support(draft)
+
+        self.assertEqual(draft.selected_enemy_support_id, "Thresh")
+        self.assertEqual(draft.selected_enemy_support_source, "AUTO_ENEMY_SUPPORT")
+
+    def test_dodge_reset_removes_old_picks_bans_and_recommendations(self) -> None:
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.draft = DraftSnapshot(
+            my_role="JUNGLE",
+            ally_locked=[DraftMember("LeeSin", "리 신", "JUNGLE")],
+            enemy_locked=[DraftMember("Vi", "바이", "JUNGLE")],
+            ally_bans=["Lux"], enemy_bans=["Yuumi"],
+        )
+        cached = object()
+        app.storage = SimpleNamespace(
+            load_opgg_snapshot=lambda enemy_id, role: cached,
+        )
+        app._manual_enemy_support = "Vi"
+        app._support_filter = "ALL"
+        app._pending_auto_hover = (1, "Vi", "바이")
+        app._recommendation_generation = 3
+        app.recommendations = [object()]
+        app.recommendation_snapshot_id = "OLD"
+        app.recommendation_context_signature = "OLD"
+        app._prompt_copied_snapshot_id = "OLD"
+        app._champ_select_inner_phase = "BAN_PICK"
+        app._local_pick_action_in_progress = True
+        app.opgg_meta_snapshot = None
+        app.opgg_snapshot = None
+        app.opgg_synergy_snapshot = object()
+        app._synergy_checked_adc = "Jinx"
+        app._selection_matchup_refreshing = {"Vi"}
+        app._selection_panel_signatures = {"draft": "OLD"}
+
+        app._reset_draft_after_dodge()
+
+        self.assertEqual(app.draft.my_role, "JUNGLE")
+        self.assertEqual(app.draft.connection_state, "LOBBY")
+        self.assertEqual(app.draft.ally_locked, [])
+        self.assertEqual(app.draft.enemy_bans, [])
+        self.assertEqual(app.recommendations, [])
+        self.assertIsNone(app._manual_enemy_support)
+        self.assertIs(app.opgg_snapshot, cached)
+
+    def test_private_player_is_a_per_card_state_not_a_global_failure(self) -> None:
+        self.assertTrue(opgg_account_unavailable_error(
+            OpggMcpError("OP.GG에서 소환사 프로필을 찾지 못했습니다.")
+        ))
+        self.assertFalse(opgg_account_unavailable_error(
+            OpggMcpError("OP.GG MCP 연결 실패 · timeout")
+        ))
+        profile = unavailable_player_profile()
+        self.assertEqual(profile.status, "PRIVATE_OR_UNAVAILABLE")
+        self.assertIn("비공개", profile.sample_scope)
+
+    def test_only_riot_key_errors_abort_the_ten_player_pass(self) -> None:
+        self.assertTrue(riot_authentication_error(
+            RiotApiError("Riot API 키가 만료되었거나 올바르지 않습니다.")
+        ))
+        self.assertFalse(riot_authentication_error(
+            RiotApiError("Riot API 오류: HTTP 404")
+        ))
+
     def test_codex_request_is_blocked_until_user_enables_feature(self) -> None:
         app = AdvisorApp.__new__(AdvisorApp)
         app.codex_recommendations_enabled = False
@@ -1731,6 +1848,9 @@ class DuoEvidenceTests(unittest.TestCase):
         app.game_phase = "InProgress"
         app._live_polling = False
         app.live_client = SimpleNamespace(snapshot=lambda: current)
+        app.storage = SimpleNamespace(set_setting=lambda _key, _value: None)
+        app._live_identity_lock = threading.RLock()
+        app._live_identity_payload = None
         app.root = SimpleNamespace(
             after=lambda delay, callback: scheduled.append((delay, callback))
         )

@@ -307,16 +307,26 @@ class LcuClient:
             raise LcuUnavailable("챔피언 선택 데이터를 읽지 못했습니다.")
         return result
 
-    def accept_ready_check_if_pending(self) -> bool:
-        ready_check = self.get("/lol-matchmaking/v1/ready-check")
-        if not isinstance(ready_check, dict):
-            raise LcuActionError("게임 수락 상태를 읽지 못했습니다.")
-        state = str(ready_check.get("state") or "").lower()
-        response = str(ready_check.get("playerResponse") or "").lower()
-        if state not in {"inprogress", "in_progress"} or response not in {"", "none"}:
-            return False
-        self.request("POST", "/lol-matchmaking/v1/ready-check/accept")
-        return True
+    def accept_ready_check_if_pending(
+        self, *, pre_commit_check: Callable[[], bool] | None = None,
+    ) -> bool:
+        with self._write_lock:
+            ready_check = self.get("/lol-matchmaking/v1/ready-check")
+            if not isinstance(ready_check, dict):
+                raise LcuActionError("게임 수락 상태를 읽지 못했습니다.")
+            state = str(ready_check.get("state") or "").lower()
+            response = str(ready_check.get("playerResponse") or "").lower()
+            if state not in {"inprogress", "in_progress"} or response not in {"", "none"}:
+                return False
+            if pre_commit_check is not None and not pre_commit_check():
+                raise LcuActionStateChanged("자동 수락이 취소되었습니다.")
+            self.request("POST", "/lol-matchmaking/v1/ready-check/accept")
+            return True
+
+    def stop_matchmaking_search(self) -> None:
+        """Stop the lobby's automatic search after a dodged champion select."""
+        with self._write_lock:
+            self.request("DELETE", "/lol-lobby/v2/lobby/matchmaking/search")
 
     @staticmethod
     def _id_set(payload: Any, failure_message: str) -> set[int]:

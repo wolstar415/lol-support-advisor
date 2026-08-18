@@ -379,6 +379,10 @@ class ItemIconCache:
         self._metadata_version = ""
         self._metadata_loading = False
         self._metadata_callbacks: list[Callable[[], None]] = []
+        self._localized_item_data: dict[str, dict[str, dict]] = {}
+        self._localized_metadata_versions: dict[str, str] = {}
+        self._localized_metadata_loading: set[str] = set()
+        self._localized_metadata_callbacks: dict[str, list[Callable[[], None]]] = {}
         self._downloads: queue.Queue[
             tuple[str, Path, str, Callable[[], None] | None]
         ] = queue.Queue()
@@ -388,6 +392,118 @@ class ItemIconCache:
 
     def _metadata_path(self, version: str) -> Path:
         return self.cache_dir / version / "item-ko_KR.json"
+
+    def _localized_metadata_path(self, version: str, locale: str) -> Path:
+        return self.cache_dir / version / f"item-{locale}.json"
+
+    def _apply_localized_metadata(
+        self, payload: dict, version: str, locale: str,
+    ) -> None:
+        data = payload.get("data") or {}
+        if not isinstance(data, dict):
+            return
+        localized = {
+            str(item_id): item
+            for item_id, item in data.items() if isinstance(item, dict)
+        }
+        with self._state_lock:
+            self._localized_item_data[locale] = localized
+            self._localized_metadata_versions[locale] = version
+            callbacks = self._localized_metadata_callbacks.pop(locale, [])
+        for callback in callbacks:
+            callback()
+
+    def _ensure_localized_metadata(
+        self, locale: str, on_ready: Callable[[], None] | None = None,
+    ) -> None:
+        version = self.registry.version
+        with self._state_lock:
+            if (
+                version == "fallback"
+                or self._localized_metadata_versions.get(locale) == version
+            ):
+                return
+            if on_ready:
+                self._localized_metadata_callbacks.setdefault(locale, []).append(on_ready)
+        path = self._localized_metadata_path(version, locale)
+        if path.exists():
+            try:
+                self._apply_localized_metadata(
+                    json.loads(path.read_text(encoding="utf-8")), version, locale,
+                )
+                return
+            except (OSError, ValueError, TypeError):
+                pass
+        with self._state_lock:
+            if locale in self._localized_metadata_loading:
+                return
+            self._localized_metadata_loading.add(locale)
+
+        def download() -> None:
+            try:
+                url = (
+                    f"https://ddragon.leagueoflegends.com/cdn/{version}/"
+                    f"data/{locale}/item.json"
+                )
+                request = Request(url, headers={"User-Agent": "LOL-Support-Advisor/0.2"})
+                with urlopen(
+                    request, timeout=12, context=ssl.create_default_context()
+                ) as response:
+                    payload = json.loads(response.read().decode("utf-8"))
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(".tmp")
+                temporary.write_text(
+                    json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+                )
+                temporary.replace(path)
+                self._ready.put(
+                    lambda payload=payload: self._apply_localized_metadata(
+                        payload, version, locale,
+                    )
+                )
+            except (OSError, ValueError, TypeError):
+                with self._state_lock:
+                    self._localized_metadata_callbacks.pop(locale, None)
+            finally:
+                with self._state_lock:
+                    self._localized_metadata_loading.discard(locale)
+
+        threading.Thread(target=download, daemon=True).start()
+
+    def localized_item_name(
+        self, item_id: int | str, language: str, fallback: str = "",
+        on_ready: Callable[[], None] | None = None,
+    ) -> str:
+        if str(language).casefold() != "en":
+            return self.item_name(item_id, fallback, on_ready)
+        locale = "en_US"
+        self._ensure_localized_metadata(locale, on_ready)
+        with self._state_lock:
+            item = self._localized_item_data.get(locale, {}).get(str(item_id or ""))
+        return str((item or {}).get("name") or f"Item {item_id}")
+
+    def localized_tooltip_text(
+        self, item_id: int | str, language: str,
+    ) -> str:
+        if str(language).casefold() != "en":
+            return self.tooltip_text(item_id)
+        normalized = str(item_id or "")
+        self._ensure_localized_metadata("en_US")
+        with self._state_lock:
+            item = self._localized_item_data.get("en_US", {}).get(normalized)
+        if not item:
+            return f"Item {normalized}\nDescription is not cached yet."
+        name = str(item.get("name") or f"Item {normalized}")
+        plaintext = str(item.get("plaintext") or "").strip()
+        description = self._plain_description(str(item.get("description") or ""))
+        gold = item.get("gold") or {}
+        total_gold = int(gold.get("total") or 0) if isinstance(gold, dict) else 0
+        lines = [name, f"Cost {total_gold:,} gold · ID {normalized}"]
+        if plaintext:
+            lines.append(plaintext)
+        if description and description.casefold() != plaintext.casefold():
+            lines.append(description)
+        return "\n".join(lines)
 
     def _apply_metadata(self, payload: dict, version: str) -> None:
         data = payload.get("data") or {}

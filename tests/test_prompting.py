@@ -58,8 +58,8 @@ class PromptingTests(unittest.TestCase):
 
     @staticmethod
     def _query_payload(prompt: str) -> dict:
-        body = prompt.split("LOL_PICK_QUERY_V5\n", 1)[1].split(
-            "\nEND_LOL_PICK_QUERY_V5", 1
+        body = prompt.split("LOL_PICK_QUERY_V6\n", 1)[1].split(
+            "\nEND_LOL_PICK_QUERY_V6", 1
         )[0]
         return json.loads(body)
 
@@ -76,7 +76,7 @@ class PromptingTests(unittest.TestCase):
 
     def test_memory_prompt_contains_rules_and_response_contract(self) -> None:
         prompt = build_memory_prompt()
-        self.assertIn("LOL_PICK_MEMORY_V5", prompt)
+        self.assertIn("LOL_PICK_MEMORY_V6", prompt)
         self.assertIn("LOCKED는 확정", prompt)
         self.assertIn("아군 원딜 궁합", prompt)
         self.assertIn("LOL_SUPPORT_V2", prompt)

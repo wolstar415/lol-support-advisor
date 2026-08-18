@@ -31,8 +31,8 @@ class FakeLcuClient(LcuClient):
         return None
 
     def request(self, method: str, path: str, payload: object = None) -> object:
-        if method.upper() == "POST":
-            self.writes.append(("POST", path, payload))
+        if method.upper() in {"POST", "DELETE"}:
+            self.writes.append((method.upper(), path, payload))
             return None
         return super().request(method, path, payload)
 
@@ -499,6 +499,24 @@ class LcuActionTests(unittest.TestCase):
         })
         self.assertFalse(accepted.accept_ready_check_if_pending())
         self.assertEqual(accepted.writes, [])
+
+    def test_ready_check_rechecks_toggle_before_accepting(self) -> None:
+        path = "/lol-matchmaking/v1/ready-check"
+        client = FakeLcuClient({
+            path: {"state": "InProgress", "playerResponse": "None"}
+        })
+        with self.assertRaises(LcuActionStateChanged):
+            client.accept_ready_check_if_pending(
+                pre_commit_check=lambda: False,
+            )
+        self.assertEqual(client.writes, [])
+
+    def test_stop_matchmaking_uses_lobby_delete_endpoint(self) -> None:
+        client = FakeLcuClient({})
+        client.stop_matchmaking_search()
+        self.assertEqual(client.writes, [(
+            "DELETE", "/lol-lobby/v2/lobby/matchmaking/search", None,
+        )])
 
 
 class LcuCredentialCacheTests(unittest.TestCase):

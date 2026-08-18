@@ -16,7 +16,7 @@ ROLE_NAMES = {
     "BOTTOM": "원딜", "SUPPORT": "서포터", "UTILITY": "서포터",
 }
 
-MEMORY_PROMPT_VERSION = "5"
+MEMORY_PROMPT_VERSION = "6"
 
 ROLE_DECISION_FOCUS = {
     "TOP": [
@@ -78,8 +78,8 @@ def build_memory_prompt() -> str:
         ],
     }
     return (
-        "LOL_PICK_MEMORY_V5\n"
-        "앞으로 이 채팅에서 LOL_PICK_QUERY_V5가 오면 리그 오브 레전드 픽 추천기로 동작해.\n"
+        "LOL_PICK_MEMORY_V6\n"
+        "앞으로 이 채팅에서 LOL_PICK_QUERY_V6가 오면 리그 오브 레전드 픽 추천기로 동작해.\n"
         + REQUEST_RULES
         + "\nrole은 추천할 내 포지션이고 opponent는 같은 포지션의 상대 챔피언이다. "
           "ally/enemy 항목 형식은 [챔피언ID, 포지션, 상태, 팀내픽순서, 전체픽턴]이다. "
@@ -89,8 +89,8 @@ def build_memory_prompt() -> str:
           "OP.GG 배열의 숫자는 질문에 있는 값만 인용해.\n"
           "답변은 인사말·설명·마크다운 없이 반드시 아래 패턴의 JSON만 출력해.\n"
           "LOL_SUPPORT_V2\n"
-        + json.dumps(response_example, ensure_ascii=False, indent=2)
-        + "\nEND_LOL_SUPPORT_V2\nEND_LOL_PICK_MEMORY_V5"
+        + json.dumps(response_example, ensure_ascii=False, separators=(",", ":"))
+        + "\nEND_LOL_SUPPORT_V2\nEND_LOL_PICK_MEMORY_V6"
     )
 
 
@@ -346,12 +346,12 @@ def build_prompt(
         ),
     }
     return (
-        "LOL_PICK_QUERY_V5\n"
+        "LOL_PICK_QUERY_V6\n"
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
-        + "\nEND_LOL_PICK_QUERY_V5\n"
+        + "\nEND_LOL_PICK_QUERY_V6\n"
           "파일·명령·웹 도구를 사용하지 말고 위 입력만 즉시 판단해. "
-          "기억한 LOL_PICK_MEMORY_V5 규칙대로 현재 역할군과 전체 조합 흐름을 종합해 정확히 3개를 "
-          "LOL_SUPPORT_V2 형식으로만 답해."
+          "기억한 LOL_PICK_MEMORY_V6 규칙대로 현재 역할군과 전체 조합 흐름을 종합해 정확히 3개를 "
+          "LOL_SUPPORT_V2 형식으로만 답해. 각 설명 필드는 20자 이내, 전체 답변은 1400자 이내로 써."
     )
 
 
