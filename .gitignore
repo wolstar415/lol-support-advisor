@@ -13,3 +13,7 @@ venv/
 htmlcov/
 .idea/
 .vscode/
+.release-venv/
+build/
+dist/
+release/
