@@ -408,6 +408,59 @@ class DuoEvidenceTests(unittest.TestCase):
         app._render_draft()
         self.assertEqual(rendered, [("bans", False)])
 
+    def test_draft_slot_refresh_reuses_visible_card_frames(self) -> None:
+        class FakeWidget:
+            def __init__(self, parent=None, **values: object) -> None:
+                self.children: list[FakeWidget] = []
+                self.values = dict(values)
+                self.destroyed = False
+                if parent is not None:
+                    parent.children.append(self)
+
+            def winfo_children(self) -> list[FakeWidget]:
+                return list(self.children)
+
+            def destroy(self) -> None:
+                self.destroyed = True
+
+            def grid_columnconfigure(self, *_args: object, **_values: object) -> None:
+                pass
+
+            def grid(self, *_args: object, **_values: object) -> None:
+                pass
+
+            def pack(self, *_args: object, **_values: object) -> None:
+                pass
+
+            def configure(self, **values: object) -> None:
+                self.values.update(values)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.draft = DraftSnapshot(my_role="SUPPORT")
+        app._text = lambda key, **values: (
+            f"slot-{values.get('order')}" if key == "draft.slot" else key
+        )
+        app._champion_text = lambda champion_id, *_args: str(champion_id)
+        app._selection_icon_ready = lambda _panel: None
+        app._select_enemy_support = lambda _champion_id: None
+        app.icon_cache = SimpleNamespace(get=lambda *_args, **_values: None)
+        frame = FakeWidget()
+
+        with patch("lol_support_advisor.ui.tk.Frame", FakeWidget), patch(
+            "lol_support_advisor.ui.tk.Button", FakeWidget,
+        ):
+            app._render_draft_team_slots(frame, ally=True)
+            first_frames = list(frame.children)
+            app._render_draft_team_slots(frame, ally=True)
+
+        self.assertEqual(len(frame.children), 5)
+        self.assertEqual(frame.children, first_frames)
+        self.assertTrue(all(len(outer.children) == 1 for outer in frame.children))
+        self.assertEqual(
+            [outer.children[0].values.get("text") for outer in frame.children],
+            ["slot-1", "slot-2", "slot-3", "slot-4", "slot-5"],
+        )
+
     def test_lux_auto_ban_target_has_safe_early_window(self) -> None:
         observed: list[tuple[int, int]] = []
 

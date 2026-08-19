@@ -9626,8 +9626,6 @@ class AdvisorApp:
                 COLORS["blue"] if selected or ally else COLORS["red"]
             )
             border = accent if (is_me or selected or state != "EMPTY") else COLORS["border"]
-            outer = tk.Frame(frame, bg=border, padx=1, pady=1)
-            outer.grid(row=0, column=index, sticky="nsew", padx=(0 if index == 0 else 3, 3))
             role = ROLE_LABELS.get(member.role, "?") if member else "?"
             name = (
                 self._champion_text(member.champion_id, member.champion_name_ko)
