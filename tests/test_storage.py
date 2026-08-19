@@ -52,6 +52,24 @@ def match_payload(
 
 
 class StorageTests(unittest.TestCase):
+    def test_canonical_player_puuid_is_not_downgraded_by_private_session_id(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            canonical = "c" * 78
+            transient = "t" * 36
+
+            storage.save_player_identity("Player#KR1", canonical)
+            storage.save_player_identity("Player#KR1", transient)
+            self.assertEqual(
+                storage.find_puuid_by_riot_id("Player#KR1"), canonical,
+            )
+
+            storage.save_player_identity("Other#KR1", transient)
+            storage.save_player_identity("Other#KR1", canonical)
+            self.assertEqual(
+                storage.find_puuid_by_riot_id("Other#KR1"), canonical,
+            )
+
     def test_settings_cache_avoids_repeated_reads_and_persists_new_instances(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             db_path = Path(temp_dir) / "advisor.db"

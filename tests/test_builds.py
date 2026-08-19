@@ -79,7 +79,7 @@ class BuildApplicatorTests(unittest.TestCase):
         method, path, payload = self.lcu.calls[-1]
         self.assertEqual((method, path), ("PUT", "/lol-perks/v1/pages/1"))
         self.assertEqual(payload["selectedPerkIds"][0], 8465)  # type: ignore[index]
-        self.assertEqual(payload["name"], "LOL Advisor")  # type: ignore[index]
+        self.assertEqual(payload["name"], "LOL Advisor - 쓰레쉬")  # type: ignore[index]
         self.assertIn("마지막 룬 페이지", result)
         self.assertFalse(any(call[0] == "POST" for call in self.lcu.calls))
 
@@ -104,9 +104,20 @@ class BuildApplicatorTests(unittest.TestCase):
             ("PUT", "/lol-perks/v1/pages/9"),
             ("PUT", "/lol-perks/v1/pages/9"),
         ])
-        self.assertTrue(all(call[2]["name"] == "LOL Advisor" for call in writes))
+        self.assertEqual(
+            [call[2]["name"] for call in writes],
+            ["LOL Advisor - 쓰레쉬", "LOL Advisor - 레오나"],
+        )
         self.assertIn("재사용", first)
         self.assertIn("재사용", second)
+
+    def test_rune_page_uses_english_champion_name_in_english_ui(self) -> None:
+        self.applicator.apply_runes(
+            self.guide, self.guide.rune_builds[0], language="en",
+        )
+
+        payload = self.lcu.calls[-1][2]
+        self.assertEqual(payload["name"], "LOL Advisor - Thresh")
 
     def test_runes_skip_noneditable_tail_and_reuse_last_editable_page(self) -> None:
         self.lcu.pages = [
@@ -146,17 +157,18 @@ class BuildApplicatorTests(unittest.TestCase):
             self.lcu.calls[-1][2], {"spell1Id": 4, "spell2Id": 14}
         )
 
-    def test_item_set_preserves_existing_sets(self) -> None:
+    def test_item_set_replaces_existing_sets_with_only_advisor(self) -> None:
         self.applicator.apply_item_set(self.guide)
         method, path, payload = self.lcu.calls[-1]
         self.assertEqual((method, path), (
             "PUT", "/lol-item-sets/v1/item-sets/123/sets"
         ))
         item_sets = payload["itemSets"]  # type: ignore[index]
-        self.assertEqual(item_sets[0]["uid"], "blitz")
-        self.assertIn("LOL Advisor", item_sets[1]["title"])
-        self.assertEqual(item_sets[1]["associatedChampions"], [412])
-        blocks = item_sets[1]["blocks"]
+        self.assertEqual(len(item_sets), 1)
+        self.assertNotEqual(item_sets[0]["uid"], "blitz")
+        self.assertIn("LOL Advisor", item_sets[0]["title"])
+        self.assertEqual(item_sets[0]["associatedChampions"], [412])
+        blocks = item_sets[0]["blocks"]
         self.assertEqual(
             blocks[0]["type"],
             "[Advisor] 시작 아이템 · 초반 스킬 순서 Q>E>W>Q",
