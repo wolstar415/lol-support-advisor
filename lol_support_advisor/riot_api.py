@@ -151,6 +151,7 @@ class RiotApiClient:
         tag_line: str,
         start: int = 0,
         count: int = 10,
+        known_puuid: str = "",
     ) -> tuple[str, list[str], int, bool]:
         """Resolve an inspected player and cache one 10-game solo page.
 
@@ -161,8 +162,22 @@ class RiotApiClient:
         in page order without being downloaded again.
         """
         requested_size = max(1, min(int(count), 10))
-        account = self.resolve_account(game_name, tag_line)
-        puuid = str(account.get("puuid") or "").strip()
+        puuid = str(known_puuid or "").strip()
+        if puuid:
+            account: dict[str, Any] = {
+                "puuid": puuid, "gameName": game_name, "tagLine": tag_line,
+            }
+        else:
+            try:
+                account = self.resolve_account(game_name, tag_line)
+            except RiotApiError as exc:
+                if "HTTP 404" in str(exc):
+                    raise RiotApiError(
+                        "Riot ID를 찾지 못했습니다. 비공개 세션의 임시 이름이거나 "
+                        "최근에 Riot ID가 변경됐을 수 있습니다."
+                    ) from exc
+                raise
+            puuid = str(account.get("puuid") or "").strip()
         if not puuid:
             raise RiotApiError("Riot API 응답에 계정 PUUID가 없습니다.")
 

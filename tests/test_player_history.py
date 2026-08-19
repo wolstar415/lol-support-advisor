@@ -35,6 +35,18 @@ class PlayerHistoryHelpersTest(unittest.TestCase):
     def test_riot_id_normalization_and_split(self) -> None:
         self.assertEqual(normalize_riot_id("  피카피카츄  # KR1 "), "피카피카츄#kr1")
         self.assertEqual(split_riot_id(" 피카피카츄 # KR1 "), ("피카피카츄", "KR1"))
+        self.assertEqual(
+            normalize_riot_id(" 이  재  명 # 대  재  명 "),
+            "이 재 명#대 재 명",
+        )
+        self.assertEqual(
+            split_riot_id(" 이  재  명 # 대  재  명 "),
+            ("이 재 명", "대 재 명"),
+        )
+        self.assertNotEqual(
+            normalize_riot_id("이 재 명#대 재 명"),
+            normalize_riot_id("이 재 명#대재명"),
+        )
         self.assertEqual(normalize_riot_id("태그 없음"), "")
         self.assertIsNone(split_riot_id("태그 없음"))
 

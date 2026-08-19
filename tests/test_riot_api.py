@@ -166,6 +166,22 @@ class RiotApiTests(unittest.TestCase):
             self.assertIsNotNone(storage.load_match("KR_cached"))
             self.assertIsNotNone(storage.load_match("KR_new"))
 
+    def test_player_match_page_uses_cached_puuid_when_riot_id_lookup_is_404(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            client = RiotApiClient("test-key")
+            with (
+                patch.object(client, "resolve_account") as resolve,
+                patch.object(client, "match_id_page", return_value=[]) as id_page,
+            ):
+                result = client.sync_player_match_page(
+                    storage, "Temporary Name", "KR1", known_puuid="known-puuid",
+                )
+
+            resolve.assert_not_called()
+            id_page.assert_called_once_with("known-puuid", start=0, count=10)
+            self.assertEqual(result, ("known-puuid", [], 0, False))
+
     def test_player_page_refetches_detail_deleted_during_retention_race(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir) / "advisor.db")

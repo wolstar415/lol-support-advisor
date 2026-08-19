@@ -100,6 +100,25 @@ class LanguageTests(unittest.TestCase):
         self.assertEqual(RUNE_STYLE_NAMES_EN[8400], "Resolve")
         self.assertEqual(RUNE_NAMES_EN[8465], "Guardian")
 
+    def test_player_behavior_badges_have_authored_english_copy(self) -> None:
+        expected = {
+            "갱킹 자주 감": "Frequent ganks",
+            "퍼블을 자주 땀": "Frequent first bloods",
+            "초반 라인 약세": "Weak early lane",
+            "시야 좋음": "Strong vision",
+            "제어 와드 부족": "Few control wards",
+            "군중 통제 강함": "Strong crowd control",
+            "좋은 탱킹": "Strong tanking",
+            "회복·보호 강함": "Strong ally protection",
+            "공격적 딜링": "Aggressive damage",
+            "오브젝트 기여": "Objective pressure",
+            "철거 기여": "Strong turret pressure",
+            "표본 적음": "Small sample",
+        }
+        for source, translated in expected.items():
+            with self.subTest(source=source):
+                self.assertEqual(translate_text(source, "en"), translated)
+
     def test_every_static_korean_widget_label_has_an_authored_english_resource(self) -> None:
         source_path = Path(__file__).parents[1] / "lol_support_advisor" / "ui.py"
         source = source_path.read_text(encoding="utf-8")

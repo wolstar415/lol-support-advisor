@@ -580,9 +580,26 @@ class JungleTendencyStat:
     jungle_cs_10: float | None = None
     enemy_jungle_cs: float | None = None
     spawn_objectives: float | None = None
+    first_blood_kill_rate: float | None = None
+    first_blood_assist_rate: float | None = None
+    average_deaths: float | None = None
+    wins: int = 0
+    kills: int = 0
+    deaths: int = 0
+    assists: int = 0
     labels: list[str] = field(default_factory=list)
     status: str = "NO_DATA"
     message: str = ""
+
+    @property
+    def win_rate(self) -> float | None:
+        return self.wins / self.games * 100.0 if self.games else None
+
+    @property
+    def kda(self) -> float | None:
+        if not self.games:
+            return None
+        return (self.kills + self.assists) / max(self.deaths, 1)
 
 
 @dataclass(slots=True)
@@ -603,6 +620,12 @@ class PlayerBehaviorStat:
     average_deaths: float | None = None
     vision_per_minute: float | None = None
     control_wards: float | None = None
+    crowd_control_seconds: float | None = None
+    tanking_per_minute: float | None = None
+    champion_damage_per_minute: float | None = None
+    ally_protection_per_minute: float | None = None
+    objective_damage_per_minute: float | None = None
+    turret_damage_per_minute: float | None = None
     labels: list[str] = field(default_factory=list)
     status: str = "NO_DATA"
     message: str = ""

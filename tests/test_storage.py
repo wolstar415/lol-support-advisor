@@ -845,6 +845,18 @@ class StorageTests(unittest.TestCase):
                 match["info"]["participants"][0]["firstBloodKill"] = index == 0
                 match["info"]["participants"][0]["firstBloodAssist"] = index == 1
                 match["info"]["participants"][0]["detectorWardsPlaced"] = 4
+                match["info"]["gameDuration"] = 1800
+                participant = match["info"]["participants"][0]
+                participant.update({
+                    "timeCCingOthers": 30,
+                    "totalDamageTaken": 25_000,
+                    "damageSelfMitigated": 30_000,
+                    "totalDamageDealtToChampions": 24_000,
+                    "totalHealsOnTeammates": 3_000,
+                    "totalDamageShieldedOnTeammates": 3_000,
+                    "damageDealtToObjectives": 15_000,
+                    "damageDealtToTurrets": 5_000,
+                })
                 matches.append(match)
             storage.save_matches(matches)
 
@@ -854,9 +866,11 @@ class StorageTests(unittest.TestCase):
             self.assertEqual(stat.games, 3)
             self.assertTrue(stat.champion_specific)
             self.assertEqual(stat.early_takedowns, 3.0)
-            self.assertIn("초반 개입 적극", stat.labels)
-            self.assertIn("상대 정글 침투", stat.labels)
-            self.assertIn("생성 직후 오브젝트", stat.labels)
+            self.assertIn("갱킹 자주 감", stat.labels)
+            self.assertIn("카정 잦음", stat.labels)
+            self.assertIn("오브젝트 즉시", stat.labels)
+            self.assertIn("퍼블을 자주 땀", stat.labels)
+            self.assertAlmostEqual(stat.first_blood_kill_rate or 0.0, 33.33, places=1)
 
             behavior = storage.player_behavior(
                 "mine", "LeeSin", position="JUNGLE"
@@ -865,9 +879,43 @@ class StorageTests(unittest.TestCase):
             self.assertAlmostEqual(behavior.first_blood_rate or 0.0, 66.67, places=1)
             self.assertEqual(behavior.early_advantage_rate, 100.0)
             self.assertAlmostEqual(behavior.kill_participation or 0.0, 72.0)
-            self.assertIn("선취점 관여 잦음", behavior.labels)
-            self.assertIn("초반 라인 우위", behavior.labels)
-            self.assertIn("합류 적극", behavior.labels)
+            self.assertIn("퍼블을 자주 땀", behavior.labels)
+            self.assertIn("초반 라인 강함", behavior.labels)
+            self.assertIn("합류 잦음", behavior.labels)
+            self.assertIn("시야 좋음", behavior.labels)
+            self.assertIn("제어 와드 적극", behavior.labels)
+            self.assertIn("군중 통제 강함", behavior.labels)
+            self.assertIn("좋은 탱킹", behavior.labels)
+            self.assertIn("회복·보호 강함", behavior.labels)
+            self.assertIn("공격적 딜링", behavior.labels)
+            self.assertIn("오브젝트 기여", behavior.labels)
+            self.assertIn("철거 기여", behavior.labels)
+
+    def test_behavior_badges_hold_back_claims_below_three_games(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            match = match_payload(
+                "KR_TINY_BEHAVIOR", True, "LeeSin", "Viego",
+                my_position="JUNGLE", enemy_position="JUNGLE",
+            )
+            participant = match["info"]["participants"][0]
+            participant["firstBloodKill"] = True
+            participant["challenges"] = {
+                "takedownsFirstXMinutes": 8,
+                "killsOnLanersEarlyJungleAsJungler": 5,
+            }
+            storage.save_matches([match])
+
+            self.assertEqual(
+                storage.jungle_tendency("mine", "LeeSin").labels,
+                ["표본 적음"],
+            )
+            self.assertEqual(
+                storage.player_behavior(
+                    "mine", "LeeSin", position="JUNGLE",
+                ).labels,
+                ["표본 적음"],
+            )
 
     def test_cache_jobs_have_independent_daily_cooldowns(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

@@ -44,7 +44,7 @@ def normalize_riot_id(value: str) -> str:
     if not separator:
         return ""
     game_name = " ".join(game_name.split())
-    tag_line = "".join(tag_line.split())
+    tag_line = " ".join(tag_line.split())
     if not game_name or not tag_line:
         return ""
     return f"{game_name.casefold()}#{tag_line.casefold()}"
@@ -53,7 +53,7 @@ def normalize_riot_id(value: str) -> str:
 def split_riot_id(value: str) -> tuple[str, str] | None:
     game_name, separator, tag_line = str(value or "").strip().partition("#")
     game_name = " ".join(game_name.split())
-    tag_line = "".join(tag_line.split())
+    tag_line = " ".join(tag_line.split())
     if not separator or not game_name or not tag_line:
         return None
     return game_name, tag_line

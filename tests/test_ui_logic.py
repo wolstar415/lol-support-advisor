@@ -33,7 +33,9 @@ from lol_support_advisor.ui import (
     matchup_final_item_builds, matchup_item_groups, matchup_rune_index,
     lane_matchup_from_snapshot, lane_matchup_label, lane_matchup_snapshot_fresh,
     matchup_counter_for_candidate,
-    opgg_recent_form, participant_performance_ranks, representative_build_item,
+    opgg_player_history_matches,
+    opgg_jungle_tendency, opgg_recent_form, participant_performance_ranks,
+    representative_build_item,
     riot_local_recent_form,
     recent_match_ids_from_payload, streak_badge_text, support_archetype,
     opgg_account_unavailable_error, riot_authentication_error,
@@ -63,6 +65,78 @@ from lol_support_advisor.models import (
 
 
 class DuoEvidenceTests(unittest.TestCase):
+    def test_opgg_player_history_fallback_filters_sorts_and_caps_at_ten(self) -> None:
+        rows = [
+            OpggMcpRecentMatch(
+                f"KR_{index}", f"2026-08-{index:02d}T01:00:00",
+                "SOLORANKED", 22, "Ashe", "BOTTOM",
+                "WIN" if index % 2 else "LOSE", 5, 3, 7,
+            )
+            for index in range(1, 13)
+        ]
+        rows.extend([
+            OpggMcpRecentMatch(
+                "KR_ARAM", "2026-08-19T04:00:00", "ARAM", 22,
+                "Ashe", "BOTTOM", "WIN", 20, 0, 20,
+            ),
+            OpggMcpRecentMatch(
+                "KR_REMAKE", "2026-08-19T03:00:00", "SOLORANKED", 22,
+                "Ashe", "BOTTOM", "UNKNOWN", 0, 0, 0,
+            ),
+        ])
+        profile = OpggMcpSummonerProfile(
+            riot_id="Private#KR1", game_name="Private", tag_line="KR1",
+            recent_matches=list(reversed(rows)), recent_matches_status="OK",
+        )
+
+        result = opgg_player_history_matches(profile)
+
+        self.assertEqual(len(result), 10)
+        self.assertEqual(result[0].match_id, "KR_12")
+        self.assertEqual(result[-1].match_id, "KR_3")
+        self.assertTrue(all(row.game_type == "SOLORANKED" for row in result))
+        self.assertTrue(all(row.result in {"WIN", "LOSE"} for row in result))
+
+    def test_other_player_jungle_summary_uses_opgg_recent_solo_games(self) -> None:
+        profile = OpggMcpSummonerProfile(
+            riot_id="Enemy#KR1", game_name="Enemy", tag_line="KR1",
+            recent_matches=[
+                OpggMcpRecentMatch(
+                    "KR_3", "2026-08-19T03:00:00", "SOLORANKED", 102,
+                    "Shyvana", "JUNGLE", "WIN", 7, 2, 8,
+                ),
+                OpggMcpRecentMatch(
+                    "KR_2", "2026-08-19T02:00:00", "SOLORANKED", 102,
+                    "Shyvana", "JUNGLE", "LOSE", 4, 4, 5,
+                ),
+                OpggMcpRecentMatch(
+                    "KR_1", "2026-08-19T01:00:00", "SOLORANKED", 102,
+                    "Shyvana", "JUNGLE", "WIN", 8, 3, 6,
+                ),
+                OpggMcpRecentMatch(
+                    "KR_MID", "2026-08-18T23:00:00", "SOLORANKED", 102,
+                    "Shyvana", "MIDDLE", "WIN", 20, 0, 0,
+                ),
+                OpggMcpRecentMatch(
+                    "KR_ARAM", "2026-08-18T22:00:00", "ARAM", 102,
+                    "Shyvana", "JUNGLE", "WIN", 20, 0, 0,
+                ),
+            ],
+            recent_matches_status="OK", status="OK",
+        )
+
+        stat = opgg_jungle_tendency(
+            profile, champion_key=102, champion_id="Shyvana",
+        )
+
+        self.assertIsNotNone(stat)
+        self.assertEqual(stat.status, "SUMMARY")
+        self.assertTrue(stat.champion_specific)
+        self.assertEqual((stat.games, stat.wins), (3, 2))
+        self.assertAlmostEqual(stat.win_rate or 0.0, 66.67, places=1)
+        self.assertAlmostEqual(stat.kda or 0.0, 38 / 9, places=2)
+        self.assertIsNone(stat.early_takedowns)
+
     def test_local_blind_recommendations_exist_before_codex(self) -> None:
         counters = [
             OpggCounter("Braum", "브라움", 51.0, 3_000),
@@ -1893,6 +1967,33 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(merged.champion_streak, -1)
         self.assertEqual(merged.recent_form_source, "RIOT_LOCAL")
 
+    def test_other_player_keeps_riot_match_streak_over_lagging_opgg(self) -> None:
+        app = SimpleNamespace(registry=SimpleNamespace(
+            by_id={"Ashe": (22, "애쉬")}, by_key={},
+        ))
+        player = LivePlayer("Ashe", "애쉬", "Player", "KR1", "ORDER")
+        base = PlayerProfileStat(
+            status="OK", recent_games=5, recent_wins=3,
+            overall_streak=1, champion_streak=1,
+            recent_form_source="RIOT_LOCAL",
+        )
+        lagging = OpggMcpSummonerProfile(
+            riot_id="Player#KR1", game_name="Player", tag_line="KR1",
+            recent_matches=[OpggMcpRecentMatch(
+                match_id=f"old-loss-{index}",
+                created_at=f"2026-08-19T0{index}:00:00",
+                game_type="SOLORANKED", champion_key=22,
+                champion_name="애쉬", position="BOTTOM", result="LOSE",
+            ) for index in range(4)],
+            recent_matches_status="OK", status="OK",
+        )
+
+        merged = AdvisorApp._profile_with_opgg(app, base, lagging, player)
+
+        self.assertEqual(merged.overall_streak, 1)
+        self.assertEqual(merged.champion_streak, 1)
+        self.assertEqual(merged.recent_form_source, "RIOT_LOCAL")
+
     def test_missing_opgg_top_champion_is_not_reported_as_zero_percent(self) -> None:
         app = SimpleNamespace(registry=SimpleNamespace(by_id={"Thresh": (412, "쓰레쉬")}))
         player = LivePlayer("Thresh", "쓰레쉬", "Player", "KR1", "ORDER")
@@ -2246,6 +2347,7 @@ class DuoEvidenceTests(unittest.TestCase):
         app.live_game = LiveGameSnapshot(players=[player], active_team="ORDER")
         app.player_profiles = {player.riot_id: PlayerProfileStat(status="LOADING")}
         app.duo_pairs = {}
+        app.jungle_tendencies = {}
         app._duo_checking = False
         app._duo_checked_signature = ""
         app.lane_matchups = {}
@@ -2322,6 +2424,77 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(rendered, [True])
         self.assertIsNone(app._play_insight_after_id)
         self.assertEqual(callback_id, "after-2")
+
+    def test_selection_and_play_render_bursts_use_one_latest_callback(self) -> None:
+        class FakeRoot:
+            def __init__(self) -> None:
+                self.pending: dict[str, tuple[int, object]] = {}
+                self.cancelled: list[str] = []
+                self.serial = 0
+
+            def after(self, delay: int, callback: object) -> str:
+                self.serial += 1
+                callback_id = f"render-{self.serial}"
+                self.pending[callback_id] = (delay, callback)
+                return callback_id
+
+            def after_cancel(self, callback_id: str) -> None:
+                self.cancelled.append(callback_id)
+                self.pending.pop(callback_id, None)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.root = FakeRoot()
+        app._closing = False
+        app._selection_render_scheduled = False
+        app._selection_render_after_id = None
+        app._play_render_scheduled = False
+        app._play_render_after_id = None
+        rendered: list[str] = []
+        app._render_selection = lambda: rendered.append("selection")
+        app._render_play = lambda: rendered.append("play")
+
+        app._schedule_selection_render()
+        first_selection = app._selection_render_after_id
+        app._schedule_selection_render()
+        self.assertIn(first_selection, app.root.cancelled)
+        selection_id = app._selection_render_after_id
+
+        app._schedule_play_render()
+        first_play = app._play_render_after_id
+        app._schedule_play_render()
+        self.assertIn(first_play, app.root.cancelled)
+        play_id = app._play_render_after_id
+
+        self.assertEqual(len(app.root.pending), 2)
+        selection_delay, selection_callback = app.root.pending[selection_id]
+        play_delay, play_callback = app.root.pending[play_id]
+        self.assertEqual(selection_delay, 110)
+        self.assertEqual(play_delay, 140)
+        selection_callback()
+        play_callback()
+        self.assertEqual(rendered, ["selection", "play"])
+        self.assertIsNone(app._selection_render_after_id)
+        self.assertIsNone(app._play_render_after_id)
+
+    def test_background_and_ui_queue_stop_accepting_work_after_close(self) -> None:
+        class FakeExecutor:
+            def __init__(self) -> None:
+                self.submitted: list[object] = []
+
+            def submit(self, callback: object) -> None:
+                self.submitted.append(callback)
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app._closing = True
+        app._background_executor = FakeExecutor()
+        app._ui_queue = __import__("queue").SimpleQueue()
+
+        app._background(lambda: 1, lambda _value: None, lambda _exc: None)
+        app._post_ui(lambda: None)
+
+        self.assertEqual(app._background_executor.submitted, [])
+        with self.assertRaises(__import__("queue").Empty):
+            app._ui_queue.get_nowait()
 
     def test_play_summary_skips_identical_inputs(self) -> None:
         class FakeLabel:

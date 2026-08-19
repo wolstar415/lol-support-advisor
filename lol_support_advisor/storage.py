@@ -1664,9 +1664,10 @@ class Storage:
         samples: list[dict[str, Any]] = []
         champion_samples: list[dict[str, Any]] = []
         for match in self.player_matches(puuid, limit=max(limit * 3, limit)):
+            match_info = match.get("info") or {}
             participant = next(
                 (
-                    item for item in (match.get("info") or {}).get("participants", [])
+                    item for item in match_info.get("participants", [])
                     if item.get("puuid") == puuid
                 ),
                 None,
@@ -1716,25 +1717,55 @@ class Storage:
         enemy_jungle_cs = average_challenge("enemyJungleMonsterKills")
         spawn_objectives = average_challenge("epicMonsterKillsWithin30SecondsOfSpawn")
 
+        def participant_rate(key: str) -> float | None:
+            values = [bool(participant.get(key)) for participant in selected]
+            return sum(values) / len(values) * 100.0 if values else None
+
+        first_blood_kill_rate = participant_rate("firstBloodKill")
+        first_blood_assist_rate = participant_rate("firstBloodAssist")
+        average_deaths = (
+            sum(int(participant.get("deaths") or 0) for participant in selected)
+            / len(selected)
+        )
+
         labels: list[str] = []
         if (
             (early_takedowns is not None and early_takedowns >= 2.0)
             or (early_lane_kills is not None and early_lane_kills >= 0.8)
         ):
-            labels.append("초반 개입 적극")
+            labels.append("갱킹 자주 감")
+        elif (
+            early_takedowns is not None and early_takedowns <= 0.8
+            and early_lane_kills is not None and early_lane_kills <= 0.3
+        ):
+            labels.append("초반 갱 적음")
         if jungle_cs_10 is not None and jungle_cs_10 >= 52.0:
-            labels.append("10분 성장 우선")
+            labels.append("풀캠·성장 우선")
         if enemy_jungle_cs is not None and enemy_jungle_cs >= 10.0:
-            labels.append("상대 정글 침투")
+            labels.append("카정 잦음")
         if spawn_objectives is not None and spawn_objectives >= 0.35:
-            labels.append("생성 직후 오브젝트")
+            labels.append("오브젝트 즉시")
+        if first_blood_kill_rate is not None and first_blood_kill_rate >= 15.0:
+            labels.append("퍼블을 자주 땀")
+        elif (
+            first_blood_assist_rate is not None
+            and first_blood_kill_rate is not None
+            and first_blood_kill_rate + first_blood_assist_rate >= 25.0
+        ):
+            labels.append("퍼블 관여 높음")
+        if average_deaths >= 7.0:
+            labels.append("데스 주의")
+        elif average_deaths <= 3.5:
+            labels.append("생존 안정")
         available = any(
             value is not None for value in (
                 early_takedowns, early_lane_kills, jungle_cs_10,
                 enemy_jungle_cs, spawn_objectives,
             )
         )
-        if available and not labels:
+        if len(selected) < 3:
+            labels = ["표본 적음"]
+        elif available and not labels:
             labels.append("균형형")
         return JungleTendencyStat(
             puuid=puuid,
@@ -1746,6 +1777,9 @@ class Storage:
             jungle_cs_10=jungle_cs_10,
             enemy_jungle_cs=enemy_jungle_cs,
             spawn_objectives=spawn_objectives,
+            first_blood_kill_rate=first_blood_kill_rate,
+            first_blood_assist_rate=first_blood_assist_rate,
+            average_deaths=average_deaths,
             labels=labels,
             status="OK" if available else "NO_FIELDS",
             message=(
@@ -1768,9 +1802,10 @@ class Storage:
         samples: list[dict[str, Any]] = []
         champion_samples: list[dict[str, Any]] = []
         for match in self.player_matches(puuid, limit=max(limit * 3, limit)):
+            match_info = match.get("info") or {}
             participant = next(
                 (
-                    item for item in (match.get("info") or {}).get("participants", [])
+                    item for item in match_info.get("participants", [])
                     if item.get("puuid") == puuid
                 ),
                 None,
@@ -1786,9 +1821,16 @@ class Storage:
             )
             if participant_position != normalized_position:
                 continue
-            samples.append(participant)
+            sample = dict(participant)
+            try:
+                duration_seconds = float(match_info.get("gameDuration") or 0)
+            except (TypeError, ValueError):
+                duration_seconds = 0.0
+            if duration_seconds > 0:
+                sample["_advisor_game_minutes"] = max(duration_seconds / 60.0, 1.0)
+            samples.append(sample)
             if str(participant.get("championName") or "") == champion_id:
-                champion_samples.append(participant)
+                champion_samples.append(sample)
             if len(samples) >= limit:
                 break
         selected = champion_samples if len(champion_samples) >= 3 else samples
@@ -1843,18 +1885,93 @@ class Storage:
                 continue
         control_wards = average(control_ward_values)
 
+        def per_minute_average(*keys: str) -> float | None:
+            values: list[float] = []
+            for participant in selected:
+                minutes = float(participant.get("_advisor_game_minutes") or 0.0)
+                if minutes <= 0 or not any(key in participant for key in keys):
+                    continue
+                try:
+                    total = sum(float(participant.get(key) or 0.0) for key in keys)
+                except (TypeError, ValueError):
+                    continue
+                values.append(total / minutes)
+            return average(values)
+
+        crowd_control_values: list[float] = []
+        for participant in selected:
+            if "timeCCingOthers" not in participant:
+                continue
+            try:
+                crowd_control_values.append(float(participant.get("timeCCingOthers") or 0.0))
+            except (TypeError, ValueError):
+                continue
+        crowd_control_seconds = average(crowd_control_values)
+        tanking_per_minute = per_minute_average(
+            "totalDamageTaken", "damageSelfMitigated",
+        )
+        champion_damage_per_minute = per_minute_average(
+            "totalDamageDealtToChampions",
+        )
+        ally_protection_per_minute = per_minute_average(
+            "totalHealsOnTeammates", "totalDamageShieldedOnTeammates",
+        )
+        objective_damage_per_minute = per_minute_average(
+            "damageDealtToObjectives",
+        )
+        turret_damage_per_minute = per_minute_average("damageDealtToTurrets")
+
         labels: list[str] = []
-        if first_blood_rate >= 25.0:
-            labels.append("선취점 관여 잦음")
+        first_blood_kill_rate = first_blood_kills / len(selected) * 100
+        first_blood_assist_rate = first_blood_assists / len(selected) * 100
+        if first_blood_kill_rate >= 15.0:
+            labels.append("퍼블을 자주 땀")
+        elif first_blood_rate >= 25.0:
+            labels.append("퍼블 관여 높음")
+        if early_takedowns is not None and early_takedowns >= 2.0:
+            labels.append("초반 교전 잦음")
+        elif early_takedowns is not None and early_takedowns <= 0.8:
+            labels.append("초반 교전 적음")
         if early_advantage_rate is not None and early_advantage_rate >= 60.0:
-            labels.append("초반 라인 우위")
+            labels.append("초반 라인 강함")
+        elif early_advantage_rate is not None and early_advantage_rate <= 35.0:
+            labels.append("초반 라인 약세")
         if kill_participation is not None and kill_participation >= 65.0:
-            labels.append("합류 적극")
+            labels.append("합류 잦음")
+        elif kill_participation is not None and kill_participation <= 45.0:
+            labels.append("합류 낮음")
         if average_deaths >= 6.0:
-            labels.append("고위험 진입")
-        if vision_per_minute is not None and vision_per_minute >= 1.7:
-            labels.append("시야 투자 높음")
-        if not labels:
+            labels.append("데스 많음")
+        elif len(selected) >= 5 and average_deaths <= 3.5:
+            labels.append("생존 안정")
+        vision_high = 1.7 if normalized_position == "SUPPORT" else 1.0
+        vision_low = 1.3 if normalized_position == "SUPPORT" else 0.7
+        if vision_per_minute is not None and vision_per_minute >= vision_high:
+            labels.append("시야 좋음")
+        elif vision_per_minute is not None and vision_per_minute < vision_low:
+            labels.append("시야 부족")
+        if control_wards is not None and control_wards >= 3.5:
+            labels.append("제어 와드 적극")
+        elif (
+            normalized_position == "SUPPORT"
+            and control_wards is not None and control_wards < 2.0
+        ):
+            labels.append("제어 와드 부족")
+        if crowd_control_seconds is not None and crowd_control_seconds >= 20.0:
+            labels.append("군중 통제 강함")
+        if tanking_per_minute is not None and tanking_per_minute >= 1800.0:
+            labels.append("좋은 탱킹")
+        if ally_protection_per_minute is not None and ally_protection_per_minute >= 180.0:
+            labels.append("회복·보호 강함")
+        if champion_damage_per_minute is not None and champion_damage_per_minute >= 750.0:
+            labels.append("공격적 딜링")
+        if objective_damage_per_minute is not None and objective_damage_per_minute >= 350.0:
+            labels.append("오브젝트 기여")
+        if turret_damage_per_minute is not None and turret_damage_per_minute >= 120.0:
+            labels.append("철거 기여")
+        if len(selected) < 3:
+            labels = ["표본 적음"]
+        elif not labels:
             labels.append("균형형")
         return PlayerBehaviorStat(
             puuid=puuid,
@@ -1871,6 +1988,12 @@ class Storage:
             average_deaths=average_deaths,
             vision_per_minute=vision_per_minute,
             control_wards=control_wards,
+            crowd_control_seconds=crowd_control_seconds,
+            tanking_per_minute=tanking_per_minute,
+            champion_damage_per_minute=champion_damage_per_minute,
+            ally_protection_per_minute=ally_protection_per_minute,
+            objective_damage_per_minute=objective_damage_per_minute,
+            turret_damage_per_minute=turret_damage_per_minute,
             labels=labels,
             status="OK",
             message=(
