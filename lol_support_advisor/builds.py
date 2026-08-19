@@ -109,8 +109,10 @@ class BuildApplicator:
     """Apply only user-selected pre-game settings through the local client.
 
     The class never picks champions, accepts queues, or performs in-game input.
-    Existing user/third-party rune pages and item sets are preserved; only the
-    stable LOL Advisor entries are updated.
+    One stable LOL Advisor rune page is updated. If it does not exist, the
+    client's last editable rune page is intentionally converted into it so a
+    full page collection never causes another create-page failure. Item sets
+    owned by the user or another app remain preserved.
     """
 
     def __init__(self, lcu: LcuClient, registry: ChampionRegistry) -> None:
@@ -118,8 +120,43 @@ class BuildApplicator:
         self.registry = registry
 
     @staticmethod
-    def rune_page_name(guide: ChampionBuildGuide) -> str:
-        return f"LOL Advisor · {guide.champion_name_ko} · {guide.position}"
+    def rune_page_name(_guide: ChampionBuildGuide) -> str:
+        # The client has a small rune-page limit. One stable page is shared by
+        # every champion and updated in place whenever the user applies runes.
+        return "LOL Advisor"
+
+    @staticmethod
+    def _advisor_rune_page(
+        pages: object, preferred_name: str,
+    ) -> dict | None:
+        available = [
+            page for page in (pages if isinstance(pages, list) else [])
+            if isinstance(page, dict)
+            and page.get("id") is not None
+        ]
+        candidates = [
+            page for page in available
+            if str(page.get("name") or "") == "LOL Advisor"
+            or str(page.get("name") or "").startswith("LOL Advisor ·")
+        ]
+        exact = next(
+            (page for page in candidates if str(page.get("name")) == preferred_name),
+            None,
+        )
+        if exact:
+            return exact
+        # Reuse one page owned by this app instead of creating a page for
+        # every champion and eventually hitting the League Client page cap.
+        legacy = next((page for page in candidates if page.get("current")), None) or (
+            candidates[0] if candidates else None
+        )
+        if legacy:
+            return legacy
+        editable = [
+            page for page in available
+            if page.get("isEditable") is not False
+        ]
+        return editable[-1] if editable else None
 
     def apply_runes(self, guide: ChampionBuildGuide, rune_build: RuneBuild) -> str:
         if len(rune_build.perks) != 9:
@@ -134,18 +171,21 @@ class BuildApplicator:
         }
         try:
             pages = self.lcu.get("/lol-perks/v1/pages")
-            existing = next(
-                (
-                    page for page in (pages or [])
-                    if isinstance(page, dict) and str(page.get("name")) == name
-                ),
-                None,
-            )
+            existing = self._advisor_rune_page(pages, name)
             if existing and existing.get("id") is not None:
                 self.lcu.put(f"/lol-perks/v1/pages/{int(existing['id'])}", payload)
-                return "Advisor 룬 페이지 갱신 완료"
-            self.lcu.post("/lol-perks/v1/pages", payload)
-            return "Advisor 룬 페이지 생성 및 적용 완료"
+                existing_name = str(existing.get("name") or "")
+                return (
+                    "Advisor 룬 페이지 갱신 완료"
+                    if existing_name == name else
+                    "기존 Advisor 룬 페이지 재사용 및 적용 완료"
+                    if existing_name.startswith("LOL Advisor ·") else
+                    "마지막 룬 페이지를 Advisor 페이지로 전환 및 적용 완료"
+                )
+            raise BuildApplyError(
+                "재사용할 편집 가능한 룬 페이지를 찾지 못했습니다. 롤 클라이언트에서 "
+                "편집 가능한 룬 페이지가 하나 이상 있는지 확인하세요."
+            )
         except LcuUnavailable as exc:
             raise BuildApplyError(str(exc)) from exc
 

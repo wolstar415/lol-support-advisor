@@ -4,7 +4,7 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from lol_support_advisor.builds import BuildApplicator
+from lol_support_advisor.builds import BuildApplicator, BuildApplyError
 from lol_support_advisor.champions import ChampionRegistry
 from lol_support_advisor.models import (
     BuildAsset, BuildItemGroup, ChampionBuildGuide, RuneBuild,
@@ -14,11 +14,12 @@ from lol_support_advisor.models import (
 class FakeLcu:
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, object]] = []
+        self.pages: list[dict] = [{"id": 1, "name": "Blitz: Existing"}]
 
     def get(self, path: str):
         self.calls.append(("GET", path, None))
         if path == "/lol-perks/v1/pages":
-            return [{"id": 1, "name": "Blitz: Existing"}]
+            return self.pages
         if path == "/lol-summoner/v1/current-summoner":
             return {"summonerId": 123}
         if path == "/lol-item-sets/v1/item-sets/123/sets":
@@ -71,12 +72,63 @@ class BuildApplicatorTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.temp_dir.cleanup()
 
-    def test_runes_create_only_advisor_page(self) -> None:
-        self.applicator.apply_runes(self.guide, self.guide.rune_builds[0])
+    def test_runes_convert_last_editable_page_without_post(self) -> None:
+        result = self.applicator.apply_runes(
+            self.guide, self.guide.rune_builds[0],
+        )
         method, path, payload = self.lcu.calls[-1]
-        self.assertEqual((method, path), ("POST", "/lol-perks/v1/pages"))
+        self.assertEqual((method, path), ("PUT", "/lol-perks/v1/pages/1"))
         self.assertEqual(payload["selectedPerkIds"][0], 8465)  # type: ignore[index]
-        self.assertIn("LOL Advisor", payload["name"])  # type: ignore[index]
+        self.assertEqual(payload["name"], "LOL Advisor")  # type: ignore[index]
+        self.assertIn("마지막 룬 페이지", result)
+        self.assertFalse(any(call[0] == "POST" for call in self.lcu.calls))
+
+    def test_runes_reuse_one_stable_advisor_page_for_every_champion(self) -> None:
+        self.lcu.pages = [{
+            "id": 9,
+            "name": "LOL Advisor · 쓰레쉬 · SUPPORT",
+            "current": False,
+        }]
+
+        first = self.applicator.apply_runes(
+            self.guide, self.guide.rune_builds[0],
+        )
+        self.guide.champion_id = "Leona"
+        self.guide.champion_name_ko = "레오나"
+        second = self.applicator.apply_runes(
+            self.guide, self.guide.rune_builds[0],
+        )
+
+        writes = [call for call in self.lcu.calls if call[0] in {"PUT", "POST"}]
+        self.assertEqual([call[:2] for call in writes], [
+            ("PUT", "/lol-perks/v1/pages/9"),
+            ("PUT", "/lol-perks/v1/pages/9"),
+        ])
+        self.assertTrue(all(call[2]["name"] == "LOL Advisor" for call in writes))
+        self.assertIn("재사용", first)
+        self.assertIn("재사용", second)
+
+    def test_runes_skip_noneditable_tail_and_reuse_last_editable_page(self) -> None:
+        self.lcu.pages = [
+            {"id": 4, "name": "내 룬", "isEditable": True},
+            {"id": 5, "name": "기본 제공 룬", "isEditable": False},
+        ]
+
+        self.applicator.apply_runes(self.guide, self.guide.rune_builds[0])
+
+        self.assertEqual(
+            self.lcu.calls[-1][:2], ("PUT", "/lol-perks/v1/pages/4"),
+        )
+
+    def test_runes_never_post_when_no_editable_page_exists(self) -> None:
+        self.lcu.pages = [
+            {"id": 5, "name": "기본 제공 룬", "isEditable": False},
+        ]
+
+        with self.assertRaisesRegex(BuildApplyError, "편집 가능한 룬 페이지"):
+            self.applicator.apply_runes(self.guide, self.guide.rune_builds[0])
+
+        self.assertFalse(any(call[0] == "POST" for call in self.lcu.calls))
 
     def test_spells_patch_only_my_selection(self) -> None:
         self.applicator.apply_spells(self.guide)
