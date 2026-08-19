@@ -14,6 +14,18 @@ class RiotApiError(RuntimeError):
     pass
 
 
+def riot_puuid_is_canonical(value: str) -> bool:
+    """Reject short transient identifiers exposed during private loading.
+
+    Account-v1 PUUIDs currently have 78 characters.  The League Client can
+    briefly expose 36-character privacy/session identifiers; sending those to
+    Match-v5 returns HTTP 400 and used to disable every downstream analysis.
+    Keep a little format headroom while still separating the two forms.
+    """
+    normalized = str(value or "").strip()
+    return len(normalized) >= 70 and not any(char.isspace() for char in normalized)
+
+
 class RiotApiClient:
     def __init__(self, api_key: str, timeout: float = 15.0) -> None:
         self.api_key = api_key.strip()
@@ -163,7 +175,12 @@ class RiotApiClient:
         """
         requested_size = max(1, min(int(count), 10))
         puuid = str(known_puuid or "").strip()
-        if puuid:
+        # The League loading screen can briefly expose a 36-character
+        # privacy/session identifier.  It is useful for keeping a roster
+        # stable, but it is not a Match-v5 PUUID and the IDs endpoint rejects
+        # it with HTTP 400.  Only skip Account-v1 when the cached value has
+        # the canonical PUUID shape.
+        if riot_puuid_is_canonical(puuid):
             account: dict[str, Any] = {
                 "puuid": puuid, "gameName": game_name, "tagLine": tag_line,
             }

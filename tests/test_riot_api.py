@@ -6,7 +6,9 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from lol_support_advisor.riot_api import RiotApiClient, RiotApiError
+from lol_support_advisor.riot_api import (
+    RiotApiClient, RiotApiError, riot_puuid_is_canonical,
+)
 from lol_support_advisor.storage import Storage
 
 
@@ -25,6 +27,10 @@ class PagingClient(RiotApiClient):
 
 
 class RiotApiTests(unittest.TestCase):
+    def test_private_loading_identifier_is_not_treated_as_match_v5_puuid(self) -> None:
+        self.assertFalse(riot_puuid_is_canonical("a" * 36))
+        self.assertTrue(riot_puuid_is_canonical("b" * 78))
+
     def test_match_ids_pages_one_thousand_in_hundreds(self) -> None:
         client = PagingClient()
         ids = client.match_ids("puuid", count=1000)
@@ -170,17 +176,50 @@ class RiotApiTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             storage = Storage(Path(temp_dir) / "advisor.db")
             client = RiotApiClient("test-key")
+            canonical_puuid = "p" * 78
             with (
                 patch.object(client, "resolve_account") as resolve,
                 patch.object(client, "match_id_page", return_value=[]) as id_page,
             ):
                 result = client.sync_player_match_page(
-                    storage, "Temporary Name", "KR1", known_puuid="known-puuid",
+                    storage, "Temporary Name", "KR1", known_puuid=canonical_puuid,
                 )
 
             resolve.assert_not_called()
-            id_page.assert_called_once_with("known-puuid", start=0, count=10)
-            self.assertEqual(result, ("known-puuid", [], 0, False))
+            id_page.assert_called_once_with(canonical_puuid, start=0, count=10)
+            self.assertEqual(result, (canonical_puuid, [], 0, False))
+
+    def test_player_match_page_resolves_transient_loading_identifier(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            storage = Storage(Path(temp_dir) / "advisor.db")
+            client = RiotApiClient("test-key")
+            transient_puuid = "a" * 36
+            canonical_puuid = "p" * 78
+            with (
+                patch.object(
+                    client,
+                    "resolve_account",
+                    return_value={
+                        "puuid": canonical_puuid,
+                        "gameName": "KUNGFU",
+                        "tagLine": "KOA5",
+                    },
+                ) as resolve,
+                patch.object(client, "match_id_page", return_value=[]) as id_page,
+            ):
+                result = client.sync_player_match_page(
+                    storage,
+                    "KUNGFU",
+                    "KOA5",
+                    known_puuid=transient_puuid,
+                )
+
+            resolve.assert_called_once_with("KUNGFU", "KOA5")
+            id_page.assert_called_once_with(canonical_puuid, start=0, count=10)
+            self.assertEqual(result, (canonical_puuid, [], 0, False))
+            self.assertEqual(
+                storage.find_puuid_by_riot_id("KUNGFU#KOA5"), canonical_puuid,
+            )
 
     def test_player_page_refetches_detail_deleted_during_retention_race(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

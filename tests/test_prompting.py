@@ -11,7 +11,8 @@ from lol_support_advisor.models import (
     OpggSynergySnapshot, OpggSynergyStat, PersonalStat,
 )
 from lol_support_advisor.prompting import (
-    ResponseError, StaleResponseError, build_memory_prompt, build_prompt, parse_response,
+    ResponseError, StaleResponseError, UnavailableRecommendationError,
+    build_memory_prompt, build_prompt, parse_response,
 )
 
 
@@ -68,11 +69,15 @@ class PromptingTests(unittest.TestCase):
         payload = self._query_payload(prompt)
         self.assertIn(["Jinx", "BOTTOM", "HOVER", None, None], payload["ally"])
         self.assertEqual(payload["bans"]["ally"], ["Yuumi"])
+        self.assertEqual(
+            set(payload["do_not_recommend"]), {"Jinx", "Leona", "Yuumi"},
+        )
         self.assertEqual(payload["snapshot_id"], self.draft.snapshot_id)
         self.assertIn("숫자를 추측하지 말 것", payload["opgg"]["notice"])
         self.assertLess(len(prompt), 2500)
         self.assertNotIn('"recommendations"', prompt)
         self.assertIn("파일·명령·웹 도구를 사용하지 말고", prompt)
+        self.assertIn("bans와 do_not_recommend", prompt)
 
     def test_memory_prompt_contains_rules_and_response_contract(self) -> None:
         prompt = build_memory_prompt()
@@ -199,8 +204,19 @@ class PromptingTests(unittest.TestCase):
             parse_response(self._response("DRAFT-OLD"), self.draft, self.registry)
 
     def test_unavailable_champion_is_rejected(self) -> None:
-        with self.assertRaises(ResponseError):
+        with self.assertRaises(UnavailableRecommendationError):
             parse_response(self._response(first="Yuumi"), self.draft, self.registry)
+
+    def test_unavailable_champion_can_be_skipped_without_losing_valid_rows(self) -> None:
+        result = parse_response(
+            self._response(first="Yuumi"), self.draft, self.registry,
+            skip_unavailable=True,
+        )
+
+        self.assertEqual(
+            [item.champion_id for item in result], ["Braum", "Taric"],
+        )
+        self.assertEqual([item.rank for item in result], [2, 3])
 
 
 if __name__ == "__main__":

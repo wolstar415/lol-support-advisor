@@ -305,6 +305,7 @@ def build_prompt(
         *([draft.my_hover] if draft.my_hover else []),
     ]
     enemy_members = draft.enemy_team_order or draft.enemy_locked
+    unavailable_champions = draft.unavailable_champions()
 
     def compact_member(member: Any) -> list[Any]:
         return [
@@ -325,6 +326,10 @@ def build_prompt(
         "ally": [compact_member(member) for member in ally_members],
         "enemy": [compact_member(member) for member in enemy_members],
         "bans": {"ally": draft.ally_bans, "enemy": draft.enemy_bans},
+        # Keep this consolidated hard-stop list next to the raw ban lists.  The
+        # model previously overlooked a banned champion when it had to infer
+        # availability from several different fields.
+        "do_not_recommend": unavailable_champions,
         "opponent": {
             "champion": draft.selected_enemy_support_id,
             "name_ko": draft.selected_enemy_support_name_ko,
@@ -350,12 +355,17 @@ def build_prompt(
         + json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         + "\nEND_LOL_PICK_QUERY_V6\n"
           "파일·명령·웹 도구를 사용하지 말고 위 입력만 즉시 판단해. "
+          "bans와 do_not_recommend에 있는 챔피언은 절대 추천하지 마. "
           "기억한 LOL_PICK_MEMORY_V6 규칙대로 현재 역할군과 전체 조합 흐름을 종합해 정확히 3개를 "
           "LOL_SUPPORT_V2 형식으로만 답해. 각 설명 필드는 20자 이내, 전체 답변은 1400자 이내로 써."
     )
 
 
 class ResponseError(ValueError):
+    pass
+
+
+class UnavailableRecommendationError(ResponseError):
     pass
 
 
@@ -367,6 +377,8 @@ def parse_response(
     text: str,
     draft: DraftSnapshot,
     registry: ChampionRegistry,
+    *,
+    skip_unavailable: bool = False,
 ) -> list[Recommendation]:
     cleaned = text.strip().replace("```json", "").replace("```", "")
     start_marker = "LOL_SUPPORT_V2"
@@ -403,14 +415,25 @@ def parse_response(
         champion_id = str(item["champion_id"])
         if champion_id in seen:
             raise ResponseError(f"중복 추천: {champion_id}")
-        if champion_id in unavailable:
-            raise ResponseError(f"사용할 수 없는 챔피언이 추천되었습니다: {champion_id}")
         if not registry.contains(champion_id):
             raise ResponseError(f"알 수 없는 챔피언 ID입니다: {champion_id}")
+        try:
+            rank = int(item["rank"])
+        except (TypeError, ValueError) as exc:
+            raise ResponseError("추천 순위는 숫자 1, 2, 3이어야 합니다.") from exc
+        if rank not in {1, 2, 3}:
+            raise ResponseError("추천 순위는 1, 2, 3이어야 합니다.")
+        if champion_id in unavailable:
+            if skip_unavailable:
+                seen.add(champion_id)
+                continue
+            raise UnavailableRecommendationError(
+                f"사용할 수 없는 챔피언이 추천되었습니다: {champion_id}"
+            )
         seen.add(champion_id)
         recommendations.append(
             Recommendation(
-                rank=int(item["rank"]),
+                rank=rank,
                 champion_id=champion_id,
                 champion_name_ko=str(item["champion_name_ko"]),
                 style=str(item["style"]),
@@ -422,6 +445,6 @@ def parse_response(
             )
         )
     ranks = sorted(item.rank for item in recommendations)
-    if ranks != [1, 2, 3]:
+    if not skip_unavailable and ranks != [1, 2, 3]:
         raise ResponseError("추천 순위는 1, 2, 3이어야 합니다.")
     return sorted(recommendations, key=lambda item: item.rank)

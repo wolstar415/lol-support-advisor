@@ -25,6 +25,16 @@ class MainPathTests(unittest.TestCase):
             ):
                 self.assertEqual(app_main.project_root(), executable.parent)
 
+    def test_frozen_resources_are_loaded_from_meipass(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.object(app_main.sys, "frozen", True, create=True),
+                patch.object(app_main.sys, "_MEIPASS", temp_dir, create=True),
+            ):
+                self.assertEqual(
+                    app_main.resource_root(), Path(temp_dir).resolve(),
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

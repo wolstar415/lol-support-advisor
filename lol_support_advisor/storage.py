@@ -1514,8 +1514,13 @@ class Storage:
             )
             connection.execute(
                 "INSERT INTO player_identities(riot_id, puuid, updated_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(riot_id) DO UPDATE SET puuid = excluded.puuid, "
-                "updated_at = excluded.updated_at",
+                "ON CONFLICT(riot_id) DO UPDATE SET "
+                "puuid = CASE WHEN LENGTH(player_identities.puuid) >= 70 "
+                "AND LENGTH(excluded.puuid) < 70 THEN player_identities.puuid "
+                "ELSE excluded.puuid END, "
+                "updated_at = CASE WHEN LENGTH(player_identities.puuid) >= 70 "
+                "AND LENGTH(excluded.puuid) < 70 THEN player_identities.updated_at "
+                "ELSE excluded.updated_at END",
                 (riot_id, puuid, updated_at),
             )
 
@@ -1524,8 +1529,13 @@ class Storage:
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO player_identities(riot_id, puuid, updated_at) VALUES(?, ?, ?) "
-                "ON CONFLICT(riot_id) DO UPDATE SET puuid = excluded.puuid, "
-                "updated_at = excluded.updated_at",
+                "ON CONFLICT(riot_id) DO UPDATE SET "
+                "puuid = CASE WHEN LENGTH(player_identities.puuid) >= 70 "
+                "AND LENGTH(excluded.puuid) < 70 THEN player_identities.puuid "
+                "ELSE excluded.puuid END, "
+                "updated_at = CASE WHEN LENGTH(player_identities.puuid) >= 70 "
+                "AND LENGTH(excluded.puuid) < 70 THEN player_identities.updated_at "
+                "ELSE excluded.updated_at END",
                 (riot_id, puuid, updated_at),
             )
 

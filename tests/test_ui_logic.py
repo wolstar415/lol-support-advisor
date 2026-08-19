@@ -24,6 +24,7 @@ from lol_support_advisor.ui import (
     final_item_builds, matchup_build_reason,
     game_prediction_display_signature, local_draft_selection,
     local_recommendations_from_candidates,
+    merge_codex_with_local_recommendations,
     live_active_context_signature, live_roster_signature,
     lux_auto_ban_deadline_after_timer_sample,
     lux_auto_ban_monitor_due,
@@ -32,6 +33,7 @@ from lol_support_advisor.ui import (
     estimate_live_game_prediction,
     matchup_final_item_builds, matchup_item_groups, matchup_rune_index,
     lane_matchup_from_snapshot, lane_matchup_label, lane_matchup_snapshot_fresh,
+    jungle_tendency_advice,
     matchup_counter_for_candidate,
     opgg_player_history_matches,
     opgg_jungle_tendency, opgg_recent_form, participant_performance_ranks,
@@ -55,7 +57,7 @@ from lol_support_advisor.storage import Storage
 from lol_support_advisor.models import (
     BuildAsset, BuildItemGroup, ChampionBuildGuide, DraftBan, DraftMember,
     DraftSnapshot, GamePrediction,
-    LaneMatchupStat,
+    JungleTendencyStat, LaneMatchupStat,
     LiveGameSnapshot, LivePlayer,
     OpggCounter, OpggMcpChampionStat, OpggMcpRecentMatch,
     OpggMcpSummonerProfile, OpggSnapshot, OpggSynergyStat,
@@ -137,6 +139,35 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertAlmostEqual(stat.kda or 0.0, 38 / 9, places=2)
         self.assertIsNone(stat.early_takedowns)
 
+    def test_jungle_advice_is_actionable_and_side_aware(self) -> None:
+        stat = JungleTendencyStat(
+            games=12,
+            labels=["갱킹 자주 감", "카정 잦음", "퍼블 관여 높음"],
+            status="OK",
+        )
+
+        ally = jungle_tendency_advice(stat, ally=True)
+        enemy = jungle_tendency_advice(stat, ally=False)
+
+        self.assertEqual(len(ally), 3)
+        self.assertEqual(len(enemy), 3)
+        self.assertIn("갱 공간", ally[0])
+        self.assertIn("아군 정글 입구", enemy[1])
+        self.assertIn("2~4레벨", enemy[2])
+        self.assertNotEqual(ally, enemy)
+
+    def test_opgg_jungle_summary_does_not_invent_route_details(self) -> None:
+        stat = JungleTendencyStat(
+            games=5, wins=4, labels=["최근 정글 폼 우세"],
+            status="SUMMARY",
+        )
+
+        advice = jungle_tendency_advice(stat, ally=False)
+
+        self.assertEqual(len(advice), 2)
+        self.assertIn("소규모 교전", advice[0])
+        self.assertIn("확정하지 않습니다", advice[1])
+
     def test_local_blind_recommendations_exist_before_codex(self) -> None:
         counters = [
             OpggCounter("Braum", "브라움", 51.0, 3_000),
@@ -165,6 +196,35 @@ class DuoEvidenceTests(unittest.TestCase):
             action for _label, action, _accent in RECOMMENDATION_ACTION_SPECS
         })
         self.assertIn("SUPPORT", LOCAL_RECOMMENDATION_FALLBACKS)
+
+    def test_invalid_codex_pick_is_removed_while_other_rows_are_preserved(self) -> None:
+        def recommendation(rank: int, champion_id: str, reason: str) -> Recommendation:
+            return Recommendation(
+                rank=rank, champion_id=champion_id,
+                champion_name_ko=champion_id, style="보호",
+                blind_safety="보통", reason=reason, team_synergy="",
+                lane_plan="", watch_for="",
+            )
+
+        result = merge_codex_with_local_recommendations(
+            [
+                recommendation(2, "Braum", "Codex 브라움"),
+                recommendation(3, "Taric", "Codex 타릭"),
+            ],
+            [
+                recommendation(1, "Braum", "로컬 중복"),
+                recommendation(2, "Janna", "로컬 잔나"),
+                recommendation(3, "Renata", "로컬 차단"),
+            ],
+            unavailable={"Renata"},
+        )
+
+        self.assertEqual(
+            [item.champion_id for item in result], ["Braum", "Taric", "Janna"],
+        )
+        self.assertEqual([item.rank for item in result], [1, 2, 3])
+        self.assertEqual(result[0].reason, "Codex 브라움")
+        self.assertEqual(result[1].reason, "Codex 타릭")
 
     def test_local_matchup_recommendation_mentions_selected_enemy(self) -> None:
         recommendations = local_recommendations_from_candidates(
@@ -3280,6 +3340,20 @@ class DuoEvidenceTests(unittest.TestCase):
             AdvisorApp._classify_duo_evidence([(2, 8), (9, 20)])[0], "가능"
         )
         self.assertIsNone(AdvisorApp._classify_duo_evidence([(5, 7)]))
+
+    def test_opgg_shared_recent_matches_are_used_as_duo_fallback(self) -> None:
+        level, evidence = AdvisorApp._classify_duo_overlap_evidence(
+            [(0, 0), (1, 1), (2, 2), (3, 3), (4, 4)],
+        ) or ("", "")
+        self.assertEqual(level, "매우 유력")
+        self.assertIn("직전 2경기", evidence)
+
+        possible = AdvisorApp._classify_duo_overlap_evidence([(0, 0)])
+        self.assertIsNotNone(possible)
+        self.assertEqual(possible[0], "가능")
+        self.assertIsNone(
+            AdvisorApp._classify_duo_overlap_evidence([(7, 8)]),
+        )
 
     def test_previous_game_kda(self) -> None:
         profile = PlayerProfileStat(

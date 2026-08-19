@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from pathlib import Path
 import sys
 import tempfile
@@ -21,11 +22,46 @@ def project_root() -> Path:
     return Path(__file__).resolve().parent.parent
 
 
+def resource_root() -> Path:
+    """Return bundled read-only assets without moving user data into _MEIPASS."""
+    bundled = getattr(sys, "_MEIPASS", "")
+    if getattr(sys, "frozen", False) and bundled:
+        return Path(str(bundled)).resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+def configure_windows_app_identity() -> None:
+    """Give source and frozen runs one stable Windows taskbar identity."""
+    if sys.platform != "win32":
+        return
+    try:
+        ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "LOL.Support.Advisor.Desktop"
+        )
+    except (AttributeError, OSError):
+        pass
+
+
+def apply_window_icon(root: tk.Tk) -> None:
+    icon_path = resource_root() / "assets" / "app_icon.png"
+    if not icon_path.is_file():
+        return
+    try:
+        icon = tk.PhotoImage(file=str(icon_path))
+        root.iconphoto(True, icon)
+        # Tk only keeps the Tcl-side image name; retain the Python wrapper for
+        # the full window lifetime so taskbar/title icons cannot disappear.
+        root._advisor_app_icon = icon  # type: ignore[attr-defined]
+    except (OSError, tk.TclError):
+        pass
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="LoL pick and user-triggered build advisor")
     parser.add_argument("--demo", action="store_true", help="show a populated offline preview")
     args = parser.parse_args(argv)
 
+    configure_windows_app_identity()
     instance_lock = SingleInstanceLock(
         r"Local\LOL-Pick-Advisor-Demo-Single-Instance"
         if args.demo else r"Local\LOL-Pick-Advisor-Single-Instance"
@@ -47,6 +83,7 @@ def main(argv: list[str] | None = None) -> int:
             ) as demo_dir:
                 storage = Storage(Path(demo_dir) / "advisor.db")
                 root = tk.Tk()
+                apply_window_icon(root)
                 AdvisorApp(
                     root, storage, registry, demo=True, asset_dir=data_dir,
                 )
@@ -54,6 +91,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             storage = Storage(data_dir / "advisor.db")
             root = tk.Tk()
+            apply_window_icon(root)
             AdvisorApp(root, storage, registry)
             root.mainloop()
     finally:

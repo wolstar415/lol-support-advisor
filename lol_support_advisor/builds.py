@@ -112,7 +112,8 @@ class BuildApplicator:
     One stable LOL Advisor rune page is updated. If it does not exist, the
     client's last editable rune page is intentionally converted into it so a
     full page collection never causes another create-page failure. Item sets
-    owned by the user or another app remain preserved.
+    Applying an item build replaces the client collection with the selected
+    Advisor set, as requested by the user.
     """
 
     def __init__(self, lcu: LcuClient, registry: ChampionRegistry) -> None:
@@ -120,10 +121,19 @@ class BuildApplicator:
         self.registry = registry
 
     @staticmethod
-    def rune_page_name(_guide: ChampionBuildGuide) -> str:
+    def rune_page_name(
+        guide: ChampionBuildGuide, language: str = "ko",
+    ) -> str:
         # The client has a small rune-page limit. One stable page is shared by
         # every champion and updated in place whenever the user applies runes.
-        return "LOL Advisor"
+        # Keeping the selected champion in its name is a deliberate guard
+        # against applying the right runes to the wrong draft champion.
+        champion_name = (
+            guide.champion_id
+            if str(language).strip().lower().startswith("en")
+            else guide.champion_name_ko or guide.champion_id
+        )
+        return f"LOL Advisor - {champion_name}"
 
     @staticmethod
     def _advisor_rune_page(
@@ -138,6 +148,7 @@ class BuildApplicator:
             page for page in available
             if str(page.get("name") or "") == "LOL Advisor"
             or str(page.get("name") or "").startswith("LOL Advisor ·")
+            or str(page.get("name") or "").startswith("LOL Advisor - ")
         ]
         exact = next(
             (page for page in candidates if str(page.get("name")) == preferred_name),
@@ -158,10 +169,13 @@ class BuildApplicator:
         ]
         return editable[-1] if editable else None
 
-    def apply_runes(self, guide: ChampionBuildGuide, rune_build: RuneBuild) -> str:
+    def apply_runes(
+        self, guide: ChampionBuildGuide, rune_build: RuneBuild,
+        language: str = "ko",
+    ) -> str:
         if len(rune_build.perks) != 9:
             raise BuildApplyError("적용할 룬 9개가 완전하지 않습니다.")
-        name = self.rune_page_name(guide)
+        name = self.rune_page_name(guide, language)
         payload = {
             "name": name,
             "primaryStyleId": int(rune_build.primary_style_id),
@@ -179,7 +193,7 @@ class BuildApplicator:
                     "Advisor 룬 페이지 갱신 완료"
                     if existing_name == name else
                     "기존 Advisor 룬 페이지 재사용 및 적용 완료"
-                    if existing_name.startswith("LOL Advisor ·") else
+                    if existing_name.startswith(("LOL Advisor ·", "LOL Advisor - ")) else
                     "마지막 룬 페이지를 Advisor 페이지로 전환 및 적용 완료"
                 )
             raise BuildApplyError(
@@ -267,13 +281,10 @@ class BuildApplicator:
                 "type": "custom",
                 "uid": stable_uid,
             }
-            existing_sets = [
-                item_set for item_set in (collection.get("itemSets") or [])
-                if isinstance(item_set, dict)
-                and item_set.get("uid") != stable_uid
-                and item_set.get("title") != title
-            ]
-            collection["itemSets"] = [*existing_sets, advisor_set]
+            # Item-set application is explicit and destructive by design:
+            # remove stale Blitz/OP.GG/custom sets and leave one deterministic
+            # Advisor set for the champion the user selected.
+            collection["itemSets"] = [advisor_set]
             collection["timestamp"] = int(time.time() * 1000)
             self.lcu.put(path, collection)
             early_order = ">".join(guide.skill_sequence[:4]) or "데이터 없음"
@@ -287,12 +298,12 @@ class BuildApplicator:
 
     def apply_all(
         self, guide: ChampionBuildGuide, rune_build: RuneBuild,
-        flash_slot: str = "F",
+        flash_slot: str = "F", language: str = "ko",
     ) -> list[str]:
         results: list[str] = []
         errors: list[str] = []
         for label, action in (
-            ("룬", lambda: self.apply_runes(guide, rune_build)),
+            ("룬", lambda: self.apply_runes(guide, rune_build, language)),
             ("스펠", lambda: self.apply_spells(guide, flash_slot)),
             ("아이템", lambda: self.apply_item_set(guide)),
         ):

@@ -544,6 +544,51 @@ ENGLISH_TEXT = {
     "TOP 3 후보를 복사했습니다.": "Copied the top 3 candidates.",
     "종합점수: OP.GG 후보표에 없는 추천": "Overall score: recommendation absent from the OP.GG candidate table",
     "이번 판 체크 포인트": "Game checkpoints",
+    "운영 해석": "How to play it",
+    "최근 폼 우세 · 교전 호응을 기대할 수 있지만 동선은 시야로 확인하세요.":
+        "Strong recent form · expect follow-up, but confirm the route with vision.",
+    "최근 폼 우세 · 소규모 교전을 길게 열지 말고 먼저 인원수를 확인하세요.":
+        "Strong recent form · avoid extended skirmishes until you count nearby players.",
+    "최근 폼 부진 · 정글에게 복구 시간을 주고 불필요한 강가 교전을 줄이세요.":
+        "Weak recent form · give your jungler time to recover and reduce unnecessary river fights.",
+    "최근 폼 부진 · 시야가 확보되면 안전하게 주도권을 굴릴 여지가 있습니다.":
+        "Weak recent form · when vision is secure, there is room to press your lead safely.",
+    "최근 결과·KDA만 확인됨 · 실제 갱 동선은 미니맵과 와드로 판단하세요.":
+        "Only recent results and KDA are known · judge the actual gank route from the minimap and wards.",
+    "OP.GG 요약 표본이라 갱 방향·카정·오브젝트 성향은 확정하지 않습니다.":
+        "This is an OP.GG summary sample, so gank direction, invades, and objective tendencies are not confirmed.",
+    "초반 개입형 · 라인을 당겨 갱 공간을 만들고 핑이 오면 먼저 호응하세요.":
+        "Early-impact style · hold the wave to create a gank angle and respond first to pings.",
+    "초반 개입형 · 첫 귀환 전 강가·삼거리 시야를 두고 긴 라인을 피하세요.":
+        "Early-impact style · ward river and tri-brush before first recall and avoid holding a long lane.",
+    "성장 우선형 · 초반에는 정글 도움 없이 버틸 파동을 만들고 무리한 교전을 피하세요.":
+        "Scaling-first style · build a safe early wave without jungle help and avoid forced fights.",
+    "초반 개입이 낮음 · 시야가 확인되면 라인 주도권을 밀되 역갱 여지는 남기세요.":
+        "Low early activity · push lane control when vision confirms it, but respect a counter-gank.",
+    "풀캠 성향 · 캠프가 끝나는 바위게·첫 궁극기 타이밍에 맞춰 교전을 여세요.":
+        "Full-clear style · time fights around the post-clear Scuttle and first-ultimate windows.",
+    "풀캠 성향 · 첫 풀캠 직후 강가와 6레벨 전후 개입을 특히 확인하세요.":
+        "Full-clear style · watch river after the first clear and pay special attention around level 6.",
+    "균형형 표본 · 확정 동선보다 라인 주도권과 현재 시야를 기준으로 판단하세요.":
+        "Balanced sample · judge from lane priority and current vision rather than assuming a fixed route.",
+    "카정 성향 · 인접 라인이 먼저 밀고 강가에 합류하면 정글 격차를 키울 수 있습니다.":
+        "Invade tendency · nearby lanes can extend the jungle lead by pushing first and rotating to river.",
+    "카정 성향 · 아군 정글 입구 와드와 미드·서폿의 선합류가 필요합니다.":
+        "Invade tendency · ward your jungle entrances and have mid/support ready to rotate first.",
+    "오브젝트 우선 · 출현 40초 전에 라인을 정리하고 강가 시야를 함께 여세요.":
+        "Objective-first · fix the wave and establish river vision together 40 seconds before spawn.",
+    "오브젝트 우선 · 출현 전에 귀환하고 입구 시야를 먼저 지우세요.":
+        "Objective-first · recall before spawn and clear entrance vision first.",
+    "퍼블 관여 높음 · 첫 강가 교전과 2~4레벨 라인 합류에 빠르게 반응하세요.":
+        "High first-blood involvement · react quickly to the first river fight and level 2–4 lane plays.",
+    "퍼블 관여 높음 · 2~4레벨에는 체력 교환을 짧게 하고 적 위치부터 확인하세요.":
+        "High first-blood involvement · keep trades short at levels 2–4 and locate the jungler first.",
+    "데스 표본 높음 · 무리한 진입을 따라가기보다 퇴로와 다음 오브젝트를 지키세요.":
+        "High-death sample · protect the exit and next objective instead of following a forced engage.",
+    "데스 표본 높음 · 시야 안에서 길게 받아치면 실수를 유도할 수 있습니다.":
+        "High-death sample · extend the counterplay inside vision to draw out mistakes.",
+    "생존 안정형 · 억지 추격보다 다음 캠프와 오브젝트로 이득을 이어갈 가능성이 큽니다.":
+        "Stable survival style · more likely to convert into the next camp or objective than force a chase.",
     "TOP/MID/BOT 갱 방향은 매치 타임라인 표본이 없어 추정하지 않습니다.":
         "TOP/MID/BOT gank direction is not inferred without match-timeline samples.",
     "최근 행동 패턴 · 분석가 요약": "Recent behavior · analyst summary",

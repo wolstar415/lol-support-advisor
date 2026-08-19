@@ -14,6 +14,9 @@ $releaseDir = Join-Path $projectRoot 'release'
 $workDir = Join-Path $projectRoot 'build\pyinstaller'
 $specDir = Join-Path $projectRoot 'build\spec'
 $artifactName = "LOL-Support-Advisor-v$Version"
+$iconPath = Join-Path $projectRoot 'assets\app_icon.ico'
+$iconPngPath = Join-Path $projectRoot 'assets\app_icon.png'
+$iconData = "$iconPngPath;assets"
 
 New-Item -ItemType Directory -Force -Path $releaseDir, $workDir, $specDir | Out-Null
 
@@ -32,6 +35,8 @@ try {
         --clean `
         --onefile `
         --windowed `
+        --icon $iconPath `
+        --add-data $iconData `
         --name $artifactName `
         --distpath $releaseDir `
         --workpath $workDir `

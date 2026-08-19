@@ -70,9 +70,10 @@ from .player_history import (
 )
 from .prompting import (
     MEMORY_PROMPT_VERSION, ResponseError, StaleResponseError,
+    UnavailableRecommendationError,
     build_memory_prompt, build_prompt, parse_response,
 )
-from .riot_api import RiotApiClient, RiotApiError
+from .riot_api import RiotApiClient, RiotApiError, riot_puuid_is_canonical
 from .runes import RuneCatalog, RuneStyle
 from .storage import Storage
 
@@ -622,6 +623,95 @@ def opgg_jungle_tendency(
         status="SUMMARY",
         message="OP.GG 최근 솔로랭크 정글 요약",
     )
+
+
+def jungle_tendency_advice(
+    stat: JungleTendencyStat,
+    ally: bool,
+) -> list[str]:
+    """Turn jungle evidence into conservative, side-aware game advice.
+
+    Detailed Riot samples may support route, invade, and objective guidance.
+    OP.GG summaries contain only recent result/KDA data, so they explicitly
+    avoid inventing pathing tendencies.
+    """
+    labels = set(stat.labels)
+    advice: list[str] = []
+    if stat.status == "SUMMARY":
+        if "최근 정글 폼 우세" in labels:
+            advice.append(
+                "최근 폼 우세 · 교전 호응을 기대할 수 있지만 동선은 시야로 확인하세요."
+                if ally else
+                "최근 폼 우세 · 소규모 교전을 길게 열지 말고 먼저 인원수를 확인하세요."
+            )
+        elif "최근 정글 폼 부진" in labels:
+            advice.append(
+                "최근 폼 부진 · 정글에게 복구 시간을 주고 불필요한 강가 교전을 줄이세요."
+                if ally else
+                "최근 폼 부진 · 시야가 확보되면 안전하게 주도권을 굴릴 여지가 있습니다."
+            )
+        else:
+            advice.append(
+                "최근 결과·KDA만 확인됨 · 실제 갱 동선은 미니맵과 와드로 판단하세요."
+            )
+        advice.append(
+            "OP.GG 요약 표본이라 갱 방향·카정·오브젝트 성향은 확정하지 않습니다."
+        )
+        return advice
+
+    if "갱킹 자주 감" in labels:
+        advice.append(
+            "초반 개입형 · 라인을 당겨 갱 공간을 만들고 핑이 오면 먼저 호응하세요."
+            if ally else
+            "초반 개입형 · 첫 귀환 전 강가·삼거리 시야를 두고 긴 라인을 피하세요."
+        )
+    elif "초반 갱 적음" in labels:
+        advice.append(
+            "성장 우선형 · 초반에는 정글 도움 없이 버틸 파동을 만들고 무리한 교전을 피하세요."
+            if ally else
+            "초반 개입이 낮음 · 시야가 확인되면 라인 주도권을 밀되 역갱 여지는 남기세요."
+        )
+    elif "풀캠·성장 우선" in labels:
+        advice.append(
+            "풀캠 성향 · 캠프가 끝나는 바위게·첫 궁극기 타이밍에 맞춰 교전을 여세요."
+            if ally else
+            "풀캠 성향 · 첫 풀캠 직후 강가와 6레벨 전후 개입을 특히 확인하세요."
+        )
+    else:
+        advice.append(
+            "균형형 표본 · 확정 동선보다 라인 주도권과 현재 시야를 기준으로 판단하세요."
+        )
+
+    if "카정 잦음" in labels:
+        advice.append(
+            "카정 성향 · 인접 라인이 먼저 밀고 강가에 합류하면 정글 격차를 키울 수 있습니다."
+            if ally else
+            "카정 성향 · 아군 정글 입구 와드와 미드·서폿의 선합류가 필요합니다."
+        )
+    elif "오브젝트 즉시" in labels:
+        advice.append(
+            "오브젝트 우선 · 출현 40초 전에 라인을 정리하고 강가 시야를 함께 여세요."
+            if ally else
+            "오브젝트 우선 · 출현 전에 귀환하고 입구 시야를 먼저 지우세요."
+        )
+
+    if {"퍼블을 자주 땀", "퍼블 관여 높음"} & labels:
+        advice.append(
+            "퍼블 관여 높음 · 첫 강가 교전과 2~4레벨 라인 합류에 빠르게 반응하세요."
+            if ally else
+            "퍼블 관여 높음 · 2~4레벨에는 체력 교환을 짧게 하고 적 위치부터 확인하세요."
+        )
+    elif "데스 주의" in labels:
+        advice.append(
+            "데스 표본 높음 · 무리한 진입을 따라가기보다 퇴로와 다음 오브젝트를 지키세요."
+            if ally else
+            "데스 표본 높음 · 시야 안에서 길게 받아치면 실수를 유도할 수 있습니다."
+        )
+    elif "생존 안정" in labels:
+        advice.append(
+            "생존 안정형 · 억지 추격보다 다음 캠프와 오브젝트로 이득을 이어갈 가능성이 큽니다."
+        )
+    return advice[:3]
 
 
 def riot_local_recent_form(
@@ -1971,6 +2061,27 @@ def local_recommendations_from_candidates(
             watch_for=watch,
         ))
     return result
+
+
+def merge_codex_with_local_recommendations(
+    codex_recommendations: list[Recommendation],
+    local_recommendations: list[Recommendation],
+    *,
+    unavailable: set[str] | None = None,
+    limit: int = 3,
+) -> list[Recommendation]:
+    """Keep valid Codex picks and fill only missing slots from local data."""
+    blocked = unavailable or set()
+    merged: list[Recommendation] = []
+    seen: set[str] = set()
+    for item in [*codex_recommendations, *local_recommendations]:
+        if item.champion_id in blocked or item.champion_id in seen:
+            continue
+        seen.add(item.champion_id)
+        merged.append(replace(item, rank=len(merged) + 1))
+        if len(merged) >= max(0, int(limit)):
+            break
+    return merged
 
 
 class AdvisorApp:
@@ -9682,7 +9793,9 @@ class AdvisorApp:
 
         def work() -> str:
             if component == "runes":
-                return self.build_applicator.apply_runes(apply_guide, rune_build)
+                return self.build_applicator.apply_runes(
+                    apply_guide, rune_build, self.ui_language,
+                )
             if component == "spells":
                 return self.build_applicator.apply_spells(
                     apply_guide, self._flash_slot
@@ -9691,7 +9804,7 @@ class AdvisorApp:
                 return self.build_applicator.apply_item_set(apply_guide)
             return "\n".join(
                 self.build_applicator.apply_all(
-                    apply_guide, rune_build, self._flash_slot
+                    apply_guide, rune_build, self._flash_slot, self.ui_language
                 )
             )
 
@@ -12522,6 +12635,7 @@ class AdvisorApp:
                 bg=COLORS["surface"], fg=COLORS["muted"],
                 font=("Malgun Gothic", 7), anchor="w",
             ).pack(fill="x", pady=(5, 0))
+            self._render_jungle_advice(card, stat, ally)
             return
         badges = tk.Frame(card, bg=COLORS["surface"])
         badges.pack(fill="x", pady=(7, 5))
@@ -12551,6 +12665,29 @@ class AdvisorApp:
             bg=COLORS["surface"], fg=COLORS["muted"],
             font=("Malgun Gothic", 7), anchor="w",
         ).pack(fill="x", pady=(5, 0))
+
+        self._render_jungle_advice(card, stat, ally)
+
+    def _render_jungle_advice(
+        self,
+        card: tk.Widget,
+        stat: JungleTendencyStat,
+        ally: bool,
+    ) -> None:
+        advice = jungle_tendency_advice(stat, ally)
+        if not advice:
+            return
+        tk.Label(
+            card, text=self._tr("운영 해석"), bg=COLORS["surface"],
+            fg=COLORS["blue"], font=("Malgun Gothic", 7, "bold"),
+            anchor="w",
+        ).pack(fill="x", pady=(8, 2))
+        for line in advice:
+            tk.Label(
+                card, text=f"• {self._tr(line)}", bg=COLORS["surface"],
+                fg=COLORS["text"], font=("Malgun Gothic", 7),
+                anchor="w", justify="left", wraplength=330,
+            ).pack(fill="x", pady=(0, 2))
 
     def _render_play_plan_card(self, parent: tk.Widget, column: int) -> None:
         border = tk.Frame(parent, bg=COLORS["purple"], padx=1, pady=1)
@@ -16177,6 +16314,7 @@ class AdvisorApp:
         render_summary: bool = True,
     ) -> bool:
         parsed_draft = draft_context or self.draft
+        repaired_unavailable = False
         try:
             recommendations = parse_response(text, parsed_draft, self.registry)
         except StaleResponseError as exc:
@@ -16185,6 +16323,54 @@ class AdvisorApp:
             if show_dialog:
                 messagebox.showwarning("오래된 추천", str(exc), parent=self.root)
             return False
+        except UnavailableRecommendationError as exc:
+            # A single banned/locked suggestion must not discard the other
+            # valid Codex picks.  Keep those rows in their original order and
+            # fill only the vacant slots from the already-cached local list.
+            try:
+                codex_recommendations = parse_response(
+                    text, parsed_draft, self.registry, skip_unavailable=True,
+                )
+                blocked = set(parsed_draft.unavailable_champions())
+                candidates = self._local_recommendation_candidates()
+                candidate_ids = [item.champion_id for item in candidates]
+                adc = allied_adc_member(parsed_draft)
+                local_recommendations = local_recommendations_from_candidates(
+                    candidates,
+                    unavailable=blocked,
+                    personal_stats=self._personal_stats_for(candidate_ids),
+                    synergies={
+                        champion_id: self._synergy_for(champion_id)
+                        for champion_id in candidate_ids
+                    },
+                    enemy_name=(
+                        self._champion_text(
+                            parsed_draft.selected_enemy_support_id,
+                            parsed_draft.selected_enemy_support_name_ko,
+                        )
+                        if parsed_draft.selected_enemy_support_id else ""
+                    ),
+                    ally_adc_name=(
+                        self._champion_text(adc.champion_id, adc.champion_name_ko)
+                        if adc else ""
+                    ),
+                    role_name=self._position_text(parsed_draft.my_role),
+                    language=self.ui_language,
+                )
+                recommendations = merge_codex_with_local_recommendations(
+                    codex_recommendations,
+                    local_recommendations,
+                    unavailable=blocked,
+                )
+            except ResponseError:
+                recommendations = []
+            if not recommendations:
+                self._recommendation_apply_error = str(exc)
+                self.exchange_status.configure(text=str(exc), fg=COLORS["red"])
+                if show_dialog:
+                    messagebox.showerror("추천 적용 실패", str(exc), parent=self.root)
+                return False
+            repaired_unavailable = True
         except ResponseError as exc:
             self._recommendation_apply_error = str(exc)
             self.exchange_status.configure(text=str(exc), fg=COLORS["red"])
@@ -16205,7 +16391,11 @@ class AdvisorApp:
             parsed_draft.selected_enemy_support_id or ""
         )
         self.exchange_status.configure(
-            text=self._text("recommendations.applied"), fg=COLORS["green"],
+            text=(
+                "사용 불가 후보 제외 · 유효한 Codex 추천 유지 · 빈자리 로컬 보충"
+                if repaired_unavailable else self._text("recommendations.applied")
+            ),
+            fg=COLORS["orange"] if repaired_unavailable else COLORS["green"],
         )
         # Only two small panels depend on the response; rebuilding the whole
         # selection screen here caused a visible flash on every answer.
@@ -19117,6 +19307,7 @@ class AdvisorApp:
             )
             puuids: dict[str, str] = {}
             histories: dict[str, list[str]] = {}
+            opgg_histories: dict[str, list[str]] = {}
             rank_updates = 0
             fetched_details = 0
             champion_updates = 0
@@ -19124,8 +19315,19 @@ class AdvisorApp:
             for index, player in enumerate(players, start=1):
                 if not player.riot_game_name or not player.riot_tag_line:
                     continue
+                opgg_profile = self.storage.load_opgg_player_profile(
+                    player.riot_id, max_age=analysis_max_age,
+                )
+                if opgg_profile:
+                    opgg_histories[player.riot_id] = [
+                        item.match_id
+                        for item in completed_solo_ranked_matches(
+                            opgg_profile.recent_matches,
+                        )
+                        if item.match_id
+                    ]
                 puuid = self.storage.find_puuid_by_riot_id(player.riot_id)
-                if not puuid:
+                if not riot_puuid_is_canonical(puuid):
                     try:
                         account = client.resolve_account(
                             player.riot_game_name, player.riot_tag_line,
@@ -19281,55 +19483,73 @@ class AdvisorApp:
                 for pair_index, first in enumerate(team_players):
                     first_puuid = puuids.get(first.riot_id, "")
                     first_history = histories.get(first.riot_id, [])
-                    if not first_puuid or not first_history:
-                        continue
                     for second in team_players[pair_index + 1:]:
                         second_puuid = puuids.get(second.riot_id, "")
                         second_history = histories.get(second.riot_id, [])
-                        if not second_puuid or not second_history:
-                            continue
-                        second_ids = set(second_history)
-                        common_ids = [
-                            match_id for match_id in first_history if match_id in second_ids
-                        ][:5]
-                        first_positions = {
-                            match_id: position for position, match_id in enumerate(first_history)
-                        }
-                        second_positions = {
-                            match_id: position for position, match_id in enumerate(second_history)
-                        }
                         same_team_positions: list[tuple[int, int]] = []
-                        for match_id in common_ids:
-                            match = self.storage.load_match(match_id)
-                            if match is None:
-                                if fetched_details >= LIVE_TOTAL_DETAIL_BUDGET:
-                                    break
-                                try:
-                                    match = client.match(match_id)
-                                except RiotApiError as exc:
-                                    if riot_authentication_error(exc):
-                                        raise
-                                    continue
-                                self.storage.save_matches([match])
-                                fetched_details += 1
-                            participants = match.get("info", {}).get("participants", [])
-                            first_row = next(
-                                (row for row in participants if row.get("puuid") == first_puuid), None
-                            )
-                            second_row = next(
-                                (row for row in participants if row.get("puuid") == second_puuid), None
-                            )
-                            if (
-                                first_row
-                                and second_row
-                                and first_row.get("teamId") == second_row.get("teamId")
-                            ):
-                                same_team_positions.append(
-                                    (first_positions[match_id], second_positions[match_id])
+                        if (
+                            first_puuid and second_puuid
+                            and first_history and second_history
+                        ):
+                            second_ids = set(second_history)
+                            common_ids = [
+                                match_id for match_id in first_history
+                                if match_id in second_ids
+                            ][:5]
+                            first_positions = {
+                                match_id: position
+                                for position, match_id in enumerate(first_history)
+                            }
+                            second_positions = {
+                                match_id: position
+                                for position, match_id in enumerate(second_history)
+                            }
+                            for match_id in common_ids:
+                                match = self.storage.load_match(match_id)
+                                if match is None:
+                                    if fetched_details >= LIVE_TOTAL_DETAIL_BUDGET:
+                                        break
+                                    try:
+                                        match = client.match(match_id)
+                                    except RiotApiError as exc:
+                                        if riot_authentication_error(exc):
+                                            raise
+                                        continue
+                                    self.storage.save_matches([match])
+                                    fetched_details += 1
+                                participants = match.get("info", {}).get("participants", [])
+                                first_row = next(
+                                    (row for row in participants if row.get("puuid") == first_puuid), None
                                 )
-                                if {(0, 0), (1, 1)}.issubset(set(same_team_positions)):
-                                    break
+                                second_row = next(
+                                    (row for row in participants if row.get("puuid") == second_puuid), None
+                                )
+                                if (
+                                    first_row
+                                    and second_row
+                                    and first_row.get("teamId") == second_row.get("teamId")
+                                ):
+                                    same_team_positions.append(
+                                        (first_positions[match_id], second_positions[match_id])
+                                    )
+                                    if {(0, 0), (1, 1)}.issubset(set(same_team_positions)):
+                                        break
                         classification = self._classify_duo_evidence(same_team_positions)
+                        if not classification:
+                            first_opgg = opgg_histories.get(first.riot_id, [])
+                            second_opgg = opgg_histories.get(second.riot_id, [])
+                            second_opgg_positions = {
+                                match_id: position
+                                for position, match_id in enumerate(second_opgg)
+                            }
+                            overlap_positions = [
+                                (position, second_opgg_positions[match_id])
+                                for position, match_id in enumerate(first_opgg)
+                                if match_id in second_opgg_positions
+                            ][:5]
+                            classification = self._classify_duo_overlap_evidence(
+                                overlap_positions,
+                            )
                         if classification:
                             level, evidence = classification
                             pairs.setdefault(first.riot_id, []).append(
@@ -19414,6 +19634,33 @@ class AdvisorApp:
             return "가능", f"최근 100경기 중 동팀 {len(positions)}회 이상 확인"
         if any(max(first_index, second_index) <= 4 for first_index, second_index in positions):
             return "가능", "양쪽 최근 5경기 안에 동팀 · 현재도 같은 팀"
+        return None
+
+    @staticmethod
+    def _classify_duo_overlap_evidence(
+        shared_match_positions: list[tuple[int, int]],
+    ) -> tuple[str, str] | None:
+        """Use OP.GG shared match IDs when Riot details are late/unavailable.
+
+        A single common match can be an opposing-team coincidence, so it is
+        only a possible signal. Two aligned recent matches while the players
+        are teammates in the current game is strong premade evidence.
+        """
+        positions = set(shared_match_positions)
+        if {(0, 0), (1, 1)}.issubset(positions):
+            return "매우 유력", "OP.GG 서로의 직전 2경기 동일 · 현재도 같은 팀"
+        ordered = sorted(positions)
+        if any(
+            abs(first[0] - second[0]) == 1
+            and abs(first[1] - second[1]) == 1
+            for index, first in enumerate(ordered)
+            for second in ordered[index + 1:]
+        ):
+            return "유력", "OP.GG 최근 기록에서 2경기 연속 함께 큐"
+        if len(positions) >= 2:
+            return "가능", f"OP.GG 최근 기록 {len(positions)}경기 동일"
+        if (0, 0) in positions:
+            return "가능", "OP.GG 직전 경기 동일 · 현재도 같은 팀"
         return None
 
     def _tick(self) -> None:
