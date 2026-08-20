@@ -16,13 +16,14 @@ from lol_support_advisor.ui import (
     adc_flow_hint, allied_adc_member,
     candidate_score,
     behavior_strength_signals, behavior_weakness_signals,
-    build_guide_has_statistics, build_loadout_stat_text,
+    auto_build_components, build_guide_has_statistics, build_loadout_stat_text,
     cache_manager_champion_ids,
     choose_auto_accept_delay_seconds,
     choose_lux_auto_ban_stage_lead_ms,
     choose_lux_auto_ban_target_ms,
     final_item_builds, matchup_build_reason,
     game_prediction_display_signature, local_draft_selection,
+    locked_local_draft_selection,
     local_recommendations_from_candidates,
     merge_codex_with_local_recommendations,
     live_active_context_signature, live_roster_signature,
@@ -37,6 +38,8 @@ from lol_support_advisor.ui import (
     matchup_counter_for_candidate,
     opgg_player_history_matches,
     opgg_jungle_tendency, opgg_recent_form, participant_performance_ranks,
+    normalize_recent_position, player_off_role_warning, recent_primary_position,
+    normalize_build_position,
     representative_build_item,
     riot_local_recent_form,
     recent_match_ids_from_payload, streak_badge_text, support_archetype,
@@ -986,6 +989,146 @@ class DuoEvidenceTests(unittest.TestCase):
         draft.my_hover = hover
         self.assertIs(local_draft_selection(draft), hover)
 
+    def test_auto_build_components_are_independent_and_stably_ordered(self) -> None:
+        self.assertEqual(auto_build_components(False, False, False), ())
+        self.assertEqual(
+            auto_build_components(True, False, True), ("runes", "items"),
+        )
+        self.assertEqual(
+            auto_build_components(True, True, True),
+            ("runes", "spells", "items"),
+        )
+
+    def test_auto_build_signature_exists_only_after_pick_is_locked(self) -> None:
+        hover = DraftMember(
+            "Malphite", "말파이트", "SUPPORT", "HOVER", cell_id=4,
+        )
+        draft = DraftSnapshot(
+            my_role="SUPPORT", local_player_cell_id=4, my_hover=hover,
+        )
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app.draft = draft
+        app.auto_apply_runes_enabled = True
+        app.auto_apply_spells_enabled = False
+        app.auto_apply_items_enabled = True
+        app.registry = SimpleNamespace(
+            normalize_id=lambda value: value,
+            by_id={"Malphite": (54, "말파이트")},
+        )
+        self.assertIsNone(locked_local_draft_selection(draft))
+        self.assertEqual(app._auto_build_signature(), "")
+
+        locked = replace(hover, state="LOCKED")
+        draft.my_hover = None
+        draft.ally_locked = [locked]
+        draft.ally_team_order = [locked]
+
+        self.assertIs(locked_local_draft_selection(draft), locked)
+        self.assertEqual(
+            app._auto_build_signature(), "SUPPORT:Malphite:runes,items",
+        )
+
+    def test_build_position_aliases_are_normalized(self) -> None:
+        self.assertEqual(normalize_build_position("utility"), "SUPPORT")
+        self.assertEqual(normalize_build_position("adc"), "BOTTOM")
+        self.assertEqual(normalize_build_position("mid"), "MIDDLE")
+        self.assertEqual(normalize_build_position("jungle"), "JUNGLE")
+
+    def test_cached_build_prefers_exact_role_then_primary_role_reference(self) -> None:
+        support = ChampionBuildGuide(
+            "Briar", "브라이어", "SUPPORT",
+            rune_builds=[SimpleNamespace()],
+        )
+        jungle = ChampionBuildGuide(
+            "Briar", "브라이어", "JUNGLE",
+            rune_builds=[SimpleNamespace()],
+        )
+
+        class FakeStorage:
+            def __init__(self, guides: dict[tuple[str, str], ChampionBuildGuide]):
+                self.guides = guides
+
+            def load_build_guide(
+                self, champion_id: str, position: str,
+            ) -> ChampionBuildGuide | None:
+                return self.guides.get((champion_id, position))
+
+            def load_opgg_position_catalog(
+                self, position: str, max_age: object = None,
+            ) -> tuple[str, list[str]] | None:
+                del max_age
+                return (
+                    ("16.16", ["Briar"])
+                    if position == "JUNGLE" else ("16.16", [])
+                )
+
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.draft = DraftSnapshot(my_role="SUPPORT")
+        app._build_selected_champion_id = "Briar"
+        app.storage = FakeStorage({
+            ("Briar", "SUPPORT"): support,
+            ("Briar", "JUNGLE"): jungle,
+        })
+        self.assertIs(app._load_cached_build_guide("Briar"), support)
+        self.assertTrue(app._build_guide_is_exact(support))
+
+        app.storage = FakeStorage({("Briar", "JUNGLE"): jungle})
+        self.assertIs(app._load_cached_build_guide("Briar"), jungle)
+        self.assertFalse(app._build_guide_is_exact(jungle))
+
+    def test_auto_build_applies_only_enabled_spell_and_item_components(self) -> None:
+        calls: list[str] = []
+
+        class FakeWidget:
+            def configure(self, **_kwargs: object) -> None:
+                pass
+
+        guide = ChampionBuildGuide(
+            "Malphite", "말파이트", "SUPPORT",
+            summoner_spells=[
+                BuildAsset(4, "점멸"), BuildAsset(14, "점화"),
+            ],
+            item_groups=[BuildItemGroup(
+                "핵심", [BuildAsset(3068, "태양불꽃 방패")],
+            )],
+        )
+        app = AdvisorApp.__new__(AdvisorApp)
+        app.demo = False
+        app.ui_language = "ko"
+        app.draft = DraftSnapshot(my_role="SUPPORT")
+        app.registry = SimpleNamespace(ko_name=lambda _value: "")
+        app.build_guide = guide
+        app._build_selected_champion_id = "Malphite"
+        app._build_spell_index = 0
+        app._build_applying = False
+        app._flash_slot = "F"
+        app._auto_build_applied_signature = ""
+        app._auto_build_pending_signature = "sig"
+        app._auto_build_signature = lambda: "sig"
+        app.build_apply_status = FakeWidget()
+        app.build_apply_buttons = [FakeWidget()]
+        app._mark_build_render_current = lambda: None
+        app.build_applicator = SimpleNamespace(
+            apply_spells=lambda _guide, _slot: calls.append("spells") or "spells ok",
+            apply_item_set=lambda _guide: calls.append("items") or "items ok",
+        )
+
+        def run_now(work, success, error) -> None:
+            try:
+                success(work())
+            except Exception as exc:  # pragma: no cover - assertion aid
+                error(exc)
+
+        app._background = run_now
+        app._apply_build_components(
+            ("spells", "items"), automatic=True, auto_signature="sig",
+        )
+
+        self.assertEqual(calls, ["spells", "items"])
+        self.assertEqual(app._auto_build_applied_signature, "sig")
+        self.assertEqual(app._auto_build_pending_signature, "")
+
     def test_apply_build_selection_follows_local_draft_hover(self) -> None:
         hover = DraftMember(
             "Malphite", "말파이트", "SUPPORT", "HOVER", cell_id=4,
@@ -1914,6 +2057,31 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(form["champion_streak"], -1)
         self.assertEqual((form["recent_games"], form["recent_wins"]), (3, 1))
         self.assertEqual(form["last_game_champion_id"], "Thresh")
+        self.assertEqual(form["primary_position"], "SUPPORT")
+        self.assertEqual(
+            (form["primary_position_games"], form["position_sample_games"]),
+            (3, 3),
+        )
+
+    def test_recent_primary_position_requires_clear_sample_majority(self) -> None:
+        self.assertEqual(
+            recent_primary_position(["JGL", "JUNGLE", "TOP", "JUNGLE"]),
+            ("JUNGLE", 3, 4),
+        )
+        self.assertEqual(
+            recent_primary_position(["TOP", "TOP", "MID", "MID"]),
+            ("UNKNOWN", 0, 4),
+        )
+        self.assertEqual(
+            recent_primary_position(["UTILITY", "SUPPORT"]),
+            ("UNKNOWN", 0, 2),
+        )
+
+    def test_off_role_warning_is_only_for_supported_role_mismatch(self) -> None:
+        self.assertEqual(normalize_recent_position("UTILITY"), "SUPPORT")
+        self.assertTrue(player_off_role_warning("TOP", "JUNGLE", 6, 10))
+        self.assertFalse(player_off_role_warning("JGL", "JUNGLE", 6, 10))
+        self.assertFalse(player_off_role_warning("TOP", "JUNGLE", 1, 2))
 
     def test_behavior_signals_separate_strengths_and_actionable_weaknesses(self) -> None:
         stat = PlayerBehaviorStat(

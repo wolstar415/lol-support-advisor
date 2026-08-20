@@ -658,6 +658,9 @@ class PlayerProfileStat:
     champion_recent_wins: int = 0
     champion_streak: int = 0
     recent_form_source: str = ""
+    primary_position: str = "UNKNOWN"
+    primary_position_games: int = 0
+    position_sample_games: int = 0
     together_games: int = 0
     together_wins: int = 0
     against_games: int = 0

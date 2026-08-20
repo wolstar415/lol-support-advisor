@@ -364,6 +364,18 @@ CACHE_POSITION_CHOICES = (
     ("BOTTOM", "원딜 (ADC)"),
     ("SUPPORT", "서포터 (SUP)"),
 )
+BUILD_POSITIONS = tuple(position for position, _label in CACHE_POSITION_CHOICES)
+
+
+def normalize_build_position(position: object) -> str:
+    """Normalize League role aliases before reading or comparing build keys."""
+    normalized = str(position or "SUPPORT").strip().upper()
+    aliases = {
+        "UTILITY": "SUPPORT", "SUP": "SUPPORT",
+        "MID": "MIDDLE", "ADC": "BOTTOM",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized if normalized in BUILD_POSITIONS else "SUPPORT"
 
 SUPPORT_ARCHETYPES = {
     "UTILITY": {
@@ -506,6 +518,57 @@ def _result_streak(matches: list[object], champion_key: int | None = None) -> in
     return count if first == "WIN" else -count
 
 
+def normalize_recent_position(position: object) -> str:
+    """Normalize Riot and OP.GG position names for recent-role analysis."""
+    return {
+        "TOP": "TOP",
+        "JGL": "JUNGLE", "JUNGLE": "JUNGLE",
+        "MID": "MIDDLE", "MIDDLE": "MIDDLE",
+        "ADC": "BOTTOM", "BOT": "BOTTOM", "BOTTOM": "BOTTOM",
+        "SUP": "SUPPORT", "UTILITY": "SUPPORT", "SUPPORT": "SUPPORT",
+    }.get(str(position or "").strip().upper(), "UNKNOWN")
+
+
+def recent_primary_position(
+    positions: list[object],
+) -> tuple[str, int, int]:
+    """Return a primary role only for a clear, sufficiently large sample."""
+    normalized = [
+        value for value in (normalize_recent_position(item) for item in positions)
+        if value != "UNKNOWN"
+    ]
+    sample_games = len(normalized)
+    if sample_games < 3:
+        return "UNKNOWN", 0, sample_games
+    counts = {position: normalized.count(position) for position in set(normalized)}
+    ordered = sorted(counts.items(), key=lambda item: (-item[1], item[0]))
+    primary, games = ordered[0]
+    if games < 2 or games * 2 < sample_games:
+        return "UNKNOWN", 0, sample_games
+    if len(ordered) > 1 and ordered[1][1] == games:
+        return "UNKNOWN", 0, sample_games
+    return primary, games, sample_games
+
+
+def player_off_role_warning(
+    current_position: object,
+    primary_position: object,
+    primary_games: int,
+    sample_games: int,
+) -> bool:
+    """Whether a player card should show the important off-role warning."""
+    current = normalize_recent_position(current_position)
+    primary = normalize_recent_position(primary_position)
+    return bool(
+        current != "UNKNOWN"
+        and primary != "UNKNOWN"
+        and current != primary
+        and sample_games >= 3
+        and primary_games >= 2
+        and primary_games * 2 >= sample_games
+    )
+
+
 def opgg_recent_form(
     profile: OpggMcpSummonerProfile, champion_key: int
 ) -> dict[str, int | float | str | bool | None]:
@@ -522,6 +585,9 @@ def opgg_recent_form(
     ][:10]
     scored = [match.op_score for match in recent if match.op_score > 0]
     last_game = recent[0] if recent else None
+    primary_position, primary_games, position_sample_games = recent_primary_position(
+        [match.position for match in recent]
+    )
     return {
         "recent_games": len(recent),
         "recent_wins": sum(match.result.upper() == "WIN" for match in recent),
@@ -547,6 +613,9 @@ def opgg_recent_form(
             match.result.upper() == "WIN" for match in champion_recent
         ),
         "champion_streak": _result_streak(completed, champion_key),
+        "primary_position": primary_position,
+        "primary_position_games": primary_games,
+        "position_sample_games": position_sample_games,
     }
 
 
@@ -761,6 +830,10 @@ def riot_local_recent_form(
         if str(item.get("championName") or "") == champion_id
     ]
     last = samples[0] if samples else {}
+    primary_position, primary_games, position_sample_games = recent_primary_position([
+        item.get("teamPosition") or item.get("individualPosition")
+        for item in samples
+    ])
     return {
         "recent_games": len(samples),
         "recent_wins": sum(bool(item.get("win")) for item in samples),
@@ -782,6 +855,9 @@ def riot_local_recent_form(
         "last_game_deaths": int(last.get("deaths") or 0),
         "last_game_assists": int(last.get("assists") or 0),
         "last_game_won": bool(last.get("win")) if last else None,
+        "primary_position": primary_position,
+        "primary_position_games": primary_games,
+        "position_sample_games": position_sample_games,
     }
 
 
@@ -830,6 +906,18 @@ def local_draft_selection(draft: DraftSnapshot) -> DraftMember | None:
         ),
         None,
     )
+
+
+def locked_local_draft_selection(draft: DraftSnapshot) -> DraftMember | None:
+    """Return the local champion only after the League pick is committed.
+
+    Build previews deliberately follow HOVER, but automatic rune, spell, and
+    item changes must never run from an intent that the player can still
+    change. Keeping this separate prevents preview behavior from accidentally
+    re-enabling HOVER automation later.
+    """
+    selection = local_draft_selection(draft)
+    return selection if selection and selection.state == "LOCKED" else None
 
 
 def recommendation_draft_context_signature(draft: DraftSnapshot) -> str:
@@ -1707,6 +1795,23 @@ def build_guide_has_statistics(guide: ChampionBuildGuide | None) -> bool:
     return rune_stats and spell_stats
 
 
+def auto_build_components(
+    runes_enabled: bool,
+    spells_enabled: bool,
+    items_enabled: bool,
+) -> tuple[str, ...]:
+    """Return enabled automatic build actions in a stable, safe order."""
+    return tuple(
+        component
+        for enabled, component in (
+            (runes_enabled, "runes"),
+            (spells_enabled, "spells"),
+            (items_enabled, "items"),
+        )
+        if enabled
+    )
+
+
 def matchup_item_groups(
     groups: list[BuildItemGroup], enemy_champion_id: str | None
 ) -> list[BuildItemGroup]:
@@ -2275,6 +2380,15 @@ class AdvisorApp:
         self.stop_queue_after_dodge_enabled = (
             storage.get_setting("stop_queue_after_dodge_enabled", "0") == "1"
         )
+        self.auto_apply_runes_enabled = (
+            storage.get_setting("auto_apply_runes_enabled", "0") == "1"
+        )
+        self.auto_apply_spells_enabled = (
+            storage.get_setting("auto_apply_spells_enabled", "0") == "1"
+        )
+        self.auto_apply_items_enabled = (
+            storage.get_setting("auto_apply_items_enabled", "0") == "1"
+        )
         self._auto_accept_status = "게임 수락 대기"
         self._lux_auto_ban_status = "내 밴 차례 대기"
         self._lux_auto_ban_action_id: int | None = None
@@ -2447,10 +2561,11 @@ class AdvisorApp:
         if self._flash_slot not in {"D", "F"}:
             self._flash_slot = "F"
         self.build_guide: ChampionBuildGuide | None = (
-            self._demo_build() if demo else storage.load_build_guide(
+            self._demo_build() if demo else self._load_cached_build_guide(
                 self._build_selected_champion_id, self.draft.my_role
             )
         )
+        self._build_requested_position_loaded = self._requested_build_position()
         self._build_rune_index = 0
         self._build_spell_index = 0
         self._build_item_details_expanded = False
@@ -2474,6 +2589,9 @@ class AdvisorApp:
         self._build_matchup_signature = ""
         self._build_refreshing = False
         self._build_applying = False
+        self._auto_build_applied_signature = ""
+        self._auto_build_pending_signature = ""
+        self._auto_build_apply_after_id: str | None = None
         self._build_bulk_downloading = False
         self._build_bulk_cancel = threading.Event()
         self._build_request_signature = ""
@@ -2863,11 +2981,12 @@ class AdvisorApp:
             self._render_build()
             if not self.demo:
                 request_key = (
-                    self._build_selected_champion_id, self.draft.my_role
+                    self._build_selected_champion_id,
+                    self._requested_build_position(),
                 )
                 remaining = self._build_cooldown_remaining(*request_key)
                 needs_statistics = bool(
-                    self.build_guide
+                    self._build_guide_is_exact(self.build_guide)
                     and not build_guide_has_statistics(self.build_guide)
                 )
                 statistics_due = (
@@ -7848,6 +7967,58 @@ class AdvisorApp:
         # per downloaded asset.
         self._history_render_after_id = self.root.after(650, render)
 
+    def _requested_build_position(
+        self, draft: DraftSnapshot | None = None,
+    ) -> str:
+        return normalize_build_position((draft or self.draft).my_role)
+
+    def _load_cached_build_guide(
+        self, champion_id: str, position: str | None = None,
+    ) -> ChampionBuildGuide | None:
+        """Load the requested role first, then a useful local reference build.
+
+        Off-meta selections such as Briar support can have no current OP.GG
+        role page.  The build tab should still show a cached primary-position
+        reference instead of an empty screen while the exact role is fetched.
+        A reference guide is clearly marked and cannot be applied, preventing
+        jungle Smite/items from silently replacing a support setup.
+        """
+        requested = normalize_build_position(position or self.draft.my_role)
+        exact = self.storage.load_build_guide(champion_id, requested)
+        if exact and exact.rune_builds:
+            return exact
+
+        candidates: list[tuple[int, int, ChampionBuildGuide]] = []
+        for order, candidate_position in enumerate(BUILD_POSITIONS):
+            if candidate_position == requested:
+                continue
+            guide = self.storage.load_build_guide(
+                champion_id, candidate_position,
+            )
+            if not guide or not guide.rune_builds:
+                continue
+            catalog_rank = 10_000
+            load_catalog = getattr(
+                self.storage, "load_opgg_position_catalog", None,
+            )
+            if callable(load_catalog):
+                catalog = load_catalog(candidate_position, max_age=None)
+                if catalog and champion_id in catalog[1]:
+                    catalog_rank = list(catalog[1]).index(champion_id)
+                elif catalog:
+                    continue
+            candidates.append((catalog_rank, order, guide))
+        if candidates:
+            return min(candidates, key=lambda item: (item[0], item[1]))[2]
+        return exact
+
+    def _build_guide_is_exact(self, guide: ChampionBuildGuide | None) -> bool:
+        return bool(
+            guide and guide.champion_id == self._build_selected_champion_id
+            and normalize_build_position(guide.position)
+            == self._requested_build_position()
+        )
+
     def _refresh_build_champion_values(self) -> None:
         values: list[str] = []
         mapping: dict[str, str] = {}
@@ -7894,11 +8065,14 @@ class AdvisorApp:
         )
         if champion_id not in self.registry.by_id:
             return False
-        role = current_draft.my_role
+        role = self._requested_build_position(current_draft)
         guide_matches = bool(
             self.build_guide
             and self.build_guide.champion_id == champion_id
-            and self.build_guide.position == role
+            and getattr(
+                self, "_build_requested_position_loaded",
+                normalize_build_position(self.build_guide.position),
+            ) == role
         )
         selection_changed = champion_id != self._build_selected_champion_id
         if not selection_changed and guide_matches:
@@ -7908,7 +8082,8 @@ class AdvisorApp:
         self._build_selected_champion_id = champion_id
         if not self.demo:
             self.storage.set_setting("build_selected_champion", champion_id)
-            self.build_guide = self.storage.load_build_guide(champion_id, role)
+            self.build_guide = self._load_cached_build_guide(champion_id, role)
+            self._build_requested_position_loaded = role
         else:
             _key, name_ko = self.registry.by_id[champion_id]
             self.build_guide = replace(
@@ -7929,6 +8104,83 @@ class AdvisorApp:
             self._render_build()
         return True
 
+    def _configured_auto_build_components(self) -> tuple[str, ...]:
+        return auto_build_components(
+            bool(getattr(self, "auto_apply_runes_enabled", False)),
+            bool(getattr(self, "auto_apply_spells_enabled", False)),
+            bool(getattr(self, "auto_apply_items_enabled", False)),
+        )
+
+    def _auto_build_signature(
+        self, draft: DraftSnapshot | None = None,
+    ) -> str:
+        """Identify one committed local pick for one-time auto application."""
+        current_draft = draft or self.draft
+        components = self._configured_auto_build_components()
+        selection = locked_local_draft_selection(current_draft)
+        if self.demo or not components or not selection or not selection.champion_id:
+            return ""
+        champion_id = self.registry.normalize_id(selection.champion_id)
+        if champion_id not in self.registry.by_id:
+            return ""
+        role = self._requested_build_position(current_draft)
+        return f"{role}:{champion_id}:{','.join(components)}"
+
+    def _reset_auto_build_apply_cycle(self) -> None:
+        after_id = getattr(self, "_auto_build_apply_after_id", None)
+        if after_id:
+            try:
+                self.root.after_cancel(after_id)
+            except (AttributeError, tk.TclError):
+                pass
+        self._auto_build_apply_after_id = None
+        self._auto_build_applied_signature = ""
+        self._auto_build_pending_signature = ""
+
+    def _schedule_auto_build_apply(
+        self, draft: DraftSnapshot | None = None, delay_ms: int = 500,
+    ) -> None:
+        signature = self._auto_build_signature(draft)
+        if not signature or signature == self._auto_build_applied_signature:
+            return
+        self._auto_build_pending_signature = signature
+        if self._auto_build_apply_after_id:
+            try:
+                self.root.after_cancel(self._auto_build_apply_after_id)
+            except tk.TclError:
+                pass
+        self._auto_build_apply_after_id = self.root.after(
+            max(20, int(delay_ms)),
+            lambda expected=signature: self._attempt_auto_build_apply(expected),
+        )
+
+    def _attempt_auto_build_apply(self, expected_signature: str) -> None:
+        self._auto_build_apply_after_id = None
+        current_signature = self._auto_build_signature()
+        if self.game_phase != "ChampSelect" or current_signature != expected_signature:
+            if self._auto_build_pending_signature == expected_signature:
+                self._auto_build_pending_signature = ""
+            return
+        if self._build_applying or self._build_refreshing or self._build_bulk_downloading:
+            self._schedule_auto_build_apply(delay_ms=500)
+            return
+        self._sync_build_selection_from_draft(self.draft, render=False)
+        selection = locked_local_draft_selection(self.draft)
+        champion_id = (
+            self.registry.normalize_id(selection.champion_id)
+            if selection and selection.champion_id else ""
+        )
+        guide = self.build_guide
+        if not guide or guide.champion_id != champion_id \
+                or not self._build_guide_is_exact(guide):
+            self._refresh_build_guide(automatic=True)
+            return
+        self._apply_build_components(
+            self._configured_auto_build_components(),
+            automatic=True,
+            auto_signature=expected_signature,
+        )
+
     def _on_build_champion_selected(self, _event: tk.Event | None = None) -> None:
         champion_id = self._build_champion_display_to_id.get(
             self.build_champion_var.get(), ""
@@ -7940,20 +8192,23 @@ class AdvisorApp:
         self._build_rune_index = 0
         self._build_spell_index = 0
         self._build_rune_manual = False
-        self.build_guide = self.storage.load_build_guide(champion_id, self.draft.my_role)
+        position = self._requested_build_position()
+        self.build_guide = self._load_cached_build_guide(champion_id, position)
+        self._build_requested_position_loaded = position
         if self.build_guide:
             self._prefetch_build_assets(self.build_guide)
         self._render_build()
         cache_due = self._build_cooldown_remaining(
-            champion_id, self.draft.my_role
+            champion_id, position
         ).total_seconds() <= 0
-        request_key = (champion_id, self.draft.my_role)
+        request_key = (champion_id, position)
         needs_statistics = bool(
-            self.build_guide and not build_guide_has_statistics(self.build_guide)
+            self._build_guide_is_exact(self.build_guide)
+            and not build_guide_has_statistics(self.build_guide)
         )
         statistics_due = (
             self._build_statistics_upgrade_remaining(
-                champion_id, self.draft.my_role
+                champion_id, position
             ).total_seconds() <= 0
         )
         if (
@@ -7972,12 +8227,13 @@ class AdvisorApp:
         if self.demo or self._build_refreshing or self._build_bulk_downloading:
             return
         champion_id = self._build_selected_champion_id
-        position = self.draft.my_role
+        position = self._requested_build_position()
         if not champion_id:
             return
         remaining = self._build_cooldown_remaining(champion_id, position)
         needs_statistics = bool(
-            self.build_guide and not build_guide_has_statistics(self.build_guide)
+            self._build_guide_is_exact(self.build_guide)
+            and not build_guide_has_statistics(self.build_guide)
         )
         if needs_statistics:
             remaining = self._build_statistics_upgrade_remaining(
@@ -7985,7 +8241,7 @@ class AdvisorApp:
             )
         if (
             remaining.total_seconds() > 0
-            and self.build_guide
+            and self._build_guide_is_exact(self.build_guide)
         ):
             if not automatic:
                 minutes = max(1, int(remaining.total_seconds() // 60) + 1)
@@ -8010,8 +8266,12 @@ class AdvisorApp:
         def success(guide: ChampionBuildGuide) -> None:
             self._build_refreshing = False
             self.storage.save_build_guide(guide)
-            if signature == f"{self.draft.my_role}:{self._build_selected_champion_id}":
+            if signature == (
+                f"{self._requested_build_position()}:"
+                f"{self._build_selected_champion_id}"
+            ):
                 self.build_guide = guide
+                self._build_requested_position_loaded = position
                 self._build_rune_index = 0
                 self._build_spell_index = 0
                 self._build_rune_manual = False
@@ -8025,9 +8285,11 @@ class AdvisorApp:
                         text="빌드와 룬·스펠·아이템 이미지를 로컬에 저장했습니다.",
                         fg=COLORS["green"],
                     ) if signature == (
-                        f"{self.draft.my_role}:{self._build_selected_champion_id}"
+                        f"{self._requested_build_position()}:"
+                        f"{self._build_selected_champion_id}"
                     ) else None,
                 )
+                self._schedule_auto_build_apply(delay_ms=80)
             self._render_build()
 
         def error(exc: Exception) -> None:
@@ -8036,6 +8298,12 @@ class AdvisorApp:
             self.build_refresh_button.configure(
                 state="normal", text="OP.GG 빌드 갱신"
             )
+            pending_signature = self._auto_build_pending_signature
+            if pending_signature and pending_signature == self._auto_build_signature():
+                # Do not hammer OP.GG on every draft poll after one failed
+                # automatic lookup. A new champion, setting, or draft retries.
+                self._auto_build_applied_signature = pending_signature
+                self._auto_build_pending_signature = ""
             if not automatic:
                 messagebox.showerror("빌드 불러오기 실패", str(exc), parent=self.root)
 
@@ -8189,11 +8457,13 @@ class AdvisorApp:
                 ),
                 fg=COLORS["orange"] if cancelled else COLORS["green"],
             )
-            cached_guide = self.storage.load_build_guide(
-                self._build_selected_champion_id, self.draft.my_role
+            requested_position = self._requested_build_position()
+            cached_guide = self._load_cached_build_guide(
+                self._build_selected_champion_id, requested_position,
             )
             if cached_guide:
                 self.build_guide = cached_guide
+                self._build_requested_position_loaded = requested_position
                 self._build_rune_index = 0
                 self._build_spell_index = 0
                 self._prefetch_build_assets(cached_guide)
@@ -9307,7 +9577,8 @@ class AdvisorApp:
         if incoming_signature == self._build_render_signature:
             return
         self._build_render_signature = incoming_signature
-        role_name = self._position_text(self.draft.my_role)
+        requested_position = self._requested_build_position()
+        role_name = self._position_text(requested_position)
         self.build_position_label.configure(
             text=self._text("build.position", role=role_name)
         )
@@ -9338,7 +9609,7 @@ class AdvisorApp:
         guide = self.build_guide
         guide_matches = bool(
             guide and guide.champion_id == self._build_selected_champion_id
-            and guide.position == self.draft.my_role and guide.rune_builds
+            and guide.rune_builds
         )
         if not guide_matches:
             self.build_guide_summary.configure(
@@ -9363,6 +9634,9 @@ class AdvisorApp:
             self._mark_build_render_current()
             return
         assert guide is not None
+        reference_only = (
+            normalize_build_position(guide.position) != requested_position
+        )
         matchup_signature = (
             f"{guide.position}:{guide.champion_id}:"
             f"{self.draft.selected_enemy_support_id or 'UNKNOWN'}"
@@ -9377,16 +9651,24 @@ class AdvisorApp:
         if not self._build_rune_manual:
             self._build_rune_index = matchup_index
         stamp = guide.updated_at.replace("T", " ")[:16]
-        self.build_guide_summary.configure(
-            text=self._text(
-                "build.summary",
-                champion=self._champion_text(
-                    guide.champion_id, guide.champion_name_ko,
-                ),
-                role=role_name, patch=guide.patch, tier=guide.tier,
-                stamp=stamp,
+        summary = self._text(
+            "build.summary",
+            champion=self._champion_text(
+                guide.champion_id, guide.champion_name_ko,
             ),
-            fg=COLORS["muted"],
+            role=self._position_text(guide.position), patch=guide.patch,
+            tier=guide.tier, stamp=stamp,
+        )
+        if reference_only:
+            summary = self._text(
+                "build.reference",
+                requested=role_name,
+                source=self._position_text(guide.position),
+                summary=summary,
+            )
+        self.build_guide_summary.configure(
+            text=summary,
+            fg=COLORS["orange"] if reference_only else COLORS["muted"],
         )
         tk.Label(
             self.build_presets_frame, text=self._tr("추천 빌드 목록"),
@@ -9664,7 +9946,20 @@ class AdvisorApp:
         self.build_apply_buttons.append(item_apply)
         for button in self.build_apply_buttons:
             button.configure(
-                state="disabled" if self._build_applying or self.demo else "normal"
+                state=(
+                    "disabled"
+                    if self._build_applying or self.demo or reference_only
+                    else "normal"
+                )
+            )
+        if reference_only:
+            self.build_apply_status.configure(
+                text=self._text(
+                    "build.reference_apply_disabled",
+                    requested=role_name,
+                    source=self._position_text(guide.position),
+                ),
+                fg=COLORS["orange"],
             )
         if self.demo:
             self.build_apply_status.configure(
@@ -9740,20 +10035,45 @@ class AdvisorApp:
         self.root.after(80, restore_scroll_position)
 
     def _apply_build_component(self, component: str) -> None:
-        if self.demo or self._build_applying or not self.build_guide:
+        components = (
+            ("runes", "spells", "items")
+            if component == "all" else (component,)
+        )
+        self._apply_build_components(components)
+
+    def _apply_build_components(
+        self,
+        components: tuple[str, ...],
+        *,
+        automatic: bool = False,
+        auto_signature: str = "",
+    ) -> None:
+        components = tuple(
+            component for component in components
+            if component in {"runes", "spells", "items"}
+        )
+        if (
+            self.demo or not components or self._build_applying
+            or not self.build_guide
+        ):
             return
         guide = self.build_guide
         if guide.champion_id != self._build_selected_champion_id \
-                or guide.position != self.draft.my_role or not guide.rune_builds:
-            messagebox.showwarning(
-                "빌드 불일치", "현재 챔피언과 포지션의 빌드를 먼저 불러오세요.",
-                parent=self.root,
-            )
+                or normalize_build_position(guide.position) \
+                != self._requested_build_position() \
+                or ("runes" in components and not guide.rune_builds):
+            if not automatic:
+                messagebox.showwarning(
+                    "빌드 불일치", "현재 챔피언과 포지션의 빌드를 먼저 불러오세요.",
+                    parent=self.root,
+                )
             return
-        base_rune_build = guide.rune_builds[
-            min(self._build_rune_index, len(guide.rune_builds) - 1)
-        ]
-        rune_build = self._active_rune_build(base_rune_build)
+        rune_build: RuneBuild | None = None
+        if "runes" in components:
+            base_rune_build = guide.rune_builds[
+                min(self._build_rune_index, len(guide.rune_builds) - 1)
+            ]
+            rune_build = self._active_rune_build(base_rune_build)
         selected_spell_build = self._selected_spell_build(guide)
         base_builds = [
             BuildItemGroup(f"기본 추천 완성 빌드 {index}", build.items)
@@ -9785,43 +10105,95 @@ class AdvisorApp:
         )
         self._build_applying = True
         self.build_apply_status.configure(
-            text="롤 클라이언트에 적용 중...", fg=COLORS["blue"]
+            text=(
+                self._text("build.auto_applying")
+                if automatic else self._tr("롤 클라이언트에 적용 중...")
+            ),
+            fg=COLORS["blue"],
         )
         for button in self.build_apply_buttons:
             button.configure(state="disabled")
         self._mark_build_render_current()
 
         def work() -> str:
-            if component == "runes":
-                return self.build_applicator.apply_runes(
-                    apply_guide, rune_build, self.ui_language,
-                )
-            if component == "spells":
-                return self.build_applicator.apply_spells(
-                    apply_guide, self._flash_slot
-                )
-            if component == "items":
-                return self.build_applicator.apply_item_set(apply_guide)
-            return "\n".join(
-                self.build_applicator.apply_all(
-                    apply_guide, rune_build, self._flash_slot, self.ui_language
-                )
-            )
+            results: list[str] = []
+            errors: list[str] = []
+            labels = {"runes": "룬", "spells": "스펠", "items": "아이템"}
+            for selected_component in components:
+                if auto_signature and self._auto_build_signature() != auto_signature:
+                    raise BuildApplyError(self._text("build.auto_cancelled"))
+                try:
+                    if selected_component == "runes" and rune_build is not None:
+                        results.append(self.build_applicator.apply_runes(
+                            apply_guide, rune_build, self.ui_language,
+                        ))
+                    elif selected_component == "spells":
+                        results.append(self.build_applicator.apply_spells(
+                            apply_guide, self._flash_slot,
+                        ))
+                    elif selected_component == "items":
+                        results.append(
+                            self.build_applicator.apply_item_set(apply_guide)
+                        )
+                except BuildApplyError as exc:
+                    errors.append(f"{labels[selected_component]}: {exc}")
+            if not results:
+                raise BuildApplyError(" / ".join(errors))
+            if errors:
+                results.append("일부 실패 · " + " / ".join(errors))
+            return "\n".join(results)
 
         def success(message: str) -> None:
             self._build_applying = False
-            self.build_apply_status.configure(text=message, fg=COLORS["green"])
+            if automatic and auto_signature:
+                self._auto_build_applied_signature = auto_signature
+                if self._auto_build_pending_signature == auto_signature:
+                    self._auto_build_pending_signature = ""
+            component_names = {
+                "runes": "Runes" if self.ui_language == "en" else "룬",
+                "spells": "Spells" if self.ui_language == "en" else "스펠",
+                "items": "Items" if self.ui_language == "en" else "아이템",
+            }
+            status = self._text(
+                "build.auto_success",
+                components=" · ".join(component_names[item] for item in components),
+            ) if automatic else message
+            self.build_apply_status.configure(
+                text=self._tr(status), fg=COLORS["green"]
+            )
             for button in self.build_apply_buttons:
                 button.configure(state="normal")
             self._mark_build_render_current()
+            if (
+                self._auto_build_pending_signature
+                and self._auto_build_pending_signature != auto_signature
+            ):
+                self._schedule_auto_build_apply(delay_ms=80)
 
         def error(exc: Exception) -> None:
             self._build_applying = False
-            self.build_apply_status.configure(text=str(exc), fg=COLORS["red"])
+            if automatic and auto_signature:
+                if self._auto_build_signature() == auto_signature:
+                    self._auto_build_applied_signature = auto_signature
+                if self._auto_build_pending_signature == auto_signature:
+                    self._auto_build_pending_signature = ""
+            status = (
+                self._text("build.auto_failed", error=str(exc))
+                if automatic else str(exc)
+            )
+            self.build_apply_status.configure(
+                text=self._tr(status), fg=COLORS["red"]
+            )
             for button in self.build_apply_buttons:
                 button.configure(state="normal")
             self._mark_build_render_current()
-            messagebox.showerror("빌드 적용 실패", str(exc), parent=self.root)
+            if not automatic:
+                messagebox.showerror("빌드 적용 실패", str(exc), parent=self.root)
+            if (
+                self._auto_build_pending_signature
+                and self._auto_build_pending_signature != auto_signature
+            ):
+                self._schedule_auto_build_apply(delay_ms=80)
 
         self._background(work, success, error)
 
@@ -13955,6 +14327,7 @@ class AdvisorApp:
                 bg=COLORS["panel_2"], fg=team_color, font=("Malgun Gothic", 7, "bold"),
             ).pack(anchor="w", pady=(2, 0))
 
+        self._render_off_role_warning(card, player, profile)
         self._render_recent_form_badges(card, player, profile)
         self._render_player_tendency_badges(card, player)
         self._render_lane_matchup_strip(card, player)
@@ -14124,6 +14497,39 @@ class AdvisorApp:
                 losses=profile.season_losses,
             ),
         )
+
+    def _render_off_role_warning(
+        self, parent: tk.Widget, player: LivePlayer, profile: PlayerProfileStat,
+    ) -> None:
+        """Render the recent-main-role mismatch as a prominent card warning."""
+        if not player_off_role_warning(
+            player.position, profile.primary_position,
+            profile.primary_position_games, profile.position_sample_games,
+        ):
+            return
+        current = ROLE_LABELS.get(
+            normalize_recent_position(player.position), "?",
+        )
+        primary = ROLE_LABELS.get(profile.primary_position, "?")
+        border = tk.Frame(parent, bg=COLORS["orange"], padx=1, pady=1)
+        border.pack(fill="x", pady=(0, 6))
+        body = tk.Frame(border, bg="#2d2115", padx=7, pady=5)
+        body.pack(fill="x")
+        tk.Label(
+            body, text=self._text("play.off_role_warning"),
+            bg="#2d2115", fg="#ffbf57",
+            font=("Malgun Gothic", 8, "bold"), anchor="w",
+        ).pack(fill="x")
+        tk.Label(
+            body,
+            text=self._text(
+                "play.off_role_detail", primary=primary,
+                games=profile.primary_position_games,
+                sample=profile.position_sample_games, current=current,
+            ),
+            bg="#2d2115", fg="#ffe0a3",
+            font=("Malgun Gothic", 7, "bold"), anchor="w",
+        ).pack(fill="x", pady=(2, 0))
 
     def _render_recent_form_badges(
         self, parent: tk.Widget, player: LivePlayer, profile: PlayerProfileStat,
@@ -16922,7 +17328,54 @@ class AdvisorApp:
             state="readonly", width=34, font=("Malgun Gothic", 9),
         )
         auto_ban_combo.grid(row=3, column=1, sticky="ew", padx=(8, 0), ipady=4)
+        tk.Label(
+            feature_grid, text=self._tr("챔피언 선택 시 자동 적용"),
+            bg=COLORS["panel_2"], fg=COLORS["green"],
+            font=("Malgun Gothic", 9, "bold"), anchor="w",
+        ).grid(row=4, column=0, columnspan=2, sticky="w", pady=(14, 5))
+        auto_apply_runes_var = tk.BooleanVar(
+            value=bool(self.auto_apply_runes_enabled)
+        )
+        auto_apply_spells_var = tk.BooleanVar(
+            value=bool(self.auto_apply_spells_enabled)
+        )
+        auto_apply_items_var = tk.BooleanVar(
+            value=bool(self.auto_apply_items_enabled)
+        )
+        for column, (label, variable) in enumerate((
+            ("룬 자동 적용", auto_apply_runes_var),
+            ("스펠 자동 적용", auto_apply_spells_var),
+            ("아이템 자동 적용", auto_apply_items_var),
+        )):
+            tk.Checkbutton(
+                feature_grid, text=self._tr(label), variable=variable,
+                bg=COLORS["panel_2"], fg=COLORS["text"],
+                activebackground=COLORS["panel_2"],
+                activeforeground=COLORS["text"],
+                selectcolor=COLORS["surface_selected"],
+                font=("Malgun Gothic", 9, "bold"), cursor="hand2",
+            ).grid(
+                row=5, column=column, sticky="w",
+                padx=(0, 18) if column < 2 else (0, 0),
+            )
+        tk.Label(
+            feature_grid,
+            text=self._tr(
+                "기본 OFF · 챔피언을 확정한 뒤에만 켜진 항목을 한 번 적용합니다."
+            ),
+            bg=COLORS["panel_2"], fg=COLORS["muted"],
+            font=("Malgun Gothic", 8), justify="left", wraplength=680,
+        ).grid(row=6, column=0, columnspan=3, sticky="w", pady=(3, 1))
+        tk.Label(
+            feature_grid,
+            text=self._tr(
+                "아이템 자동 적용은 기존 사용자 아이템 세트를 지우고 Advisor 세트로 교체합니다."
+            ),
+            bg=COLORS["panel_2"], fg=COLORS["orange"],
+            font=("Malgun Gothic", 8), justify="left", wraplength=680,
+        ).grid(row=7, column=0, columnspan=3, sticky="w")
         feature_grid.columnconfigure(1, weight=1)
+        feature_grid.columnconfigure(2, weight=1)
 
         data_outer = tk.Frame(
             settings_body, bg=COLORS["border"], padx=1, pady=1,
@@ -17168,6 +17621,9 @@ class AdvisorApp:
             data_preferences: dict[str, int] | None = None,
             codex_recommendations_enabled: bool = False,
             stop_queue_after_dodge_enabled: bool = False,
+            auto_apply_runes_enabled: bool = False,
+            auto_apply_spells_enabled: bool = False,
+            auto_apply_items_enabled: bool = False,
             auto_ban_champion_key: int = 99,
             ui_language: str = "ko",
         ) -> None:
@@ -17203,6 +17659,27 @@ class AdvisorApp:
                 "stop_queue_after_dodge_enabled",
                 "1" if self.stop_queue_after_dodge_enabled else "0",
             )
+            for attribute, key, enabled in (
+                (
+                    "auto_apply_runes_enabled",
+                    "auto_apply_runes_enabled",
+                    auto_apply_runes_enabled,
+                ),
+                (
+                    "auto_apply_spells_enabled",
+                    "auto_apply_spells_enabled",
+                    auto_apply_spells_enabled,
+                ),
+                (
+                    "auto_apply_items_enabled",
+                    "auto_apply_items_enabled",
+                    auto_apply_items_enabled,
+                ),
+            ):
+                value = bool(enabled)
+                setattr(self, attribute, value)
+                self.storage.set_setting(key, "1" if value else "0")
+            self._reset_auto_build_apply_cycle()
             self.ui_language = normalize_language(ui_language)
             self.storage.set_setting("ui_language", self.ui_language)
             self._set_auto_ban_champion(auto_ban_champion_key)
@@ -17225,6 +17702,8 @@ class AdvisorApp:
             else:
                 self._render_opgg_meta()
             self._apply_language(full=True)
+            if self.game_phase == "ChampSelect":
+                self.root.after(80, self._schedule_auto_build_apply)
             if (
                 self._cache_manager_window
                 and self._cache_manager_window.winfo_exists()
@@ -17256,6 +17735,9 @@ class AdvisorApp:
             )
             codex_allowed = bool(codex_enabled_var.get())
             stop_after_dodge = bool(stop_queue_after_dodge_var.get())
+            auto_apply_runes = bool(auto_apply_runes_var.get())
+            auto_apply_spells = bool(auto_apply_spells_var.get())
+            auto_apply_items = bool(auto_apply_items_var.get())
             selected_language = next(
                 (
                     code for code, label in LANGUAGE_LABELS.items()
@@ -17270,6 +17752,9 @@ class AdvisorApp:
                     data_preferences=data_preferences,
                     codex_recommendations_enabled=codex_allowed,
                     stop_queue_after_dodge_enabled=stop_after_dodge,
+                    auto_apply_runes_enabled=auto_apply_runes,
+                    auto_apply_spells_enabled=auto_apply_spells,
+                    auto_apply_items_enabled=auto_apply_items,
                     auto_ban_champion_key=selected_auto_ban_key,
                     ui_language=selected_language,
                 )
@@ -17303,6 +17788,9 @@ class AdvisorApp:
                     data_preferences=data_preferences,
                     codex_recommendations_enabled=codex_allowed,
                     stop_queue_after_dodge_enabled=stop_after_dodge,
+                    auto_apply_runes_enabled=auto_apply_runes,
+                    auto_apply_spells_enabled=auto_apply_spells,
+                    auto_apply_items_enabled=auto_apply_items,
                     auto_ban_champion_key=selected_auto_ban_key,
                     ui_language=selected_language,
                 )
@@ -17930,6 +18418,7 @@ class AdvisorApp:
                     # extraordinarily unlikely case of identical champions.
                     self._clear_live_roster_identities()
                     self._manual_enemy_support = None
+                    self._reset_auto_build_apply_cycle()
                 role_changed = draft.my_role != self.draft.my_role
                 old_pick_order = self.draft.my_pick_order
                 old_local_cell = self.draft.local_player_cell_id
@@ -17975,6 +18464,7 @@ class AdvisorApp:
                         draft,
                         render=self._current_main_tab_index() == 3,
                     )
+                    self._schedule_auto_build_apply(draft)
                 if role_changed or draft.selected_enemy_support_id != old_support:
                     self.opgg_snapshot = self.storage.load_opgg_snapshot(
                         draft.selected_enemy_support_id, draft.my_role
@@ -18066,9 +18556,11 @@ class AdvisorApp:
                 self.opgg_snapshot = self.opgg_meta_snapshot
                 self.opgg_synergy_snapshot = None
                 self._synergy_checked_adc = ""
-                self.build_guide = self.storage.load_build_guide(
-                    self._build_selected_champion_id, self.draft.my_role
+                requested_position = self._requested_build_position()
+                self.build_guide = self._load_cached_build_guide(
+                    self._build_selected_champion_id, requested_position,
                 )
+                self._build_requested_position_loaded = requested_position
                 self._build_rune_index = 0
                 self._build_spell_index = 0
                 if self.build_guide:
@@ -19078,6 +19570,15 @@ class AdvisorApp:
             ),
             champion_streak=int(local_recent.get("champion_streak", 0) or 0),
             recent_form_source=("RIOT_LOCAL" if has_local_recent else ""),
+            primary_position=str(
+                local_recent.get("primary_position") or "UNKNOWN"
+            ),
+            primary_position_games=int(
+                local_recent.get("primary_position_games", 0) or 0
+            ),
+            position_sample_games=int(
+                local_recent.get("position_sample_games", 0) or 0
+            ),
             together_games=int(relationship.get("together_games", 0)),
             together_wins=int(relationship.get("together_wins", 0)),
             against_games=int(relationship.get("against_games", 0)),
