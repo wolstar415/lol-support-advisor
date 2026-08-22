@@ -16,6 +16,7 @@ from lol_support_advisor.ui import (
     adc_flow_hint, allied_adc_member,
     candidate_score,
     behavior_strength_signals, behavior_weakness_signals,
+    current_champion_record_values,
     auto_build_components, build_guide_has_statistics, build_loadout_stat_text,
     cache_manager_champion_ids,
     choose_auto_accept_delay_seconds,
@@ -31,6 +32,7 @@ from lol_support_advisor.ui import (
     lux_auto_ban_monitor_due,
     lux_auto_ban_stage_due,
     projected_lux_auto_ban_remaining_ms,
+    estimate_draft_pick_win_probability,
     estimate_live_game_prediction,
     matchup_final_item_builds, matchup_item_groups, matchup_rune_index,
     lane_matchup_from_snapshot, lane_matchup_label, lane_matchup_snapshot_fresh,
@@ -1723,6 +1725,25 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(result, "break")
         self.assertEqual(routed_events, [event])
 
+    def test_draft_prediction_is_neutral_without_cached_evidence(self) -> None:
+        self.assertEqual(estimate_draft_pick_win_probability(), (50.0, 0))
+
+    def test_draft_prediction_combines_matchup_synergy_and_overall_stats(self) -> None:
+        favorable, favorable_evidence = estimate_draft_pick_win_probability(
+            matchup_win_rate=56.0, synergy_win_rate=54.0, overall_win_rate=52.0,
+        )
+        unfavorable, unfavorable_evidence = estimate_draft_pick_win_probability(
+            matchup_win_rate=44.0, synergy_win_rate=46.0, overall_win_rate=48.0,
+        )
+
+        self.assertEqual(favorable_evidence, 3)
+        self.assertEqual(unfavorable_evidence, 3)
+        self.assertGreater(favorable, 50.0)
+        self.assertLess(unfavorable, 50.0)
+        self.assertLessEqual(favorable, 58.0)
+        self.assertGreaterEqual(unfavorable, 42.0)
+
+
     def test_live_prediction_combines_team_profiles_and_lane_matchups(self) -> None:
         players: list[LivePlayer] = []
         profiles: dict[str, PlayerProfileStat] = {}
@@ -2006,6 +2027,32 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertEqual(streak_badge_text(3), "3연승 중")
         self.assertEqual(streak_badge_text(-10, "잔나 "), "잔나 10+연패 중")
         self.assertEqual(streak_badge_text(1), "")
+    def test_opgg_current_champion_sample_is_limited_to_last_ten_matches(self) -> None:
+        matches = [
+            OpggMcpRecentMatch(
+                match_id=f"recent-{index}", created_at="",
+                game_type="SOLORANKED", champion_key=89,
+                champion_name="Leona", position="SUPPORT", result="WIN",
+                kills=1, deaths=2, assists=8,
+            )
+            for index in range(10)
+        ]
+        matches.append(OpggMcpRecentMatch(
+            match_id="older-current-champion", created_at="",
+            game_type="SOLORANKED", champion_key=40,
+            champion_name="Janna", position="SUPPORT", result="WIN",
+            kills=0, deaths=1, assists=12,
+        ))
+        profile = OpggMcpSummonerProfile(
+            riot_id="Player#KR1", game_name="Player", tag_line="KR1",
+            recent_matches=matches, recent_matches_status="OK", status="OK",
+        )
+
+        form = opgg_recent_form(profile, 40)
+
+        self.assertEqual(form["recent_games"], 10)
+        self.assertEqual(form["champion_recent_games"], 0)
+
 
     def test_opgg_recent_form_uses_newest_completed_solo_match(self) -> None:
         older = OpggMcpRecentMatch(
@@ -2094,6 +2141,27 @@ class DuoEvidenceTests(unittest.TestCase):
         self.assertTrue(any("선취점" in value for value in strengths))
         self.assertTrue(any("평균 데스" in value for value in weaknesses))
         self.assertTrue(any("시야" in value for value in weaknesses))
+
+    def test_current_champion_record_values_keep_season_and_recent_samples(self) -> None:
+        profile = PlayerProfileStat(
+            champion_games=12, champion_wins=8,
+            champion_recent_games=3, champion_recent_wins=2,
+        )
+        values = current_champion_record_values(profile)
+        self.assertEqual(values[:3], (12, 8, 4))
+        self.assertAlmostEqual(values[3] or 0.0, 66.666, places=2)
+        self.assertEqual(values[4:7], (3, 2, 1))
+        self.assertAlmostEqual(values[7] or 0.0, 66.666, places=2)
+
+    def test_current_champion_record_values_clamp_inconsistent_wins(self) -> None:
+        profile = PlayerProfileStat(
+            champion_games=2, champion_wins=5,
+            champion_recent_games=1, champion_recent_wins=-3,
+        )
+        self.assertEqual(
+            current_champion_record_values(profile),
+            (2, 2, 0, 100.0, 1, 0, 1, 0.0),
+        )
 
     def test_behavior_signals_do_not_overclaim_tiny_samples(self) -> None:
         stat = PlayerBehaviorStat(

@@ -569,6 +569,28 @@ def player_off_role_warning(
     )
 
 
+def current_champion_record_values(
+    profile: PlayerProfileStat,
+) -> tuple[int, int, int, float | None, int, int, int, float | None]:
+    """Return normalized season and recent values for the selected champion."""
+    season_games = max(int(profile.champion_games), 0)
+    season_wins = min(max(int(profile.champion_wins), 0), season_games)
+    season_losses = season_games - season_wins
+    recent_games = max(int(profile.champion_recent_games), 0)
+    recent_wins = min(max(int(profile.champion_recent_wins), 0), recent_games)
+    recent_losses = recent_games - recent_wins
+    return (
+        season_games,
+        season_wins,
+        season_losses,
+        PlayerProfileStat.rate(season_wins, season_games),
+        recent_games,
+        recent_wins,
+        recent_losses,
+        PlayerProfileStat.rate(recent_wins, recent_games),
+    )
+
+
 def opgg_recent_form(
     profile: OpggMcpSummonerProfile, champion_key: int
 ) -> dict[str, int | float | str | bool | None]:
@@ -581,7 +603,7 @@ def opgg_recent_form(
         completed.sort(key=lambda match: match.created_at or "", reverse=True)
     recent = completed[:10]
     champion_recent = [
-        match for match in completed if int(match.champion_key) == int(champion_key)
+        match for match in recent if int(match.champion_key) == int(champion_key)
     ][:10]
     scored = [match.op_score for match in recent if match.op_score > 0]
     last_game = recent[0] if recent else None
@@ -1135,6 +1157,42 @@ def matchup_counter_for_candidate(
         ),
         None,
     )
+
+
+def estimate_draft_pick_win_probability(
+    matchup_win_rate: float | None = None,
+    synergy_win_rate: float | None = None,
+    overall_win_rate: float | None = None,
+) -> tuple[float, int]:
+    """Return a conservative draft estimate from already-cached public stats.
+
+    Champion-select identities can be hidden, so this intentionally avoids the
+    heavier player-history predictor used by the Play tab. Each available input
+    only nudges a neutral baseline and the final range remains restrained.
+    """
+    estimate = 50.0
+    evidence = 0
+
+    def contribution(
+        value: float | None, limit: float, weight: float,
+    ) -> float:
+        nonlocal evidence
+        if value is None:
+            return 0.0
+        try:
+            rate = float(value)
+        except (TypeError, ValueError):
+            return 0.0
+        if not 0.0 <= rate <= 100.0:
+            return 0.0
+        evidence += 1
+        delta = max(-limit, min(rate - 50.0, limit))
+        return delta * weight
+
+    estimate += contribution(matchup_win_rate, 8.0, 0.65)
+    estimate += contribution(synergy_win_rate, 7.0, 0.35)
+    estimate += contribution(overall_win_rate, 5.0, 0.25)
+    return round(max(42.0, min(estimate, 58.0)), 1), evidence
 
 
 def lane_matchup_snapshot_fresh(
@@ -6401,6 +6459,27 @@ class AdvisorApp:
         )
         self.stale_label.pack(anchor="w", pady=(4, 0))
 
+        self.draft_prediction_frame = tk.Frame(
+            panel, bg=COLORS["surface"], padx=10, pady=7,
+            highlightthickness=1, highlightbackground=COLORS["divider"],
+        )
+        self.draft_prediction_frame.pack(fill="x", pady=(7, 0))
+        self.draft_prediction_value = tk.Label(
+            self.draft_prediction_frame, text="", bg=COLORS["surface"],
+            fg=COLORS["gold"], anchor="w",
+            font=("Malgun Gothic", 10, "bold"),
+        )
+        self.draft_prediction_value.pack(side="left")
+        self.draft_prediction_detail = tk.Label(
+            self.draft_prediction_frame, text="", bg=COLORS["surface"],
+            fg=COLORS["muted"], anchor="e",
+            font=("Malgun Gothic", 8),
+        )
+        self.draft_prediction_detail.pack(
+            side="right", fill="x", expand=True, padx=(12, 0),
+        )
+
+
         self.hover_matchup_card = tk.Frame(
             panel, bg=COLORS["surface"], padx=12, pady=10,
             highlightthickness=1, highlightbackground=COLORS["divider"],
@@ -10687,6 +10766,98 @@ class AdvisorApp:
         ):
             self._render_draft_team_slots(self.enemy_picks_frame, ally=False)
 
+        self._render_draft_prediction()
+
+    def _render_draft_prediction(self) -> None:
+        if not hasattr(self, "draft_prediction_value"):
+            return
+
+        selection = local_draft_selection(self.draft)
+        champion_id = selection.champion_id if selection else ""
+        enemy_id = self.draft.selected_enemy_support_id or ""
+        matchup = None
+        if (
+            champion_id and enemy_id and self.opgg_snapshot
+            and self.opgg_snapshot.enemy_support_id == enemy_id
+        ):
+            matchup = matchup_counter_for_candidate(
+                self.opgg_snapshot, champion_id,
+            )
+
+        synergy = self._synergy_for(champion_id) if champion_id else None
+        meta = matchup_counter_for_candidate(
+            self.opgg_meta_snapshot, champion_id,
+        )
+        overall_rate = (
+            matchup.overall_win_rate
+            if matchup and matchup.overall_win_rate is not None
+            else meta.overall_win_rate if meta else None
+        )
+        rate, evidence = estimate_draft_pick_win_probability(
+            matchup.versus_win_rate if matchup else None,
+            synergy.win_rate if synergy else None,
+            overall_rate,
+        )
+
+        sources: list[str] = []
+        if matchup is not None:
+            sources.append(self._text("draft.prediction.source.matchup"))
+        if synergy is not None and synergy.win_rate is not None:
+            sources.append(self._text("draft.prediction.source.synergy"))
+        if overall_rate is not None:
+            sources.append(self._text("draft.prediction.source.overall"))
+
+        slots = [
+            *self._draft_team_slots(True),
+            *self._draft_team_slots(False),
+        ]
+        visible_picks = sum(
+            1 for member in slots
+            if member and member.champion_id
+            and member.state in {"HOVER", "LOCKED"}
+        )
+        if evidence == 0:
+            outcome = self._text("draft.prediction.waiting")
+            color = COLORS["muted"]
+            detail = self._text(
+                "draft.prediction.pick_waiting"
+                if not champion_id else "draft.prediction.source_waiting"
+            )
+        elif rate >= 51.5:
+            outcome = self._text("draft.prediction.win")
+            color = COLORS["green"]
+            detail = " · ".join(sources)
+        elif rate <= 48.5:
+            outcome = self._text("draft.prediction.loss")
+            color = COLORS["red"]
+            detail = " · ".join(sources)
+        else:
+            outcome = self._text("draft.prediction.even")
+            color = COLORS["gold"]
+            detail = " · ".join(sources)
+
+        signature = (
+            champion_id, enemy_id, visible_picks, rate, evidence,
+            tuple(sources), self.ui_language,
+        )
+        if not self._selection_panel_needs_render(
+            "draft_prediction", *signature,
+        ):
+            return
+        self.draft_prediction_value.configure(
+            text=self._text(
+                "draft.prediction.value", rate=rate, outcome=outcome,
+            ),
+            fg=color,
+        )
+        self.draft_prediction_detail.configure(
+            text=self._text(
+                "draft.prediction.detail",
+                picks=visible_picks, sources=detail,
+            ),
+        )
+
+
     def _schedule_hover_matchup_render(self) -> None:
         if self._hover_matchup_render_scheduled:
             return
@@ -14336,64 +14507,113 @@ class AdvisorApp:
         stats.pack(fill="x", pady=(0, 5))
         stats.grid_columnconfigure(0, weight=1, uniform="compact_stats")
         stats.grid_columnconfigure(1, weight=1, uniform="compact_stats")
-        champion_losses = max(profile.champion_games - profile.champion_wins, 0)
+        (
+            champion_games, champion_wins, champion_losses, champion_rate,
+            champion_recent_games, champion_recent_wins,
+            champion_recent_losses, champion_recent_rate,
+        ) = current_champion_record_values(profile)
+        champion_title = self._text(
+            "play.current_champion_title",
+            champion=self._champion_text(
+                player.champion_id, player.champion_name_ko,
+            ),
+        )
+        champion_recent_detail = ""
+        if champion_recent_games:
+            champion_recent_detail = self._text(
+                "play.champion_recent_short", sample=profile.recent_games,
+                games=champion_recent_games, wins=champion_recent_wins,
+                losses=champion_recent_losses,
+                rate=_fmt_rate(champion_recent_rate),
+            )
+        elif profile.recent_games:
+            champion_recent_detail = self._text(
+                "play.champion_recent_none", sample=profile.recent_games,
+            )
         if profile.champion_data_source == "OPGG":
-            champion_value = (
-                self._text(
-                    "play.champion_record", games=profile.champion_games,
-                    rate=_fmt_rate(profile.champion_win_rate),
-                )
+            champion_value = self._text(
+                "play.champion_record_full", games=champion_games,
+                wins=champion_wins, losses=champion_losses,
+                rate=_fmt_rate(champion_rate),
             )
             champion_detail = self._text(
-                "play.champion_source_opgg", wins=profile.champion_wins,
+                "play.champion_source_opgg", wins=champion_wins,
                 losses=champion_losses,
             )
             sample_color = (
-                COLORS["orange"] if profile.champion_games < 5 else COLORS["green"]
+                COLORS["orange"] if champion_games < 5 else COLORS["green"]
             )
         elif profile.champion_data_source == "OPGG_NOT_LISTED":
-            champion_value = self._text("play.opgg_not_listed")
-            champion_detail = self._text("play.opgg_not_listed_detail")
-            sample_color = COLORS["muted"]
+            if champion_recent_games:
+                champion_value = self._text(
+                    "play.champion_record_full", games=champion_recent_games,
+                    wins=champion_recent_wins, losses=champion_recent_losses,
+                    rate=_fmt_rate(champion_recent_rate),
+                )
+                champion_detail = self._text("play.opgg_not_listed_detail")
+                sample_color = (
+                    COLORS["orange"] if champion_recent_games < 5 else COLORS["green"]
+                )
+            else:
+                champion_value = self._text("play.opgg_not_listed")
+                champion_detail = self._text("play.opgg_not_listed_detail")
+                sample_color = COLORS["muted"]
         elif profile.champion_data_source == "RIOT_LIVE":
             champion_value = (
                 self._text(
-                    "play.champion_record", games=profile.champion_games,
-                    rate=_fmt_rate(profile.champion_win_rate),
-                ) if profile.champion_games else self._text("play.current_no_selection")
+                    "play.champion_record_full", games=champion_games,
+                    wins=champion_wins, losses=champion_losses,
+                    rate=_fmt_rate(champion_rate),
+                ) if champion_games else self._text("play.current_no_selection")
             )
             champion_detail = self._text(
                 "play.champion_source_riot", loaded=profile.local_sample_games,
                 target=profile.champion_sample_target,
-                wins=profile.champion_wins, losses=champion_losses,
+                wins=champion_wins, losses=champion_losses,
             )
             sample_color = (
                 COLORS["orange"]
                 if profile.local_sample_games < profile.champion_sample_target
-                or 0 < profile.champion_games < 3
-                else COLORS["green"] if profile.champion_games else COLORS["blue"]
+                or 0 < champion_games < 3
+                else COLORS["green"] if champion_games else COLORS["blue"]
             )
         elif profile.champion_data_source == "LOCAL":
             champion_value = (
                 self._text(
-                    "play.champion_record", games=profile.champion_games,
-                    rate=_fmt_rate(profile.champion_win_rate),
-                ) if profile.champion_games else self._text("play.current_none")
+                    "play.champion_record_full", games=champion_games,
+                    wins=champion_wins, losses=champion_losses,
+                    rate=_fmt_rate(champion_rate),
+                ) if champion_games else self._text("play.current_none")
             )
             champion_detail = self._text(
                 "play.champion_source_local", sample=profile.local_sample_games,
-                wins=profile.champion_wins, losses=champion_losses,
+                wins=champion_wins, losses=champion_losses,
             )
             sample_color = (
-                COLORS["orange"] if 0 < profile.champion_games < 5 else COLORS["green"]
+                COLORS["orange"] if 0 < champion_games < 5 else COLORS["green"]
+            )
+        elif champion_recent_games:
+            champion_value = self._text(
+                "play.champion_record_full", games=champion_recent_games,
+                wins=champion_recent_wins, losses=champion_recent_losses,
+                rate=_fmt_rate(champion_recent_rate),
+            )
+            champion_detail = self._text("play.opgg_fallback")
+            sample_color = (
+                COLORS["orange"] if champion_recent_games < 5 else COLORS["green"]
             )
         else:
             champion_value = self._text("play.opgg_checking")
             champion_detail = self._text("play.opgg_fallback")
             sample_color = COLORS["blue"]
-        if partial and profile.champion_data_source not in {
-            "RIOT_LIVE", "OPGG", "OPGG_NOT_LISTED"
-        }:
+        if champion_recent_detail and champion_games:
+            champion_detail = f"{champion_detail}\n{champion_recent_detail}"
+        if (
+            partial
+            and profile.champion_data_source in {"RIOT_PENDING", ""}
+            and not champion_games
+            and not champion_recent_games
+        ):
             champion_value = (
                 self._text("play.opgg_checking")
                 if not player.is_active_player else self._tr("계산 중")
@@ -14403,7 +14623,7 @@ class AdvisorApp:
                 if not player.is_active_player else self._tr("내 저장 전적 계산 중")
             )
         self._compact_stat(
-            stats, 0, self._tr("현 챔프"), champion_value,
+            stats, 0, champion_title, champion_value,
             champion_detail, sample_color,
         )
 
@@ -14972,7 +15192,7 @@ class AdvisorApp:
         ).pack(anchor="w")
         tk.Label(
             frame, text=detail, bg=COLORS["surface"], fg=COLORS["muted"],
-            font=("Malgun Gothic", 6),
+            font=("Malgun Gothic", 6), justify="left",
         ).pack(anchor="w")
 
     def _winrate_bar(self, parent: tk.Widget, rate: float | None, label: str) -> None:
@@ -17230,6 +17450,8 @@ class AdvisorApp:
             state="readonly", width=16, font=("Malgun Gothic", 9),
         )
         language_combo.pack(side="left", ipady=4)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            language_combo.bind(sequence, self._on_rune_style_mousewheel)
         tk.Label(
             language_panel,
             text=self._tr("언어 변경은 저장 즉시 적용되고 다음 실행에도 유지됩니다."),
@@ -17328,6 +17550,8 @@ class AdvisorApp:
             state="readonly", width=34, font=("Malgun Gothic", 9),
         )
         auto_ban_combo.grid(row=3, column=1, sticky="ew", padx=(8, 0), ipady=4)
+        for sequence in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+            auto_ban_combo.bind(sequence, self._on_rune_style_mousewheel)
         tk.Label(
             feature_grid, text=self._tr("챔피언 선택 시 자동 적용"),
             bg=COLORS["panel_2"], fg=COLORS["green"],
